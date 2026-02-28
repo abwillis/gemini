@@ -1,0 +1,99 @@
+{
+  "name": "gemini-for-linux",
+  "version": "1.11.8",
+  "description": "Gemini for Linux",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --linux rpm",
+    "dist:win": "electron-builder --win nsis portable"
+  },
+  "build": {
+    "appId": "com.company.gemini",
+    "productName": "gemini-for-linux",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "**/*"
+    ],
+    "asarUnpack": [
+      "**/*.node",
+      "vendor/**",
+      "resources/**",
+      "assets/*.png",
+      "assets/win/*.ico"
+    ],
+    "linux": {
+      "executableName": "gemini-for-linux",
+      "target": [
+        {
+          "target": "rpm",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "category": "Utility",
+      "icon": "assets",
+      "maintainer": "Name <name@mail.com>",
+      "vendor": "Name <name@mail.com>",
+      "synopsis": "Gemini Electron App",
+      "description": "Gemini for Linux",
+      "desktop": {
+        "entry": {
+          "Name": "gemini-for-linux",
+          "Icon": "gemini-for-linux",
+          "Type": "Application",
+          "Comment": "Unofficial Google Gemini client for Linux using Electron. It uses the Web App and wraps it as a standalone application using Electron.",
+          "StartupWMClass": "gemini-for-linux",
+          "Categories": "Network;Utility;Productivity"
+        }
+      }
+    },
+    "rpm": {
+      "artifactName": "${name}-${version}.${arch}.rpm",
+      "compression": "bzip2"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "cscLink": "C:/apps/certs/my_code_sign.pfx",
+      "cscKeyPassword": "WhatsnextforYou",
+      "icon": "assets/win/icon.ico",
+      "artifactName": "${productName}-${version}-Windows-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "gemini-for-linux",
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": "assets/win/icon.ico",
+      "uninstallerIcon": "assets/win/icon.ico",
+      "installerSidebar": null,
+      "uninstallerSidebar": null
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-Portable-${arch}.${ext}"
+    }
+  },
+  "homepage": "https://yourwebsite.com",
+  "author": {
+    "name": "Name",
+    "email": "name@mail.com"
+  },
+  "license": "BSD 3-Clause License",
+  "devDependencies": {
+    "electron": "^40.6.1",
+    "electron-builder": "^26.4.0"
+  },
+  "dependencies": {
+    "npm": "^11.7.0"
+  }
+}
+
