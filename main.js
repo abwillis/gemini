@@ -74,6 +74,9 @@ width: 95vw !important;
   display: block !important; /* Overrides flex-end alignment if present */
     padding-right: 10 !important;
     padding-left: auto !important;
+    align-self: flex-end !important;
+    justify-self: end !important;
+    place-self: end !important;
     display: block !important;
   margin-left: auto !important;
   margin-right: 10 !important;
