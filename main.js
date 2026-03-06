@@ -25,7 +25,7 @@ const QUICK_PASTE_POST_KEY_DELAY_MS = 40; // tiny gap between paste and optional
 
 
 // --- Quick Chat / IPC constants --------------------------------------------
-const gemini_URL = 'https://m365.cloud.microsoft/chat';
+const gemini_URL = 'https://gemini.google.com';
 
 const IPC = Object.freeze({
   SEND_SELECTION: 'gemini:send-selection',
@@ -36,6 +36,54 @@ const SEND_MODE = Object.freeze({
   PLAIN: 'plain',
   QUOTE: 'quote',
 });
+
+function applyWideLayout(wc) {
+  wc.on('did-finish-load', () => {
+    wc.insertCSS(`
+      /* Expand the main conversation width */
+      .conversation-container, 
+      main, 
+      article, 
+      .full-width-container { 
+        max-width: 100% !important; 
+        width: 100% !important;
+      }
+
+      /* Expand the input/text area at the bottom */
+      .input-area-container,
+      .bottom-container { 
+        max-width: 95% !important; 
+        margin: 0 auto !important;
+      }
+
+      /* Optional: Adjust padding for readability on ultra-wide screens */
+      .conversation-container {
+        padding-left: 20px !important;
+        padding-right: 20px !important;
+      }
+
+/* Trying to get the user input in the conversation area to also expand */
+.user-query-container,
+[class*="user-query"],
+[data-test-id="user-query"],
+.query-content,
+.user-query {
+  max-width: none !important;
+width: 95vw !important;
+  box-sizing: content-box !important;
+  display: block !important; /* Overrides flex-end alignment if present */
+    padding-right: 10 !important;
+    padding-left: auto !important;
+    display: block !important;
+  margin-left: auto !important;
+  margin-right: 10 !important;
+    overflow-wrap: anywhere !important;
+    word-break: break-word !important;
+    white-space: pre-wrap !important;
+}
+    `);
+  });
+}
 
 function normalizeSendOptions(opts) {
   const o = (opts && typeof opts === 'object') ? opts : {};
@@ -300,37 +348,16 @@ function createQuickChatWindow() {
   win.on('resize', () => scheduleSaveWindowState(win, boundsKey));
   win.on('move', () => scheduleSaveWindowState(win, boundsKey));
 
-  ensureDidStopLoadingHandler(win.webContents);
-
   // Allow Electron's internal executeJavaScript() listeners
   // without triggering false-positive leak warnings
   win.webContents.setMaxListeners(0);
   win.loadURL(gemini_URL);
 
- // Defer heavy layout CSS until after first paint to reduce initial layout thrash
- try {
-  win.webContents.once('did-stop-loading', () => {
-   // Next tick ensures Chromium has painted once
-   setTimeout(() => {
-    try { applyMaxLayoutCSS(win); }
-    catch (e) { console.error('applyMaxLayoutCSS (quick deferred) failed:', e); }
-   }, 0);
-  });
- } catch (e) {
-  console.error('applyMaxLayoutCSS quick defer wiring failed:', e);
- }
+  // ... inside createQuickChatWindow ...
+    win.loadURL(gemini_URL);
 
-  win.once('ready-to-show', () => {
-    reveal(win);
-    try { applyDynamicWidth(win); } catch {}
-    try { attachVWResize(win); } catch {}
-    try { requestExpandedLayout(win); } catch {}
-  });
-
-  win.webContents.on('did-start-navigation', () => {
-    try { attachVWResize(win); } catch {}
-  });
-
+  // Apply the wide layout to this specific window
+  applyWideLayout(win.webContents);
 
   // --- Right-click native context menu (same as Main Chat) ---
   win.webContents.on('context-menu', (_event, params) => {
@@ -487,628 +514,6 @@ function createQuickChatWindow() {
   ));
 
   return win;
-}
-
-
-// --- Make the site use the full viewport by injecting CSS (CSP-safe) ---
-// Gemini DOM can shift; override via env GEMINI_CHAT_SELECTOR if needed.
-const CHAT_SELECTOR = String(process.env.GEMINI_CHAT_SELECTOR ?? 'main').trim();
-const MESSAGE_LIST_SCOPE = '#mainChat div[id*="messagelist" i]';
-
-// Parameterized single-message selector
-const messageContentById = (id) => `${CHAT_SELECTOR} #${id}`;
-
-// === Safe 'did-stop-loading' wiring =========================================
-// A named handler so removeListener(...) can reliably detach the same function.
-function onDidStopLoading() {
-  try {
-    // Place your post-load logic here (keep it lightweight or idempotent).
-    // Example: enforceNoHScroll(BrowserWindow.getFocusedWindow() || mainWindow);
-  } catch (err) {
-    console.error('did-stop-loading handler error:', err);
-  }
-}
-
-// Attach the handler exactly once per webContents.
-function ensureDidStopLoadingHandler(webContents) {
- if (!webContents) return;
-
-  // Guard against duplicate attachment across SPA navigations
-  if (webContents.__hasDidStopLoadingHandler) return;
-
-  webContents.__hasDidStopLoadingHandler = true;
-  webContents.on('did-stop-loading', onDidStopLoading);
-}
-
-// 7 options grouped into containers vs content for correct layout application
-const SELECTORS = {
-  // Containers (safe to apply full-viewport/layout rules)
-  feedContainer:           `${MESSAGE_LIST_SCOPE} [data-testid="MessageListContainer"] [role="feed"]`,
-  listContainer:           `${MESSAGE_LIST_SCOPE} [data-testid="MessageListContainer"]`,
-  geminiChatClass: `[class*="geminiChat"]`,
-  layoutMainPane: `[data-testid="layout-main-pane"]`,
-  chatMessageResponserId: `[id*="chatMessageResponser"]`,
-  markdownReplyTestId: `[data-testid="markdown-reply"]`,
-  llmChatMessageClass: `[class*="m365-chat-llm-web-ui-chat-chat-message"]`,
-  chatMessageContainerId: `[id*="chatMessageContainer"]`,
-  llmChatMessageTestId: `[data-testid="m365-chat-llm-web-ui-chat-message"]`,
-  geminiMessageTestId: `[data-testid*="gemini-message"]`,
-
-  // Content targets (do NOT force height: 100vh here)H
-  allMessageContent_class:
-    `${MESSAGE_LIST_SCOPE} [role="feed"] .fai-GeminiMessage .fai-GeminiMessage__content`,
-  allMessageContent_class_lowSpecificity:
-    `${MESSAGE_LIST_SCOPE} :where([role="feed"]) :where(.fai-GeminiMessage) :where(.fai-GeminiMessage__content)`,
-  allMessageContent_attr:
-    `${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"][aria-labelledby*="gemini-message-" i] > div[id^="gemini-message-" i]`,
-  linksInContent_class:
-    `${MESSAGE_LIST_SCOPE} [role="feed"] .fai-GeminiMessage__content a`,
-  linksInContent_attr:
-    `${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] > div[id^="gemini-message-"] a`,
-  minimalSemantic:
-    `${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] > [id^="gemini-message-"]`,
-};
-/*
-const PREFERRED_CONTAINER_SELECTORS = [
-  SELECTORS.feedContainer,
-  SELECTORS.geminiChatClass,
-  SELECTORS.layoutMainPane,
-  SELECTORS.chatMessageResponserId,
-  SELECTORS.markdownReplyTestId,
-];
-*/
-// --- Centralized ignore list: ALWAYS excluded from layout adjustments ---
-const IGNORE_SELECTORS = [
-  // Gemini prompt/editor surfaces (keep editable/clickable)
-  `rich-textarea`,
-  `rich-textarea .ql-editor[contenteditable="true"]`,
-  `.text-input-field_textarea .ql-editor[contenteditable="true"]`,
-  `.ql-editor[contenteditable="true"]`,
-  `div[contenteditable="true"][role="textbox"]`,
-  `textarea`,
-  `input`,
-  `[contenteditable="true"]`,
-  `div[role="textbox"]`,
-  `[class*="Drawer" i]`,
-  `[class*="chatinput" i]`,
-  `[id*="ChatInput" i]`,
-  `[class*="chat-input" i]`,
-  `[id*="chat-input" i]`,
-  `[class*="button" i]`,
-  `[type*="button" i]` ,
-  `[role="button" i]` ,
-  `[class*="Menu" i]`,
-  `[class*="MessageBar" i]`,
-  `[class*="editorinput" i]` ,
-  `[role="status"]`,
-  `[role*="tooltip"]`,
-  `[class*="tooltip" i]`,
-  `[class*="popover" i]`,
-  `[class*="hover" i]`,
-  `[data-tooltip]`,
-  `[data-popover]`,
-  `[role*="toolbar"]`,
-  `[data-testid*="message-actions" i]` ,
-  `[data-testid*="hover" i]` ,
-  `[class*="messageActions" i]` ,
-  `[class*="hoverCard" i]` ,
-  `[class*="floatingToolbar" i]` ,
-  `[class*="flyout" i]` ,
-  `[class*="contextualMenu" i]` ,
-  `[class*="usermessage" i]` ,
-  `[id*="user-message"]` ,
-  `[class*="actionsContainer"]` 
-];
-const IGNORE_JOINED = IGNORE_SELECTORS.join(', ');
-
-
-function applyDynamicWidth(win) {
-  if (!win) return;
-  const script = String.raw`(function(){try{
-    const root = document.documentElement;
-    if (!getComputedStyle(root).getPropertyValue('--gemini-vw')) {
-      root.style.setProperty('--gemini-vw', '${VW_SIZE}vw');
-    }
-    window.__gemini_getTargetVW = function(){
-      try { const v = getComputedStyle(root).getPropertyValue('--gemini-vw').trim();
-        const m = /^(\d+)vw$/.exec(v); return m ? parseInt(m[1],10) : ${VW_SIZE}; } catch { return ${VW_SIZE}; }
-    };
-    window.__gemini_setTargetVW = function(v){
-      try { const c = Math.max(${MIN_VW}, Math.min(${MAX_VW}, Math.round(v))); root.style.setProperty('--gemini-vw', c+'vw'); } catch {}
-    };
-  }catch(e){} })();`;
-  try { win.webContents.executeJavaScript(script).catch(()=>{}); } catch {}
-}
-
-// Responsive VW: keep --gemini-vw tied to window size (95 → 30vw)
-function attachVWResize(win) {
-  if (!win || !win.webContents) return;
-  const wc = win.webContents;
-
-  // Run layout-affecting JS only once per window lifetime
-  if (wc.__geminiVWResizeAttached) return;
-  wc.__geminiVWResizeAttached = true;
-
-  const script = `
-    (function () {
-      try {
-        const MAX = 95;
-        const MIN = 70;
-        const root = document.documentElement;
-        function computeVW() {
-          try {
-            const screenW = (window.screen && window.screen.width) ? window.screen.width : window.innerWidth;
-            const winW = window.innerWidth;
-            let vw = Math.round((winW / screenW) * MAX);
-            vw = Math.max(MIN, Math.min(MAX, vw));
-            root.style.setProperty('--gemini-vw', vw + 'vw');
-            if (window.__gemini_setTargetVW) window.__gemini_setTargetVW(vw);
-          } catch {}
-        }
-        computeVW();
-        window.addEventListener('resize', computeVW, { passive: true });
-        window.addEventListener('orientationchange', computeVW, { passive: true });
-      } catch {}
-    })();
-  `;
-  const run = () => { try { wc.executeJavaScript(script).catch(() => {}); } catch {} };
-  wc.once('dom-ready', run);
-}
-
-// --- Dynamic width constants (added) ---
-const MAX_CHARS = 1024;
-const VW_SIZE = 100;
-const MIN_VW = 70;
-const MAX_VW = 100;
-//let   VW_WIDTH = 83;
-
-// Build CSS with container vs content separation
-
-function buildMaxLayoutCSS({ specificMessageId } = {}) {
-  const CONTAINERS = [
-    // existing containers
-    CHAT_SELECTOR,
-    SELECTORS.feedContainer,
-    SELECTORS.listContainer,
-    SELECTORS.geminiChatClass,
-    SELECTORS.layoutMainPane,
-    SELECTORS.chatMessageResponserId,
-    SELECTORS.markdownReplyTestId,
-    SELECTORS.llmChatMessageClass,
-    SELECTORS.chatMessageContainerId,
-    SELECTORS.llmChatMessageTestId,
-    SELECTORS.geminiMessageTestId,
-  ].join(',\n');
-
-  const CONTENT = [
-    specificMessageId ? messageContentById(specificMessageId) : null,
-    SELECTORS.allMessageContent_class,
-    SELECTORS.allMessageContent_class_lowSpecificity,
-    SELECTORS.allMessageContent_attr,
-   `${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"]`,
-    SELECTORS.linksInContent_class,
-    SELECTORS.linksInContent_attr,
-    SELECTORS.minimalSemantic,
-  ].filter(Boolean).join(',\n');
-
-  return String.raw`
-
-    /* Root var for dynamic target width; default 90vw */
-    html { --gemini-vw: ${VW_SIZE}vw; }
-
-    /* Page-level: strictly prevent horizontal scroll; allow vertical */
-    html, body {
-      height: 100vh !important;
-      width: 100% !important;
-      margin: 0 !important;
-      margin-left: 0 !important;
-      padding-left: 0 !important;
-      padding: 0 !important;
-      overflow-x: hidden !important;
-      overflow-y: auto !important;
-      background: #fff !important;
-      word-break: break-word !important;
-    }
-    @supports (overflow: clip) {
-      html, body { overflow-x: clip !important; }
-    }
-
-    /* (Gemini) no officehome scroll container */
-    #officehome-scroll-container {
-      overflow: visible !important;        /* or overflow: hidden; if content must clip */
-      overscroll-behavior: contain !important;   /* avoid nested scroll chaining */
-    }
-
-    /* Gemini-safe: avoid clobbering overall app layout; only constrain within the chat root */
- ${CHAT_SELECTOR}, ${CHAT_SELECTOR} * {
-   max-width: 100% !important;
-   box-sizing: border-box !important;
-   overflow-wrap: anywhere !important;
-   word-break: break-word !important;
- }
-
- /* Main chat/message containers: always full width, never clipped */
-    [class*="geminiChat"],
-    [data-testid="layout-main-pane"],
-    [id*="chatMessageResponser"],
-    [data-testid="markdown-reply"],
-    [class*="m365-chat-llm-web-ui-chat-chat-message"],
-    [id*="chatMessageContainer"],
-    [data-testid="m365-chat-llm-web-ui-chat-message"],
-    [data-testid*="gemini-message"] {
-      width: 100% !important;
-      max-width: none !important;
-      min-width: 0 !important;
-      box-sizing: border-box !important;
-      overflow-x: visible !important;
-      overflow-y: visible !important;
-      word-break: break-word !important;
-    }
-
-    /* Guard: descendant matches of the ignore list within containers keep spacing */
-    :is(${CONTAINERS}) :is(${IGNORE_JOINED}) {
-      width: auto !important;
-      max-width: none !important;
-      margin: initial !important;
-      padding: initial !important;
-      padding-left: 1px !important;
-    }
-
-    
- /* Gemini prompt safety: ensure the editor remains interactive */
- ${CHAT_SELECTOR} rich-textarea .ql-editor[contenteditable="true"],
- ${CHAT_SELECTOR} .text-input-field_textarea .ql-editor[contenteditable="true"],
- ${CHAT_SELECTOR} .ql-editor[contenteditable="true"],
- ${CHAT_SELECTOR} div[contenteditable="true"][role="textbox"],
- ${CHAT_SELECTOR} textarea,
- ${CHAT_SELECTOR} input {
-   pointer-events: auto !important;
-   user-select: text !important;
-   -webkit-user-select: text !important;
-   cursor: text !important;
-   opacity: 1 !important;
-   z-index: 9999 !important;
- }
-${SELECTORS.llmChatMessageClass},
-    ${SELECTORS.chatMessageContainerId},
-    ${SELECTORS.llmChatMessageTestId},
-    ${SELECTORS.geminiMessageTestId} {
-      /* eliminate left/right padding/margins that cause right shift */
-      margin-right: 0 !important;
-      padding-left: 0 !important;
-      padding-right: 0 !important;
-      /* align start in any flex/grid parent */
-      justify-self: start !important;
-      align-self: start !important;
-      place-self: start !important;
-      /* ensure they take full available width within container clamp */
-      width: 100% !important;
-      max-width: none !important;
-      box-sizing: border-box !important;
-      /* neutralize common layout shifters */
-      left: auto !important;
-      right: auto !important;
-      text-align: left !important;
-    }
-
-    /* If any inner wrapper adds accidental horizontal gap, clear it */
-    ${SELECTORS.llmChatMessageClass} *,
-    ${SELECTORS.chatMessageContainerId} *,
-    ${SELECTORS.llmChatMessageTestId} * {
-      padding-left: 0 !important;
-    }
-
-    /* === NEW: Shift-left nested message bubbles inside the three panes === */
-    /* Common bubble structures: role="article", gemini-message-* wrappers, generic bubble classes */
-    ${SELECTORS.llmChatMessageClass} [role="article"],
-    ${SELECTORS.llmChatMessageClass} [id^="gemini-message-" i],
-    ${SELECTORS.llmChatMessageClass} .fai-GeminiMessage,
-    ${SELECTORS.llmChatMessageClass} .fai-GeminiMessage__content,
-    ${SELECTORS.chatMessageContainerId} [role="article"],
-    ${SELECTORS.chatMessageContainerId} [id^="gemini-message-" i],
-    ${SELECTORS.chatMessageContainerId} .fai-GeminiMessage,
-    ${SELECTORS.chatMessageContainerId} .fai-GeminiMessage__content,
-    ${SELECTORS.llmChatMessageTestId} [role="article"],
-    ${SELECTORS.llmChatMessageTestId} [id^="gemini-message-" i],
-    ${SELECTORS.llmChatMessageTestId} .fai-GeminiMessage,
-    ${SELECTORS.llmChatMessageTestId} .fai-GeminiMessage__content {
-      margin-left: 0 !important;
-      padding-left: 0 !important;
-      /* Ensure left alignment even if parent uses center/space-around */
-      text-align: left !important;
-      justify-content: flex-start !important;
-      align-items: flex-start !important;
-      /* --- Ensure text wraps inside bubbles --- */
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-      white-space: normal !important;
-    }
-
-    /* Catch-all bubble alignment + wrapping for any gemini message */
-    ${SELECTORS.feedContainer} [role="article"] > [id^="gemini-message-" i],
-    ${SELECTORS.feedContainer} [role="article"] [id^="gemini-message-" i],
-    ${SELECTORS.feedContainer} .fai-GeminiMessage,
-    ${SELECTORS.feedContainer} .fai-GeminiMessage__content {
-      margin-left: 0 !important;
-      padding-left: 0 !important;
-      text-align: left !important;
-      justify-content: flex-start !important;
-      align-items: flex-start !important;
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-      white-space: normal !important;
-      width: 100% !important;
-      max-width: none !important;
-      box-sizing: border-box !important;
-    }
-
-   /* Make every message article bubble full-width and text-wrapping */
-   ${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] {
-     width: 100% !important;
-     max-width: none !important;
-     box-sizing: border-box !important;
-     text-align: left !important;
-     overflow-wrap: anywhere !important;
-     word-break: break-word !important;
-     white-space: normal !important;
-   }
-
-    /* Ensure plain text elements wrap within message articles */
-    ${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] p,
-    ${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] li,
-    ${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] ul,
-    ${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] ol,
-    ${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] blockquote {
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-      white-space: normal !important;
-    }
-
-    /* --- Ensure code blocks and inline code wrap inside bubbles --- */
-    ${SELECTORS.llmChatMessageClass} pre,
-    ${SELECTORS.llmChatMessageClass} code,
-    ${SELECTORS.chatMessageContainerId} pre,
-    ${SELECTORS.chatMessageContainerId} code,
-    ${SELECTORS.llmChatMessageTestId} pre,
-    ${SELECTORS.llmChatMessageTestId} code {
-      white-space: pre-wrap !important;
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-      max-width: 100% !important;
-    }
-
- 
-    /* Nested bubble containers in flex/grid layouts: force start alignment */
-    ${SELECTORS.llmChatMessageClass} .message,
-    ${SELECTORS.chatMessageContainerId} .message,
-    ${SELECTORS.llmChatMessageTestId} .message,
-    ${SELECTORS.geminiMessageTestId} .message {
-      justify-content: flex-start !important;
-      align-items: flex-start !important;
-      place-content: start !important;
-      place-items: start !important;
-      text-align: left !important;
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-      white-space: normal !important;
-      margin-left: 0 !important;
-      padding-left: 0 !important;
-      width: 100% !important;
-      max-width: none !important;
-      box-sizing: border-box !important;
-    }
-
-    /* Clamp wide media/code to container width; preserve aspect ratio */
-    ${SELECTORS.feedContainer} img,
-    ${SELECTORS.feedContainer} svg,
-    ${SELECTORS.feedContainer} canvas,
-    ${SELECTORS.feedContainer} video,
-    ${SELECTORS.feedContainer} iframe,
-    ${SELECTORS.feedContainer} embed,
-    ${SELECTORS.feedContainer} table {
-      max-width: 100% !important;
-      height: auto !important;
-    }
-
-    /* Code & inline tokens: wrap aggressively to avoid horizontal overflow */
-    ${SELECTORS.feedContainer} pre,
-    ${SELECTORS.feedContainer} code,
-    ${SELECTORS.feedContainer} kbd,
-    ${SELECTORS.feedContainer} samp {
-      white-space: pre-wrap !important;
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-      max-width: 100% !important;
-    }
-
-    /* Long links: let the URL wrap rather than forcing horizontal scroll */
-    ${SELECTORS.feedContainer} a {
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-    }
-
-  [data-testid="chat-history-search-input"] {
-    width: 2000ch !important;
-    max-width: 100% !important;
-  }
-
-  [class*="tooltip" i],
-  [class*="fui-Tab__content"] {
-    display: inline-block !important;   /* Allows width to fit content */
-    width: fit-content !important;      /* Shrinks to text width */
-    height: fit-content !important;     /* Shrinks to text height */
-    padding: 0 !important;              /* Optional: remove extra space */
-    margin: 0 !important;               /* Optional: remove extra space */
-    overflow-wrap: anywhere !important;
-    word-break: break-word !important;
-   }
-
-  [class*="UserMessage"]:not([class*="UserMessage_actionBar"]),
-  [data-testid="chatQuestion"], [data-testid*="UserMessage"]:not([class*="UserMessage_actionBar"]) {
-    max-width: min(min(var(--gemini-vw, ${VW_SIZE}vw), 91vw), ${MAX_CHARS}ch) !important;
-    width: auto !important;
-    box-sizing: content-box !important;
-    margin-left: auto !important;
-    margin-right: 0 !important;
-    padding-left: auto !important;
-    padding-right: 0 !important;
-    align-self: flex-end !important;
-    justify-self: end !important;
-    place-self: end !important;
-    display: block !important;
-    overflow-wrap: anywhere !important;
-    word-break: break-word !important;
-    white-space: pre-wrap !important;
-  }
-
-    /* Tables: auto layout & full width to reduce clipping overflow */
-    ${SELECTORS.feedContainer} table {
-      table-layout: auto !important;
-      width: 100% !important;
-    }
-  `;
-}
-
-// ============================================================================
-// Max-layout CSS caching + injection bookkeeping (framesInSubtree variant)
-// ============================================================================
-const maxLayoutCssCache = new Map();              // cacheKey -> css string
-const injectedFrameIdsByWC = new WeakMap();       // webContents -> Set<routingId>
-const insertedMainCssKeyByWC = new WeakMap();     // webContents -> insertedCSS key (main frame)
-const cssApplyDebounceByWC = new WeakMap();       // webContents -> timeoutId
-
-// CSP-safe injection with re-inject on SPA navigations (and cleanup)
-function injectCSSOnLoad(win, css, keyHolder) {
- if (!win || !win.webContents) return;
- const wc = win.webContents;
- if (!keyHolder) return;
- // Allow callers to update CSS without re-wiring listeners.
- keyHolder.css = String(css ?? keyHolder.css ?? '');
-
- const inject = () => {
-  try {
-   const currentCss = String(keyHolder.css ?? '');
-   if (!currentCss) return;
-   if (keyHolder.key) {
-    try { wc.removeInsertedCSS(keyHolder.key); } catch {}
-    keyHolder.key = null;
-   }
-   wc.insertCSS(currentCss)
-    .then(k => { keyHolder.key = k; })
-    .catch(() => {});
-  } catch (err) {
-   console.error('insertCSS failed:', err);
-  }
- };
-
- // Wire reinjection hooks exactly once per keyHolder.
- if (!keyHolder.__wired) {
-  keyHolder.__wired = true;
-  wc.on('dom-ready', inject);
-  wc.on('did-finish-load', inject);
-//  wc.on('did-navigate-in-page', inject);
-  wc.on('did-start-navigation', inject);
- }
- inject();
-}
-
-// Inject CSS into all frames (main + iframes), and re-inject on frame loads.
-function injectCSSIntoAllFrames(win, css) {
-  if (!win || !win.webContents) return;
-  const wc = win.webContents;
-  const apply = () => {
-    try {
-     // Debounce reinjection bursts from multiple navigation/frame events.
-     const prev = cssApplyDebounceByWC.get(wc);
-     if (prev) clearTimeout(prev);
-     const t = setTimeout(() => {
-      try {
-       // Track per-frame injections so the same frame isn't hit repeatedly.
-       let injected = injectedFrameIdsByWC.get(wc);
-       if (!injected) {
-        injected = new Set();
-        injectedFrameIdsByWC.set(wc, injected);
-       }
-
-       // Iterate over the whole frame subtree (Electron 20+)
-       const frames = wc.mainFrame?.framesInSubtree ?? wc.mainFrame?.frames ?? [];
-       for (const f of frames) {
-        try {
-         const rid = (typeof f?.routingId === 'number') ? f.routingId : null;
-         if (rid !== null && injected.has(rid)) continue;
-         // Only mark as injected after success.
-         f.insertCSS(css).then(() => { if (rid !== null) injected.add(rid); }).catch(() => {});
-        } catch {}
-       }
-
-       // Main frame injection with key tracking to avoid accumulating duplicates.
-       const prevKey = insertedMainCssKeyByWC.get(wc);
-       if (prevKey) {
-        try { wc.removeInsertedCSS(prevKey); } catch {}
-       }
-       try {
-        wc.insertCSS(css).then((k) => { insertedMainCssKeyByWC.set(wc, k); }).catch(() => {});
-       } catch {}
-      } catch {}
-     }, 150);
-     cssApplyDebounceByWC.set(wc, t);
-    } catch {}
-  };
-  // Hook all relevant events (document + frame loads + in-page SPA nav)
-  wc.on('dom-ready', apply);
-  wc.on('did-frame-finish-load', apply);
-  wc.on('did-navigate-in-page', apply);
-  wc.on('did-frame-navigate', apply);
-  apply();
-}
-
-function applyMaxLayoutCSS(win, { specificMessageId } = {}) {
-  if (!win) return;
-  const cacheKey = specificMessageId || 'default';
-  let css = maxLayoutCssCache.get(cacheKey);
-  if (!css) {
-   css = buildMaxLayoutCSS({ specificMessageId });
-   maxLayoutCssCache.set(cacheKey, css);
-  }
-  // Main-frame-only: use key tracking + reinject on navigation.
-  if (!win.__maxLayoutKeyHolder) {
-   win.__maxLayoutKeyHolder = { key: null, css: '', __wired: false };
-  }
-  injectCSSOnLoad(win, css, win.__maxLayoutKeyHolder);
-}
-
-function requestExpandedLayout(win) {
-  if (!win) return;
-  const script = `
-    (function() {
-      try {
-        // Send a message to the page requesting expanded/full-bleed layout
-        window.postMessage({
-          type: 'host:setLayoutMode',
-          payload: { mode: 'expanded' }
-        }, '*');
-      } catch (e) {
-        console.error('PostMessage layout request failed:', e);
-      }
-    })();
-  `;
-  const run = () => {
-    try { win.webContents.executeJavaScript(script).catch(() => {}); }
-    catch (err) { console.error('requestExpandedLayout failed:', err); }
-  };
-  // Initial load
-  win.webContents.on('did-finish-load', run);
-  // Client-side route changes (SPA)
-  win.webContents.on('did-navigate-in-page', run);
-}
-
-// === Window state persistence (size/position) ===
-function getWindowStateFile(key) {
-  const safe = String(key || 'main')
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  return path.join(app.getPath('userData'), `window-state-${safe}.json`);
 }
 
 const windowStateCache = new Map(); // key -> {x,y,width,height}
@@ -2322,9 +1727,6 @@ function createWindow() {
   // Safety in case it was toggled elsewhere:
   mainWindow.setSkipTaskbar(false);
 
-  // Attach 'did-stop-loading' exactly once for this webContents.
-  ensureDidStopLoadingHandler(mainWindow.webContents);
-
   // Electron internally attaches temporary did-stop-loading listeners
   // during executeJavaScript(); this is expected for SPA apps.
   mainWindow.webContents.setMaxListeners(0);
@@ -2334,36 +1736,12 @@ function createWindow() {
 
   mainWindow.loadURL(gemini_URL); // Load your app
 
-  // Defer heavy layout CSS until after first paint to reduce initial layout thrash
-  try {
-    mainWindow.webContents.once('did-stop-loading', () => {
-      // Next tick ensures Chromium has painted once
-      setTimeout(() => {
-        try { applyMaxLayoutCSS(mainWindow); }
-        catch (e) { console.error('applyMaxLayoutCSS (deferred) failed:', e); }
-      }, 0);
-    });
-  } catch (e) {
-    console.error('applyMaxLayoutCSS defer wiring failed:', e);
-  }
-
-  try { applyDynamicWidth(mainWindow); } catch (e) { console.error('applyDynamicWidth failed:', e); }
-  try { attachVWResize(mainWindow); } catch (e) { console.error('attachVWResize failed:', e); }
-  try { requestExpandedLayout(mainWindow); } catch (e) { console.error('requestExpandedLayout (outer) failed:', e); }
+  mainWindow.loadURL(gemini_URL);
+  
+  // Apply the wide layout here too
+  applyWideLayout(mainWindow.webContents);
 
   // Build native context menu purely from main, based on Chromium's params
-
-  // Keep the 'did-stop-loading' handler singular when SPA navigations occur.
-  mainWindow.webContents.on('did-start-navigation', () => {
-    try { attachVWResize(mainWindow); } catch {}
-  });
-  mainWindow.webContents.on('destroyed', () => {
-    try { mainWindow?.webContents?.removeListener('did-stop-loading', onDidStopLoading);
-      if (mainWindow?.webContents) {
-        delete mainWindow.webContents.__hasDidStopLoadingHandler;
-      }
-    } catch {}
-  });
 
   mainWindow.webContents.on('context-menu', (_event, params) => {
     // params: { isEditable, selectionText, selectionTextIsEditable, mediaType, linkURL, inputFieldType, x, y, ... }
