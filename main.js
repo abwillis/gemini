@@ -617,6 +617,10 @@ function applyWideLayout(wc) {
 .conversation-container table {
   table-layout: auto !important;
   width: 100% !important;
+        max-width: 100% !important;
+word-break: normal !important;
+  overflow-wrap: anywhere; /* breaks only if absolutely necessary */
+  white-space: normal !important;
 }
     `);
   });
