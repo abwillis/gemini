@@ -3,9 +3,9 @@ const { app, BrowserWindow, Menu, MenuItem, Tray, nativeImage, shell, ipcMain, d
 const path = require('path');
 const fs = require('fs');
 
-// Force a persistent Chromium storage partition for Copilot.
+// Force a persistent Chromium storage partition for Gemini.
 // Electron: partitions starting with "persist:" use a persistent session. [5](https://www.electronjs.org/docs/latest/api/session)
-const COPILOT_PARTITION = String(process.env.COPILOT_PARTITION ?? 'persist:copilot-for-linux').trim();
+const GEMINI_PARTITION = String(process.env.GEMINI_PARTITION ?? 'persist:gemini-for-linux').trim();
 
 let mainWindow = null;
 let quickChatWindows = [];         // Multi-Quick Chat windows
@@ -25,11 +25,11 @@ const QUICK_PASTE_POST_KEY_DELAY_MS = 40; // tiny gap between paste and optional
 
 
 // --- Quick Chat / IPC constants --------------------------------------------
-const COPILOT_URL = 'https://m365.cloud.microsoft/chat';
+const GEMINI_URL = 'https://gemini.google.com';
 
 const IPC = Object.freeze({
-  SEND_SELECTION: 'copilot:send-selection',
-  QUICK_NEW: 'copilot:quick-new',
+  SEND_SELECTION: 'gemini:send-selection',
+  QUICK_NEW: 'gemini:quick-new',
 });
 
 const SEND_MODE = Object.freeze({
@@ -55,8 +55,8 @@ function quoteify(text) {
 
 function setRoleTitle(win, role, id) {
   try {
-    if (role === 'main') win.setTitle('Copilot — Main Chat');
-    else win.setTitle(`Copilot — Quick Chat ${id}`);
+    if (role === 'main') win.setTitle('Gemini — Main Chat');
+    else win.setTitle(`Gemini — Quick Chat ${id}`);
   } catch {}
 }
 
@@ -156,7 +156,7 @@ function delayMs(ms) {
 }
 
 /**
- * Wait until the Copilot chat input appears and is visible.
+ * Wait until the Gemini chat input appears and is visible.
  * This avoids a fixed delay and pastes as soon as the UI is ready.
  *
  * Returns true if ready before timeout, else false.
@@ -257,13 +257,13 @@ function createQuickChatWindow() {
     x: typeof initialBounds.x === 'number' ? initialBounds.x : undefined,
     y: typeof initialBounds.y === 'number' ? initialBounds.y : undefined,
     show: false,
-    title: `Copilot — Quick Chat ${id}`,
+    title: `Gemini — Quick Chat ${id}`,
     icon: appIconImage,
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
       preload: path.join(__dirname, 'preload.js'),
-      partition: COPILOT_PARTITION,
+      partition: GEMINI_PARTITION,
       devTools: true,
       backgroundThrottling: true,
       spellcheck: false
@@ -272,7 +272,7 @@ function createQuickChatWindow() {
     autoHideMenuBar: false
   });
 
-  win.__copilotRole = 'quick';
+  win.__geminiRole = 'quick';
   win.__quickId = id;
   win.__boundsKey = boundsKey;
   setRoleTitle(win, 'quick', id);
@@ -305,20 +305,9 @@ function createQuickChatWindow() {
   // Allow Electron's internal executeJavaScript() listeners
   // without triggering false-positive leak warnings
   win.webContents.setMaxListeners(0);
-  win.loadURL(COPILOT_URL);
+  win.loadURL(GEMINI_URL);
 
- // Defer heavy layout CSS until after first paint to reduce initial layout thrash
- try {
-  win.webContents.once('did-stop-loading', () => {
-   // Next tick ensures Chromium has painted once
-   setTimeout(() => {
-    try { applyMaxLayoutCSS(win); }
-    catch (e) { console.error('applyMaxLayoutCSS (quick deferred) failed:', e); }
-   }, 0);
-  });
- } catch (e) {
-  console.error('applyMaxLayoutCSS quick defer wiring failed:', e);
- }
+  try { applyWideLayout(win.webContents); } catch (e) { console.error('applyWideLayout (quick deferred) failed:', e); }
 
   win.once('ready-to-show', () => {
     reveal(win);
@@ -519,104 +508,32 @@ function ensureDidStopLoadingHandler(webContents) {
   webContents.on('did-stop-loading', onDidStopLoading);
 }
 
-// 7 options grouped into containers vs content for correct layout application
-const SELECTORS = {
-  // Containers (safe to apply full-viewport/layout rules)
-  feedContainer:           '${MESSAGE_LIST_SCOPE} [data-testid="MessageListContainer"] [role="feed"]',
-  listContainer:           '${MESSAGE_LIST_SCOPE} [data-testid="MessageListContainer"]',
-  copilotChatClass: `[class*="CopilotChat"]`,
-  layoutMainPane: `[data-testid="layout-main-pane"]`,
-  chatMessageResponserId: `[id*="chatMessageResponser"]`,
-  markdownReplyTestId: `[data-testid="markdown-reply"]`,
-  llmChatMessageClass: `[class*="m365-chat-llm-web-ui-chat-chat-message"]`,
-  chatMessageContainerId: `[id*="chatMessageContainer"]`,
-  llmChatMessageTestId: `[data-testid="m365-chat-llm-web-ui-chat-message"]`,
-  copilotMessageTestId: `[data-testid*="copilot-message"]`,
-
-  // Content targets (do NOT force height: 100vh here)H
-  allMessageContent_class:
-    '${MESSAGE_LIST_SCOPE} [role="feed"] .fai-CopilotMessage .fai-CopilotMessage__content',
-  allMessageContent_class_lowSpecificity:
-    '${MESSAGE_LIST_SCOPE} :where([role="feed"]) :where(.fai-CopilotMessage) :where(.fai-CopilotMessage__content)',
-  allMessageContent_attr:
-    '${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"][aria-labelledby*="copilot-message-" i] > div[id^="copilot-message-" i]',
-  linksInContent_class:
-    '${MESSAGE_LIST_SCOPE} [role="feed"] .fai-CopilotMessage__content a',
-  linksInContent_attr:
-    '${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] > div[id^="copilot-message-"] a',
-  minimalSemantic:
-    '${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] > [id^="copilot-message-"]',
-};
-/*
-const PREFERRED_CONTAINER_SELECTORS = [
-  SELECTORS.feedContainer,
-  SELECTORS.copilotChatClass,
-  SELECTORS.layoutMainPane,
-  SELECTORS.chatMessageResponserId,
-  SELECTORS.markdownReplyTestId,
-];
-*/
-// --- Centralized ignore list: ALWAYS excluded from layout adjustments ---
-const IGNORE_SELECTORS = [
-  `[class*="Drawer" i]`,
-  `[class*="chatinput" i]`,
-  `[id*="ChatInput" i]`,
-  `[class*="chat-input" i]`,
-  `[id*="chat-input" i]`,
-  `[class*="button" i]`,
-  `[type*="button" i]` ,
-  `[role="button" i]` ,
-  `[class*="Menu" i]`,
-  `[class*="MessageBar" i]`,
-  `[class*="editorinput" i]` ,
-  `[role="status"]`,
-  `[role*="tooltip"]`,
-  `[class*="tooltip" i]`,
-  `[class*="popover" i]`,
-  `[class*="hover" i]`,
-  `[data-tooltip]`,
-  `[data-popover]`,
-  `[role*="toolbar"]`,
-  `[data-testid*="message-actions" i]` ,
-  `[data-testid*="hover" i]` ,
-  `[class*="messageActions" i]` ,
-  `[class*="hoverCard" i]` ,
-  `[class*="floatingToolbar" i]` ,
-  `[class*="flyout" i]` ,
-  `[class*="contextualMenu" i]` ,
-  `[class*="usermessage" i]` ,
-  `[id*="user-message"]` ,
-  `[class*="actionsContainer"]` 
-];
-const IGNORE_JOINED = IGNORE_SELECTORS.join(', ');
-
-
 function applyDynamicWidth(win) {
   if (!win) return;
   const script = String.raw`(function(){try{
     const root = document.documentElement;
-    if (!getComputedStyle(root).getPropertyValue('--copilot-vw')) {
-      root.style.setProperty('--copilot-vw', '${VW_SIZE}vw');
+    if (!getComputedStyle(root).getPropertyValue('--gemini-vw')) {
+      root.style.setProperty('--gemini-vw', '${VW_SIZE}vw');
     }
-    window.__copilot_getTargetVW = function(){
-      try { const v = getComputedStyle(root).getPropertyValue('--copilot-vw').trim();
+    window.__gemini_getTargetVW = function(){
+      try { const v = getComputedStyle(root).getPropertyValue('--gemini-vw').trim();
         const m = /^(\d+)vw$/.exec(v); return m ? parseInt(m[1],10) : ${VW_SIZE}; } catch { return ${VW_SIZE}; }
     };
-    window.__copilot_setTargetVW = function(v){
-      try { const c = Math.max(${MIN_VW}, Math.min(${MAX_VW}, Math.round(v))); root.style.setProperty('--copilot-vw', c+'vw'); } catch {}
+    window.__gemini_setTargetVW = function(v){
+      try { const c = Math.max(${MIN_VW}, Math.min(${MAX_VW}, Math.round(v))); root.style.setProperty('--gemini-vw', c+'vw'); } catch {}
     };
   }catch(e){} })();`;
   try { win.webContents.executeJavaScript(script).catch(()=>{}); } catch {}
 }
 
-// Responsive VW: keep --copilot-vw tied to window size (95 → 30vw)
+// Responsive VW: keep --gemini-vw tied to window size (95 → 30vw)
 function attachVWResize(win) {
   if (!win || !win.webContents) return;
   const wc = win.webContents;
 
   // Run layout-affecting JS only once per window lifetime
-  if (wc.__copilotVWResizeAttached) return;
-  wc.__copilotVWResizeAttached = true;
+  if (wc.__geminiVWResizeAttached) return;
+  wc.__geminiVWResizeAttached = true;
 
   const script = `
     (function () {
@@ -630,8 +547,8 @@ function attachVWResize(win) {
             const winW = window.innerWidth;
             let vw = Math.round((winW / screenW) * MAX);
             vw = Math.max(MIN, Math.min(MAX, vw));
-            root.style.setProperty('--copilot-vw', vw + 'vw');
-            if (window.__copilot_setTargetVW) window.__copilot_setTargetVW(vw);
+            root.style.setProperty('--gemini-vw', vw + 'vw');
+            if (window.__gemini_setTargetVW) window.__gemini_setTargetVW(vw);
           } catch {}
         }
         computeVW();
@@ -650,344 +567,55 @@ const VW_SIZE = 100;
 const MIN_VW = 70;
 const MAX_VW = 100;
 //let   VW_WIDTH = 83;
-
-// Build CSS with container vs content separation
-
-function buildMaxLayoutCSS({ specificMessageId } = {}) {
-  const CONTAINERS = [
-    // existing containers
-    CHAT_SELECTOR,
-    SELECTORS.feedContainer,
-    SELECTORS.listContainer,
-    SELECTORS.copilotChatClass,
-    SELECTORS.layoutMainPane,
-    SELECTORS.chatMessageResponserId,
-    SELECTORS.markdownReplyTestId,
-    SELECTORS.llmChatMessageClass,
-    SELECTORS.chatMessageContainerId,
-    SELECTORS.llmChatMessageTestId,
-    SELECTORS.copilotMessageTestId,
-  ].join(',\n');
-
-  const CONTENT = [
-    specificMessageId ? messageContentById(specificMessageId) : null,
-    SELECTORS.allMessageContent_class,
-    SELECTORS.allMessageContent_class_lowSpecificity,
-    SELECTORS.allMessageContent_attr,
-   `${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"]`,
-    SELECTORS.linksInContent_class,
-    SELECTORS.linksInContent_attr,
-    SELECTORS.minimalSemantic,
-  ].filter(Boolean).join(',\n');
-
-  return String.raw`
-
-    /* Root var for dynamic target width; default 90vw */
-    html { --copilot-vw: ${VW_SIZE}vw; }
-
-    /* Page-level: strictly prevent horizontal scroll; allow vertical */
-    html, body {
-      height: 100vh !important;
-      width: 100% !important;
-      margin: 0 !important;
-      margin-left: 0 !important;
-      padding-left: 0 !important;
-      padding: 0 !important;
-      overflow-x: hidden !important;
-      overflow-y: auto !important;
-      background: #fff !important;
-      word-break: break-word !important;
-    }
-    
-/* Prompt container safety: do not clip sticky/fixed composer */
-[role="textbox"], rich-textarea {
-  overflow: visible !important;
-}
-@supports (overflow: clip) {
-      html, body { overflow-x: clip !important; }
-    }
-
-    /* #officehome-scroll-container must NOT scroll */
-    #officehome-scroll-container {
-      overflow: visible !important;        /* or overflow: hidden; if content must clip */
-      overscroll-behavior: contain !important;   /* avoid nested scroll chaining */
-    }
-
-    /* Neutral wrappers: full width, no clamp */
-    main, #root, #app,
-    .container, .wrapper, [class*="container"], [class*="wrapper"],
-    [class*="content"], [class*="shell"], [class*="layout"], [class*="gutter"] {
-      width: min(min(var(--copilot-vw, ${VW_SIZE}vw), 91vw), ${MAX_CHARS}ch) !important;
-      max-width: 100% !important;
-      margin-left: 0 !important;
-      margin-right: 0 !important;
-      padding-left: 0 !important;
-      padding-right: 0 !important;
-      table {
-        margin-left: 12px !important;
-        padding-left: 12px !important;
+function applyWideLayout(wc) {
+  wc.on('did-finish-load', () => {
+    wc.insertCSS(`
+      /* Expand the main conversation width */
+      .conversation-container, 
+      main, 
+      article, 
+      .full-width-container { 
+        max-width: 100% !important; 
+        width: 100% !important;
       }
-      justify-self: start !important;
-      place-self: start !important;
-      box-sizing: border-box !important;
-      overflow-x: visible !important;
-      overflow-y: visible !important;
-      word-break: break-word !important;
-    }
 
-    /* Main chat/message containers: always full width, never clipped */
-    [class*="CopilotChat"],
-    [data-testid="layout-main-pane"],
-    [id*="chatMessageResponser"],
-    [data-testid="markdown-reply"],
-    [class*="m365-chat-llm-web-ui-chat-chat-message"],
-    [id*="chatMessageContainer"],
-    [data-testid="m365-chat-llm-web-ui-chat-message"],
-    [data-testid*="copilot-message"] {
-      width: 100% !important;
-      max-width: none !important;
-      min-width: 0 !important;
-      box-sizing: border-box !important;
-      overflow-x: visible !important;
-      overflow-y: visible !important;
-      word-break: break-word !important;
-    }
+      /* Expand the input/text area at the bottom */
+      .input-area-container,
+      .bottom-container { 
+        max-width: 95% !important; 
+        margin: 0 auto !important;
+      }
 
-    /* Guard: descendant matches of the ignore list within containers keep spacing */
-    :is(${CONTAINERS}) :is(${IGNORE_JOINED}) {
-      width: auto !important;
-      max-width: none !important;
-      margin: initial !important;
-      padding: initial !important;
-      padding-left: 1px !important;
-    }
+      /* Optional: Adjust padding for readability on ultra-wide screens */
+      .conversation-container {
+        padding-left: 20px !important;
+        padding-right: 20px !important;
+      }
 
-    
-/* Prompt/editor safety: keep typing/clicking functional */
-${CHAT_SELECTOR} rich-textarea .ql-editor[contenteditable="true"],
-${CHAT_SELECTOR} .text-input-field_textarea .ql-editor[contenteditable="true"],
-${CHAT_SELECTOR} .ql-editor[contenteditable="true"],
-${CHAT_SELECTOR} div[contenteditable="true"][role="textbox"],
-${CHAT_SELECTOR} textarea,
-${CHAT_SELECTOR} input {
-  pointer-events: auto !important;
-  user-select: text !important;
-  -webkit-user-select: text !important;
-  cursor: text !important;
-  opacity: 1 !important;
-  z-index: 9999 !important;
-}
-
-/* Global prompt safety (unscoped): keep any editor inputs clickable even if the chat root selector misses */
-rich-textarea,
-rich-textarea *,
-div[contenteditable="true"][role="textbox"],
-[contenteditable="true"],
-textarea,
-input {
-  pointer-events: auto !important;
-  user-select: text !important;
-  -webkit-user-select: text !important;
-  cursor: text !important;
-}
-${SELECTORS.llmChatMessageClass},
-    ${SELECTORS.chatMessageContainerId},
-    ${SELECTORS.llmChatMessageTestId},
-    ${SELECTORS.copilotMessageTestId} {
-      /* eliminate left/right padding/margins that cause right shift */
-      margin-right: 0 !important;
-      padding-left: 0 !important;
-      padding-right: 0 !important;
-      /* align start in any flex/grid parent */
-      justify-self: start !important;
-      align-self: start !important;
-      place-self: start !important;
-      /* ensure they take full available width within container clamp */
-      width: 100% !important;
-      max-width: none !important;
-      box-sizing: border-box !important;
-      /* neutralize common layout shifters */
-      left: auto !important;
-      right: auto !important;
-      text-align: left !important;
-    }
-
-    /* If any inner wrapper adds accidental horizontal gap, clear it */
-    ${SELECTORS.llmChatMessageClass} *,
-    ${SELECTORS.chatMessageContainerId} *,
-    ${SELECTORS.llmChatMessageTestId} * {
-      padding-left: 0 !important;
-    }
-
-    /* === NEW: Shift-left nested message bubbles inside the three panes === */
-    /* Common bubble structures: role="article", copilot-message-* wrappers, generic bubble classes */
-    ${SELECTORS.llmChatMessageClass} [role="article"],
-    ${SELECTORS.llmChatMessageClass} [id^="copilot-message-" i],
-    ${SELECTORS.llmChatMessageClass} .fai-CopilotMessage,
-    ${SELECTORS.llmChatMessageClass} .fai-CopilotMessage__content,
-    ${SELECTORS.chatMessageContainerId} [role="article"],
-    ${SELECTORS.chatMessageContainerId} [id^="copilot-message-" i],
-    ${SELECTORS.chatMessageContainerId} .fai-CopilotMessage,
-    ${SELECTORS.chatMessageContainerId} .fai-CopilotMessage__content,
-    ${SELECTORS.llmChatMessageTestId} [role="article"],
-    ${SELECTORS.llmChatMessageTestId} [id^="copilot-message-" i],
-    ${SELECTORS.llmChatMessageTestId} .fai-CopilotMessage,
-    ${SELECTORS.llmChatMessageTestId} .fai-CopilotMessage__content {
-      margin-left: 0 !important;
-      padding-left: 0 !important;
-      /* Ensure left alignment even if parent uses center/space-around */
-      text-align: left !important;
-      justify-content: flex-start !important;
-      align-items: flex-start !important;
-      /* --- Ensure text wraps inside bubbles --- */
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-      white-space: normal !important;
-    }
-
-    /* Catch-all bubble alignment + wrapping for any Copilot message */
-    ${SELECTORS.feedContainer} [role="article"] > [id^="copilot-message-" i],
-    ${SELECTORS.feedContainer} [role="article"] [id^="copilot-message-" i],
-    ${SELECTORS.feedContainer} .fai-CopilotMessage,
-    ${SELECTORS.feedContainer} .fai-CopilotMessage__content {
-      margin-left: 0 !important;
-      padding-left: 0 !important;
-      text-align: left !important;
-      justify-content: flex-start !important;
-      align-items: flex-start !important;
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-      white-space: normal !important;
-      width: 100% !important;
-      max-width: none !important;
-      box-sizing: border-box !important;
-    }
-
-   /* Make every message article bubble full-width and text-wrapping */
-   ${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] {
-     width: 100% !important;
-     max-width: none !important;
-     box-sizing: border-box !important;
-     text-align: left !important;
-     overflow-wrap: anywhere !important;
-     word-break: break-word !important;
-     white-space: normal !important;
-   }
-
-    /* Ensure plain text elements wrap within message articles */
-    ${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] p,
-    ${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] li,
-    ${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] ul,
-    ${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] ol,
-    ${MESSAGE_LIST_SCOPE} [role="feed"] [role="article"] blockquote {
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-      white-space: normal !important;
-    }
-
-    /* --- Ensure code blocks and inline code wrap inside bubbles --- */
-    ${SELECTORS.llmChatMessageClass} pre,
-    ${SELECTORS.llmChatMessageClass} code,
-    ${SELECTORS.chatMessageContainerId} pre,
-    ${SELECTORS.chatMessageContainerId} code,
-    ${SELECTORS.llmChatMessageTestId} pre,
-    ${SELECTORS.llmChatMessageTestId} code {
-      white-space: pre-wrap !important;
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-      max-width: 100% !important;
-    }
-
- 
-    /* Nested bubble containers in flex/grid layouts: force start alignment */
-    ${SELECTORS.llmChatMessageClass} .message,
-    ${SELECTORS.chatMessageContainerId} .message,
-    ${SELECTORS.llmChatMessageTestId} .message,
-    ${SELECTORS.copilotMessageTestId} .message {
-      justify-content: flex-start !important;
-      align-items: flex-start !important;
-      place-content: start !important;
-      place-items: start !important;
-      text-align: left !important;
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-      white-space: normal !important;
-      margin-left: 0 !important;
-      padding-left: 0 !important;
-      width: 100% !important;
-      max-width: none !important;
-      box-sizing: border-box !important;
-    }
-
-    /* Clamp wide media/code to container width; preserve aspect ratio */
-    ${SELECTORS.feedContainer} img,
-    ${SELECTORS.feedContainer} svg,
-    ${SELECTORS.feedContainer} canvas,
-    ${SELECTORS.feedContainer} video,
-    ${SELECTORS.feedContainer} iframe,
-    ${SELECTORS.feedContainer} embed,
-    ${SELECTORS.feedContainer} table {
-      max-width: 100% !important;
-      height: auto !important;
-    }
-
-    /* Code & inline tokens: wrap aggressively to avoid horizontal overflow */
-    ${SELECTORS.feedContainer} pre,
-    ${SELECTORS.feedContainer} code,
-    ${SELECTORS.feedContainer} kbd,
-    ${SELECTORS.feedContainer} samp {
-      white-space: pre-wrap !important;
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-      max-width: 100% !important;
-    }
-
-    /* Long links: let the URL wrap rather than forcing horizontal scroll */
-    ${SELECTORS.feedContainer} a {
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-    }
-
-  [data-testid="chat-history-search-input"] {
-    width: 2000ch !important;
-    max-width: 100% !important;
-  }
-
-  [class*="tooltip" i],
-  [class*="fui-Tab__content"] {
-    display: inline-block !important;   /* Allows width to fit content */
-    width: fit-content !important;      /* Shrinks to text width */
-    height: fit-content !important;     /* Shrinks to text height */
-    padding: 0 !important;              /* Optional: remove extra space */
-    margin: 0 !important;               /* Optional: remove extra space */
-    overflow-wrap: anywhere !important;
-    word-break: break-word !important;
-   }
-
-  [class*="UserMessage"]:not([class*="UserMessage_actionBar"]),
-  [data-testid="chatQuestion"], [data-testid*="UserMessage"]:not([class*="UserMessage_actionBar"]) {
-    max-width: min(min(var(--copilot-vw, ${VW_SIZE}vw), 91vw), ${MAX_CHARS}ch) !important;
-    width: auto !important;
-    box-sizing: content-box !important;
-    margin-left: auto !important;
-    margin-right: 0 !important;
+/* Trying to get the user input in the conversation area to also expand */
+.user-query-container,
+[class*="user-query"],
+[data-test-id="user-query"],
+.query-content,
+.user-query {
+  max-width: none !important;
+width: 95vw !important;
+  box-sizing: content-box !important;
+  display: block !important; /* Overrides flex-end alignment if present */
+    padding-right: 10 !important;
     padding-left: auto !important;
-    padding-right: 0 !important;
     align-self: flex-end !important;
     justify-self: end !important;
     place-self: end !important;
     display: block !important;
+  margin-left: auto !important;
+  margin-right: 10 !important;
     overflow-wrap: anywhere !important;
     word-break: break-word !important;
     white-space: pre-wrap !important;
-  }
-
-    /* Tables: auto layout & full width to reduce clipping overflow */
-    ${SELECTORS.feedContainer} table {
-      table-layout: auto !important;
-      width: 100% !important;
-    }
-  `;
+}
+    `);
+  });
 }
 
 // ============================================================================
@@ -1081,21 +709,6 @@ function injectCSSIntoAllFrames(win, css) {
   wc.on('did-navigate-in-page', apply);
   wc.on('did-frame-navigate', apply);
   apply();
-}
-
-function applyMaxLayoutCSS(win, { specificMessageId } = {}) {
-  if (!win) return;
-  const cacheKey = specificMessageId || 'default';
-  let css = maxLayoutCssCache.get(cacheKey);
-  if (!css) {
-   css = buildMaxLayoutCSS({ specificMessageId });
-   maxLayoutCssCache.set(cacheKey, css);
-  }
-  // Main-frame-only: use key tracking + reinject on navigation.
-  if (!win.__maxLayoutKeyHolder) {
-   win.__maxLayoutKeyHolder = { key: null, css: '', __wired: false };
-  }
-  injectCSSOnLoad(win, css, win.__maxLayoutKeyHolder);
 }
 
 function requestExpandedLayout(win) {
@@ -1229,8 +842,8 @@ function getRuntimeInfo() {
   };
 }
 
-app.setName('copilot-for-linux');  // Shows as WMClass "yourapp" or "YourApp"
-app.setAppUserModelId('your.company.copilot');
+app.setName('gemini-for-linux');  // Shows as WMClass "yourapp" or "YourApp"
+app.setAppUserModelId('your.company.gemini');
 
 // === Parent-aware helpers for find-in-page ===
 // Prefer the parent window's webContents when the focused window is a modal.
@@ -1571,7 +1184,7 @@ async function getSelectionFragment(win) {
   container.appendChild(range.cloneContents());
 
   // -------------------------------
-  // DOM CLEANUP (Copilot-specific)
+  // DOM CLEANUP (Gemini-specific)
   // -------------------------------
 
   // Known non-content UI affordances:
@@ -1645,7 +1258,7 @@ async function buildSelectionEnvelope(sourceWin, opts) {
 
   if (mode === SEND_MODE.QUOTE) content = quoteify(content);
 
-  const role = src.__copilotRole || (src === mainWindow ? 'main' : 'unknown');
+  const role = src.__geminiRole || (src === mainWindow ? 'main' : 'unknown');
   const quickId = (typeof src.__quickId === 'number') ? src.__quickId : undefined;
 
   return {
@@ -1736,7 +1349,7 @@ function buildSendToQuickSubmenu(sourceWin, optsBase) {
 
 ipcMain.on(IPC.SEND_SELECTION, async (event, opts) => {
   const sender = BrowserWindow.fromWebContents(event.sender);
-  const source = (sender && sender.__copilotRole === 'main') ? sender : mainWindow;
+  const source = (sender && sender.__geminiRole === 'main') ? sender : mainWindow;
   try { await sendSelectionToQuick(source, opts); }
   catch (e) { console.error('IPC send selection failed:', e); }
 });
@@ -1936,7 +1549,7 @@ async function savePaneAsStandaloneHTML(win, filePath) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${(result && result.title) ? result.title : 'Copilot Chat'}</title>
+  <title>${(result && result.title) ? result.title : 'Gemini Chat'}</title>
   <style>
     html, body { margin: 0; padding: 0; }
     ${CHAT_SELECTOR} { width: 100%; max-width: 100%; }
@@ -1984,14 +1597,14 @@ async function savePaneAsCleanHTML(win, filePath) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${result.title || 'Copilot Chat'}</title>
+  <title>${result.title || 'Gemini Chat'}</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 20px; line-height: 1.5; color: #222; }
     h1,h2,h3,h4,h5 { margin: 0.6em 0 0.3em; }
     p { margin: 0.4em 0; }
     .message { margin-bottom: 12px; }
     .user { font-weight: 600; color: #333; }
-    .copilot { color: #004b9a; }
+    .gemini { color: #004b9a; }
     /* Generic content spacing */
     ul,ol { margin: 0.4em 0 0.4em 1.2em; }
     pre, code { font-family: Consolas, Menlo, monospace; }
@@ -2038,7 +1651,7 @@ async function promptSaveChatPane(win) {
   try {
     const { filePath, canceled } = await dialog.showSaveDialog(win, {
       title: 'Save Chat Pane As…',
-      defaultPath: 'copilot-chat.md',  // Default to Markdown file name
+      defaultPath: 'gemini-chat.md',  // Default to Markdown file name
       // Put Markdown first so it's the preselected filter
       filters: [
         { name: 'Markdown', extensions: ['md', 'markdown'] },
@@ -2070,7 +1683,7 @@ async function saveChatPaneAsMarkdown(win, filePath) {
     const clone = root.cloneNode(true);
 
     // -------------------------------
-    // DOM CLEANUP (Copilot-specific)
+    // DOM CLEANUP (Gemini-specific)
     // -------------------------------
 
     // Known non-content UI affordances:
@@ -2134,7 +1747,7 @@ async function saveChatPaneAsMarkdown(win, filePath) {
     const paneHtml = String(result.html || '');
 
   // IMPORTANT:
-  // Copilot renders diff lines as separate block elements (div/span)
+  // Gemini renders diff lines as separate block elements (div/span)
   // with NO newline text nodes. Inject newlines between blocks so
   // diffs and code retain line structure.
   const withLineBreaks = paneHtml.replace(/></g, '>\n<');
@@ -2227,7 +1840,7 @@ function appendFileItems(fileSubmenu, win) {
 async function saveAsDialog(win) {
   const { filePath, canceled } = await dialog.showSaveDialog(win, {
     title: 'Save Page As…',
-    defaultPath: 'copilot.html',
+    defaultPath: 'gemini.html',
     filters: [
       { name: 'Web Page, HTML only', extensions: ['html'] },
       { name: 'Web Archive (MHTML)', extensions: ['mhtml'] },
@@ -2248,7 +1861,7 @@ function createWindow() {
   // Clean up any existing window first
   if (mainWindow) return; // do not destroy/recreate unless needed
 
- const taIcon = nativeImage.createFromPath(getIconPath('copilot-for-linux.png'));
+ const taIcon = nativeImage.createFromPath(getIconPath('gemini-for-linux.png'));
  /*     console.log('Native path resolved:', taIcon); // Echo to terminal
  if (taIcon.isEmpty()) {
   console.error('ICON FAILED TO LOAD — path is wrong or file corrupted');
@@ -2273,19 +1886,19 @@ function createWindow() {
   // Assign to the outer-scoped variable (do NOT redeclare with const here)
   mainWindow = new BrowserWindow({
   skipTaskbar: false,
-  title: 'Copilot — Main Chat',
+  title: 'Gemini — Main Chat',
     width: initialBounds.width,
     height: initialBounds.height,
     x: typeof initialBounds.x === 'number' ? initialBounds.x : undefined,
     y: typeof initialBounds.y === 'number' ? initialBounds.y : undefined,
     show: false, // start hidden; control via tray
-//    icon: path.join(__dirname, 'assets', 'copilot-for-linux.png'), // used for window/taskbar on Linux
+//    icon: path.join(__dirname, 'assets', 'gemini-for-linux.png'), // used for window/taskbar on Linux
     icon: appIconImage || taIcon, // cached if available
     webPreferences: {
       nodeIntegration: false,      // renderer cannot use Node APIs
       contextIsolation: true,      // safer: isolates preload from page
       preload: path.join(__dirname, 'preload.js'), // optional: expose safe APIs
-      partition: COPILOT_PARTITION,
+      partition: GEMINI_PARTITION,
       devTools: true,
       backgroundThrottling: true,   // reduce CPU when hidden
       spellcheck: false            // disable if not required
@@ -2335,7 +1948,7 @@ function createWindow() {
   // If you initially create hidden:
   mainWindow.once('ready-to-show', () => {
   reveal(mainWindow);
-  try { mainWindow.__copilotRole = 'main'; } catch {}
+  try { mainWindow.__geminiRole = 'main'; } catch {}
   try { mainWindow.__boundsKey = boundsKey; } catch {}
   setRoleTitle(mainWindow, 'main');
   augmentApplicationMenu(mainWindow);  // Augment the existing app menu with our File/Edit items
@@ -2353,20 +1966,9 @@ function createWindow() {
   // const _origOn = mainWindow.webContents.on.bind(mainWindow.webContents);
   // mainWindow.webContents.on = (evt, fn) => { if (evt === 'did-stop-loading') console.trace('[TRACE] did-stop-loading on()'); return _origOn(evt, fn); };
 
-  mainWindow.loadURL(COPILOT_URL); // Load your app
+  mainWindow.loadURL(GEMINI_URL); // Load your app
 
-  // Defer heavy layout CSS until after first paint to reduce initial layout thrash
-  try {
-    mainWindow.webContents.once('did-stop-loading', () => {
-      // Next tick ensures Chromium has painted once
-      setTimeout(() => {
-        try { applyMaxLayoutCSS(mainWindow); }
-        catch (e) { console.error('applyMaxLayoutCSS (deferred) failed:', e); }
-      }, 0);
-    });
-  } catch (e) {
-    console.error('applyMaxLayoutCSS defer wiring failed:', e);
-  }
+  try { applyWideLayout(mainWindow.webContents); } catch (e) { console.error('applyWideLayout (deferred) failed:', e); }
 
   try { applyDynamicWidth(mainWindow); } catch (e) { console.error('applyDynamicWidth failed:', e); }
   try { attachVWResize(mainWindow); } catch (e) { console.error('attachVWResize failed:', e); }
@@ -2599,11 +2201,11 @@ function createWindow() {
     if (input.type === 'keyDown' && input.control && input.alt) {
       if (input.key === '=' || input.key === '+') {
         event.preventDefault();
-        try { mainWindow.webContents.executeJavaScript('(function(){const cur=window.__copilot_getTargetVW?.() ?? ${VW_SIZE}; window.__copilot_setTargetVW?.(cur+5);})()'); } catch {}
+        try { mainWindow.webContents.executeJavaScript('(function(){const cur=window.__gemini_getTargetVW?.() ?? ${VW_SIZE}; window.__gemini_setTargetVW?.(cur+5);})()'); } catch {}
       }
       if (input.key === '-') {
         event.preventDefault();
-        try { mainWindow.webContents.executeJavaScript('(function(){const cur=window.__copilot_getTargetVW?.() ?? ${VW_SIZE}; window.__copilot_setTargetVW?.(cur-5);})()'); } catch {}
+        try { mainWindow.webContents.executeJavaScript('(function(){const cur=window.__gemini_getTargetVW?.() ?? ${VW_SIZE}; window.__gemini_setTargetVW?.(cur-5);})()'); } catch {}
       }
     }
     if (input.type === 'keyDown' && input.key === 'Escape') {
@@ -2656,7 +2258,7 @@ function getIconPath(filename) {
 
 function createTray() {
   // Use a 24x24 or 32x32 PNG for Cinnamon panel
-  const iconPath = getIconPath('copilot-for-linux.png');
+  const iconPath = getIconPath('gemini-for-linux.png');
 
   // Validate path during development (optional)
  //  console.log('Tray icon exists?', require('fs').existsSync(iconPath));
@@ -2666,9 +2268,9 @@ function createTray() {
   const smallImage = trayImage.isEmpty ? null : trayImage.resize({ width: 24, height: 24 });
 
   // Fall back to app icon if tray image is missing
-  tray = new Tray(smallImage || appIconImage || nativeImage.createFromPath(path.join(__dirname, 'assets', 'copilot-for-linux.png')));
+  tray = new Tray(smallImage || appIconImage || nativeImage.createFromPath(path.join(__dirname, 'assets', 'gemini-for-linux.png')));
 
-  tray.setToolTip('Microsoft Copilot');
+  tray.setToolTip('Microsoft Gemini');
 
   const contextMenu = Menu.buildFromTemplate([
     {
@@ -2752,9 +2354,9 @@ app.on('before-quit', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.executeJavaScript(`(function(){
         try {
-          if (window.__copilot_layoutObserver) {
-            window.__copilot_layoutObserver.disconnect();
-            window.__copilot_layoutObserver = null;
+          if (window.__gemini_layoutObserver) {
+            window.__gemini_layoutObserver.disconnect();
+            window.__gemini_layoutObserver = null;
           }
         } catch {}
       })();`).catch(() => {});

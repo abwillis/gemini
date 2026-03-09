@@ -3,9 +3,9 @@ const { app, BrowserWindow, Menu, MenuItem, Tray, nativeImage, shell, ipcMain, d
 const path = require('path');
 const fs = require('fs');
 
-// Force a persistent Chromium storage partition for gemini.
+// Force a persistent Chromium storage partition for Gemini.
 // Electron: partitions starting with "persist:" use a persistent session. [5](https://www.electronjs.org/docs/latest/api/session)
-const gemini_PARTITION = String(process.env.gemini_PARTITION ?? 'persist:gemini-for-linux').trim();
+const GEMINI_PARTITION = String(process.env.GEMINI_PARTITION ?? 'persist:gemini-for-linux').trim();
 
 let mainWindow = null;
 let quickChatWindows = [];         // Multi-Quick Chat windows
@@ -25,7 +25,7 @@ const QUICK_PASTE_POST_KEY_DELAY_MS = 40; // tiny gap between paste and optional
 
 
 // --- Quick Chat / IPC constants --------------------------------------------
-const gemini_URL = 'https://gemini.google.com';
+const GEMINI_URL = 'https://gemini.google.com';
 
 const IPC = Object.freeze({
   SEND_SELECTION: 'gemini:send-selection',
@@ -36,57 +36,6 @@ const SEND_MODE = Object.freeze({
   PLAIN: 'plain',
   QUOTE: 'quote',
 });
-
-function applyWideLayout(wc) {
-  wc.on('did-finish-load', () => {
-    wc.insertCSS(`
-      /* Expand the main conversation width */
-      .conversation-container, 
-      main, 
-      article, 
-      .full-width-container { 
-        max-width: 100% !important; 
-        width: 100% !important;
-      }
-
-      /* Expand the input/text area at the bottom */
-      .input-area-container,
-      .bottom-container { 
-        max-width: 95% !important; 
-        margin: 0 auto !important;
-      }
-
-      /* Optional: Adjust padding for readability on ultra-wide screens */
-      .conversation-container {
-        padding-left: 20px !important;
-        padding-right: 20px !important;
-      }
-
-/* Trying to get the user input in the conversation area to also expand */
-.user-query-container,
-[class*="user-query"],
-[data-test-id="user-query"],
-.query-content,
-.user-query {
-  max-width: none !important;
-width: 95vw !important;
-  box-sizing: content-box !important;
-  display: block !important; /* Overrides flex-end alignment if present */
-    padding-right: 10 !important;
-    padding-left: auto !important;
-    align-self: flex-end !important;
-    justify-self: end !important;
-    place-self: end !important;
-    display: block !important;
-  margin-left: auto !important;
-  margin-right: 10 !important;
-    overflow-wrap: anywhere !important;
-    word-break: break-word !important;
-    white-space: pre-wrap !important;
-}
-    `);
-  });
-}
 
 function normalizeSendOptions(opts) {
   const o = (opts && typeof opts === 'object') ? opts : {};
@@ -106,8 +55,8 @@ function quoteify(text) {
 
 function setRoleTitle(win, role, id) {
   try {
-    if (role === 'main') win.setTitle('gemini — Main Chat');
-    else win.setTitle(`gemini — Quick Chat ${id}`);
+    if (role === 'main') win.setTitle('Gemini — Main Chat');
+    else win.setTitle(`Gemini — Quick Chat ${id}`);
   } catch {}
 }
 
@@ -207,7 +156,7 @@ function delayMs(ms) {
 }
 
 /**
- * Wait until the gemini chat input appears and is visible.
+ * Wait until the Gemini chat input appears and is visible.
  * This avoids a fixed delay and pastes as soon as the UI is ready.
  *
  * Returns true if ready before timeout, else false.
@@ -308,13 +257,13 @@ function createQuickChatWindow() {
     x: typeof initialBounds.x === 'number' ? initialBounds.x : undefined,
     y: typeof initialBounds.y === 'number' ? initialBounds.y : undefined,
     show: false,
-    title: `gemini — Quick Chat ${id}`,
+    title: `Gemini — Quick Chat ${id}`,
     icon: appIconImage,
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
       preload: path.join(__dirname, 'preload.js'),
-      partition: gemini_PARTITION,
+      partition: GEMINI_PARTITION,
       devTools: true,
       backgroundThrottling: true,
       spellcheck: false
@@ -351,16 +300,26 @@ function createQuickChatWindow() {
   win.on('resize', () => scheduleSaveWindowState(win, boundsKey));
   win.on('move', () => scheduleSaveWindowState(win, boundsKey));
 
+  ensureDidStopLoadingHandler(win.webContents);
+
   // Allow Electron's internal executeJavaScript() listeners
   // without triggering false-positive leak warnings
   win.webContents.setMaxListeners(0);
-  win.loadURL(gemini_URL);
+  win.loadURL(GEMINI_URL);
 
-  // ... inside createQuickChatWindow ...
-    win.loadURL(gemini_URL);
+  try { applyWideLayout(win.webContents); } catch (e) { console.error('applyWideLayout (quick deferred) failed:', e); }
 
-  // Apply the wide layout to this specific window
-  applyWideLayout(win.webContents);
+  win.once('ready-to-show', () => {
+    reveal(win);
+    try { applyDynamicWidth(win); } catch {}
+    try { attachVWResize(win); } catch {}
+    try { requestExpandedLayout(win); } catch {}
+  });
+
+  win.webContents.on('did-start-navigation', () => {
+    try { attachVWResize(win); } catch {}
+  });
+
 
   // --- Right-click native context menu (same as Main Chat) ---
   win.webContents.on('context-menu', (_event, params) => {
@@ -517,6 +476,277 @@ function createQuickChatWindow() {
   ));
 
   return win;
+}
+
+
+// --- Make the site use the full viewport by injecting CSS (CSP-safe) ---
+const CHAT_SELECTOR = '#mainChat';  // Root container for the chat UI
+const MESSAGE_LIST_SCOPE = '#mainChat div[id*="messagelist" i]';
+
+// Parameterized single-message selector
+const messageContentById = (id) => `#mainChat #${id}`;
+
+// === Safe 'did-stop-loading' wiring =========================================
+// A named handler so removeListener(...) can reliably detach the same function.
+function onDidStopLoading() {
+  try {
+    // Place your post-load logic here (keep it lightweight or idempotent).
+    // Example: enforceNoHScroll(BrowserWindow.getFocusedWindow() || mainWindow);
+  } catch (err) {
+    console.error('did-stop-loading handler error:', err);
+  }
+}
+
+// Attach the handler exactly once per webContents.
+function ensureDidStopLoadingHandler(webContents) {
+ if (!webContents) return;
+
+  // Guard against duplicate attachment across SPA navigations
+  if (webContents.__hasDidStopLoadingHandler) return;
+
+  webContents.__hasDidStopLoadingHandler = true;
+  webContents.on('did-stop-loading', onDidStopLoading);
+}
+
+function applyDynamicWidth(win) {
+  if (!win) return;
+  const script = String.raw`(function(){try{
+    const root = document.documentElement;
+    if (!getComputedStyle(root).getPropertyValue('--gemini-vw')) {
+      root.style.setProperty('--gemini-vw', '${VW_SIZE}vw');
+    }
+    window.__gemini_getTargetVW = function(){
+      try { const v = getComputedStyle(root).getPropertyValue('--gemini-vw').trim();
+        const m = /^(\d+)vw$/.exec(v); return m ? parseInt(m[1],10) : ${VW_SIZE}; } catch { return ${VW_SIZE}; }
+    };
+    window.__gemini_setTargetVW = function(v){
+      try { const c = Math.max(${MIN_VW}, Math.min(${MAX_VW}, Math.round(v))); root.style.setProperty('--gemini-vw', c+'vw'); } catch {}
+    };
+  }catch(e){} })();`;
+  try { win.webContents.executeJavaScript(script).catch(()=>{}); } catch {}
+}
+
+// Responsive VW: keep --gemini-vw tied to window size (95 → 30vw)
+function attachVWResize(win) {
+  if (!win || !win.webContents) return;
+  const wc = win.webContents;
+
+  // Run layout-affecting JS only once per window lifetime
+  if (wc.__geminiVWResizeAttached) return;
+  wc.__geminiVWResizeAttached = true;
+
+  const script = `
+    (function () {
+      try {
+        const MAX = 95;
+        const MIN = 70;
+        const root = document.documentElement;
+        function computeVW() {
+          try {
+            const screenW = (window.screen && window.screen.width) ? window.screen.width : window.innerWidth;
+            const winW = window.innerWidth;
+            let vw = Math.round((winW / screenW) * MAX);
+            vw = Math.max(MIN, Math.min(MAX, vw));
+            root.style.setProperty('--gemini-vw', vw + 'vw');
+            if (window.__gemini_setTargetVW) window.__gemini_setTargetVW(vw);
+          } catch {}
+        }
+        computeVW();
+        window.addEventListener('resize', computeVW, { passive: true });
+        window.addEventListener('orientationchange', computeVW, { passive: true });
+      } catch {}
+    })();
+  `;
+  const run = () => { try { wc.executeJavaScript(script).catch(() => {}); } catch {} };
+  wc.once('dom-ready', run);
+}
+
+// --- Dynamic width constants (added) ---
+const MAX_CHARS = 1024;
+const VW_SIZE = 100;
+const MIN_VW = 70;
+const MAX_VW = 100;
+//let   VW_WIDTH = 83;
+function applyWideLayout(wc) {
+  wc.on('did-stop-loading', () => {
+    wc.insertCSS(`
+      /* Expand the main conversation width */
+      .conversation-container, 
+      main, 
+      article, 
+      .full-width-container { 
+        max-width: 100% !important; 
+        width: 100% !important;
+        overflow-x: hidden !important;
+        overflow-y: hidden !important;
+        overflow-wrap: anywhere !important;
+        word-break: break-word !important;
+      }
+
+      /* Expand the input/text area at the bottom */
+      .input-area-container,
+      .bottom-container { 
+        max-width: 95% !important; 
+        margin: 0 auto !important;
+      }
+
+      /* Optional: Adjust padding for readability on ultra-wide screens */
+      .conversation-container {
+        padding-left: 20px !important;
+        padding-right: 20px !important;
+      }
+
+      /* Trying to get the user input in the conversation area to also expand */
+      [class*="user-query"],
+  
+.conversation-container > *,
+.conversation-container article > *,
+.conversation-container [role="article"] 
+{
+        max-width: min(min(var(--copilot-vw, ${VW_SIZE}vw), 91vw), ${MAX_CHARS}ch) !important;
+        width: 100% !important;
+        box-sizing: border-box !important;
+        margin-left: auto !important;
+        margin-right: 0 !important;
+        padding-left: auto !important;
+        padding-right: 0 !important;
+        display: block !important;
+      }
+
+/* Tables: allow natural column sizing */
+.conversation-container table {
+  table-layout: auto !important;
+  width: 100% !important;
+}
+    `);
+  });
+}
+
+// ============================================================================
+// Max-layout CSS caching + injection bookkeeping (framesInSubtree variant)
+// ============================================================================
+const maxLayoutCssCache = new Map();              // cacheKey -> css string
+const injectedFrameIdsByWC = new WeakMap();       // webContents -> Set<routingId>
+const insertedMainCssKeyByWC = new WeakMap();     // webContents -> insertedCSS key (main frame)
+const cssApplyDebounceByWC = new WeakMap();       // webContents -> timeoutId
+
+// CSP-safe injection with re-inject on SPA navigations (and cleanup)
+function injectCSSOnLoad(win, css, keyHolder) {
+ if (!win || !win.webContents) return;
+ const wc = win.webContents;
+ if (!keyHolder) return;
+ // Allow callers to update CSS without re-wiring listeners.
+ keyHolder.css = String(css ?? keyHolder.css ?? '');
+
+ const inject = () => {
+  try {
+   const currentCss = String(keyHolder.css ?? '');
+   if (!currentCss) return;
+   if (keyHolder.key) {
+    try { wc.removeInsertedCSS(keyHolder.key); } catch {}
+    keyHolder.key = null;
+   }
+   wc.insertCSS(currentCss)
+    .then(k => { keyHolder.key = k; })
+    .catch(() => {});
+  } catch (err) {
+   console.error('insertCSS failed:', err);
+  }
+ };
+
+ // Wire reinjection hooks exactly once per keyHolder.
+ if (!keyHolder.__wired) {
+  keyHolder.__wired = true;
+  wc.on('dom-ready', inject);
+  wc.on('did-finish-load', inject);
+//  wc.on('did-navigate-in-page', inject);
+  wc.on('did-start-navigation', inject);
+ }
+ inject();
+}
+
+// Inject CSS into all frames (main + iframes), and re-inject on frame loads.
+function injectCSSIntoAllFrames(win, css) {
+  if (!win || !win.webContents) return;
+  const wc = win.webContents;
+  const apply = () => {
+    try {
+     // Debounce reinjection bursts from multiple navigation/frame events.
+     const prev = cssApplyDebounceByWC.get(wc);
+     if (prev) clearTimeout(prev);
+     const t = setTimeout(() => {
+      try {
+       // Track per-frame injections so the same frame isn't hit repeatedly.
+       let injected = injectedFrameIdsByWC.get(wc);
+       if (!injected) {
+        injected = new Set();
+        injectedFrameIdsByWC.set(wc, injected);
+       }
+
+       // Iterate over the whole frame subtree (Electron 20+)
+       const frames = wc.mainFrame?.framesInSubtree ?? wc.mainFrame?.frames ?? [];
+       for (const f of frames) {
+        try {
+         const rid = (typeof f?.routingId === 'number') ? f.routingId : null;
+         if (rid !== null && injected.has(rid)) continue;
+         // Only mark as injected after success.
+         f.insertCSS(css).then(() => { if (rid !== null) injected.add(rid); }).catch(() => {});
+        } catch {}
+       }
+
+       // Main frame injection with key tracking to avoid accumulating duplicates.
+       const prevKey = insertedMainCssKeyByWC.get(wc);
+       if (prevKey) {
+        try { wc.removeInsertedCSS(prevKey); } catch {}
+       }
+       try {
+        wc.insertCSS(css).then((k) => { insertedMainCssKeyByWC.set(wc, k); }).catch(() => {});
+       } catch {}
+      } catch {}
+     }, 150);
+     cssApplyDebounceByWC.set(wc, t);
+    } catch {}
+  };
+  // Hook all relevant events (document + frame loads + in-page SPA nav)
+  wc.on('dom-ready', apply);
+  wc.on('did-frame-finish-load', apply);
+  wc.on('did-navigate-in-page', apply);
+  wc.on('did-frame-navigate', apply);
+  apply();
+}
+
+function requestExpandedLayout(win) {
+  if (!win) return;
+  const script = `
+    (function() {
+      try {
+        // Send a message to the page requesting expanded/full-bleed layout
+        window.postMessage({
+          type: 'host:setLayoutMode',
+          payload: { mode: 'expanded' }
+        }, '*');
+      } catch (e) {
+        console.error('PostMessage layout request failed:', e);
+      }
+    })();
+  `;
+  const run = () => {
+    try { win.webContents.executeJavaScript(script).catch(() => {}); }
+    catch (err) { console.error('requestExpandedLayout failed:', err); }
+  };
+  // Initial load
+  win.webContents.on('did-finish-load', run);
+  // Client-side route changes (SPA)
+  win.webContents.on('did-navigate-in-page', run);
+}
+
+// === Window state persistence (size/position) ===
+function getWindowStateFile(key) {
+  const safe = String(key || 'main')
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return path.join(app.getPath('userData'), `window-state-${safe}.json`);
 }
 
 const windowStateCache = new Map(); // key -> {x,y,width,height}
@@ -958,7 +1188,7 @@ async function getSelectionFragment(win) {
   container.appendChild(range.cloneContents());
 
   // -------------------------------
-  // DOM CLEANUP (gemini-specific)
+  // DOM CLEANUP (Gemini-specific)
   // -------------------------------
 
   // Known non-content UI affordances:
@@ -1323,7 +1553,7 @@ async function savePaneAsStandaloneHTML(win, filePath) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${(result && result.title) ? result.title : 'gemini Chat'}</title>
+  <title>${(result && result.title) ? result.title : 'Gemini Chat'}</title>
   <style>
     html, body { margin: 0; padding: 0; }
     ${CHAT_SELECTOR} { width: 100%; max-width: 100%; }
@@ -1371,7 +1601,7 @@ async function savePaneAsCleanHTML(win, filePath) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${result.title || 'gemini Chat'}</title>
+  <title>${result.title || 'Gemini Chat'}</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 20px; line-height: 1.5; color: #222; }
     h1,h2,h3,h4,h5 { margin: 0.6em 0 0.3em; }
@@ -1457,7 +1687,7 @@ async function saveChatPaneAsMarkdown(win, filePath) {
     const clone = root.cloneNode(true);
 
     // -------------------------------
-    // DOM CLEANUP (gemini-specific)
+    // DOM CLEANUP (Gemini-specific)
     // -------------------------------
 
     // Known non-content UI affordances:
@@ -1521,7 +1751,7 @@ async function saveChatPaneAsMarkdown(win, filePath) {
     const paneHtml = String(result.html || '');
 
   // IMPORTANT:
-  // gemini renders diff lines as separate block elements (div/span)
+  // Gemini renders diff lines as separate block elements (div/span)
   // with NO newline text nodes. Inject newlines between blocks so
   // diffs and code retain line structure.
   const withLineBreaks = paneHtml.replace(/></g, '>\n<');
@@ -1660,7 +1890,7 @@ function createWindow() {
   // Assign to the outer-scoped variable (do NOT redeclare with const here)
   mainWindow = new BrowserWindow({
   skipTaskbar: false,
-  title: 'gemini — Main Chat',
+  title: 'Gemini — Main Chat',
     width: initialBounds.width,
     height: initialBounds.height,
     x: typeof initialBounds.x === 'number' ? initialBounds.x : undefined,
@@ -1672,7 +1902,7 @@ function createWindow() {
       nodeIntegration: false,      // renderer cannot use Node APIs
       contextIsolation: true,      // safer: isolates preload from page
       preload: path.join(__dirname, 'preload.js'), // optional: expose safe APIs
-      partition: gemini_PARTITION,
+      partition: GEMINI_PARTITION,
       devTools: true,
       backgroundThrottling: true,   // reduce CPU when hidden
       spellcheck: false            // disable if not required
@@ -1730,6 +1960,9 @@ function createWindow() {
   // Safety in case it was toggled elsewhere:
   mainWindow.setSkipTaskbar(false);
 
+  // Attach 'did-stop-loading' exactly once for this webContents.
+  ensureDidStopLoadingHandler(mainWindow.webContents);
+
   // Electron internally attaches temporary did-stop-loading listeners
   // during executeJavaScript(); this is expected for SPA apps.
   mainWindow.webContents.setMaxListeners(0);
@@ -1737,14 +1970,27 @@ function createWindow() {
   // const _origOn = mainWindow.webContents.on.bind(mainWindow.webContents);
   // mainWindow.webContents.on = (evt, fn) => { if (evt === 'did-stop-loading') console.trace('[TRACE] did-stop-loading on()'); return _origOn(evt, fn); };
 
-  mainWindow.loadURL(gemini_URL); // Load your app
+  mainWindow.loadURL(GEMINI_URL); // Load your app
 
-  mainWindow.loadURL(gemini_URL);
-  
-  // Apply the wide layout here too
-  applyWideLayout(mainWindow.webContents);
+  try { applyWideLayout(mainWindow.webContents); } catch (e) { console.error('applyWideLayout (deferred) failed:', e); }
+
+  try { applyDynamicWidth(mainWindow); } catch (e) { console.error('applyDynamicWidth failed:', e); }
+  try { attachVWResize(mainWindow); } catch (e) { console.error('attachVWResize failed:', e); }
+  try { requestExpandedLayout(mainWindow); } catch (e) { console.error('requestExpandedLayout (outer) failed:', e); }
 
   // Build native context menu purely from main, based on Chromium's params
+
+  // Keep the 'did-stop-loading' handler singular when SPA navigations occur.
+  mainWindow.webContents.on('did-start-navigation', () => {
+    try { attachVWResize(mainWindow); } catch {}
+  });
+  mainWindow.webContents.on('destroyed', () => {
+    try { mainWindow?.webContents?.removeListener('did-stop-loading', onDidStopLoading);
+      if (mainWindow?.webContents) {
+        delete mainWindow.webContents.__hasDidStopLoadingHandler;
+      }
+    } catch {}
+  });
 
   mainWindow.webContents.on('context-menu', (_event, params) => {
     // params: { isEditable, selectionText, selectionTextIsEditable, mediaType, linkURL, inputFieldType, x, y, ... }
@@ -2028,7 +2274,7 @@ function createTray() {
   // Fall back to app icon if tray image is missing
   tray = new Tray(smallImage || appIconImage || nativeImage.createFromPath(path.join(__dirname, 'assets', 'gemini-for-linux.png')));
 
-  tray.setToolTip('Microsoft gemini');
+  tray.setToolTip('Microsoft Gemini');
 
   const contextMenu = Menu.buildFromTemplate([
     {
