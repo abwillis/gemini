@@ -2,6 +2,8 @@
 const { app, BrowserWindow, Menu, MenuItem, Tray, nativeImage, shell, ipcMain, dialog, screen, clipboard, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const TurndownService = require('turndown');
+const turndownPluginGfm = require('turndown-plugin-gfm');
 
 // Force a persistent Chromium storage partition for Gemini.
 // Electron: partitions starting with "persist:" use a persistent session. [5](https://www.electronjs.org/docs/latest/api/session)
@@ -20,6 +22,7 @@ let trayImage24 = null;  // Cached icon images
 
 // --- Clipboard-based Quick Chat paste timing ---------------------------------
 // Requirement: copy selection -> open/focus Quick Chat -> wait 3s -> paste.
+const QUICK_PASTE_NEW_WINDOW_DELAY_MS = 300;
 const QUICK_PASTE_DELAY_MS = 3000; // NOTE: This is now a fallback timeout only. Primary path waits for input readiness.
 const QUICK_PASTE_POST_KEY_DELAY_MS = 40; // tiny gap between paste and optional Enter
 
@@ -206,10 +209,12 @@ async function scheduleQuickPaste(wc, { autoSubmit = false } = {}) {
   // Primary: wait for UI readiness
   const ready = await waitForChatInput(wc, 4000);
   if (ready) {
-    const pasted = sendPasteKeystroke(wc);
-    if (autoSubmit && pasted) {
-      setTimeout(() => sendEnterKeystroke(wc), QUICK_PASTE_POST_KEY_DELAY_MS);
-    }
+    setTimeout(() => {
+      const pasted = sendPasteKeystroke(wc);
+      if (autoSubmit && pasted) {
+        setTimeout(() => sendEnterKeystroke(wc), QUICK_PASTE_POST_KEY_DELAY_MS);
+      }
+    }, QUICK_PASTE_NEW_WINDOW_DELAY_MS);
     return;
   }
 
@@ -482,6 +487,15 @@ function createQuickChatWindow() {
 // --- Make the site use the full viewport by injecting CSS (CSP-safe) ---
 const CHAT_SELECTOR = '#mainChat';  // Root container for the chat UI
 const MESSAGE_LIST_SCOPE = '#mainChat div[id*="messagelist" i]';
+const GEMINI_CHAT_ROOT_SELECTORS = [
+  '#mainChat',
+  'main.chat-app',
+  '[data-test-id="chat-app"]',
+  '[role="main"]',
+  'main'
+];
+const GEMINI_CHAT_ROOT_SELECTOR = GEMINI_CHAT_ROOT_SELECTORS.join(', ');
+const GEMINI_CHAT_ROOT_PSEUDO = `:is(${GEMINI_CHAT_ROOT_SELECTOR})`;
 
 // Parameterized single-message selector
 const messageContentById = (id) => `#mainChat #${id}`;
@@ -570,58 +584,143 @@ const MAX_VW = 100;
 function applyWideLayout(wc) {
   wc.on('did-stop-loading', () => {
     wc.insertCSS(`
-      /* Expand the main conversation width */
-      .conversation-container, 
-      main, 
-      article, 
-      .full-width-container { 
-        max-width: 100% !important; 
-        width: 100% !important;
+      /* Keep the Gemini root scrollable, but do not force layout widths on root children */
+      ${GEMINI_CHAT_ROOT_PSEUDO} {
         overflow-x: hidden !important;
-        overflow-y: hidden !important;
-        overflow-wrap: anywhere !important;
-        word-break: break-word !important;
+        overflow-y: auto !important;
+        scrollbar-gutter: stable !important;
       }
 
       /* Expand the input/text area at the bottom */
       .input-area-container,
-      .bottom-container { 
-        max-width: 95% !important; 
+      .bottom-container {
+        max-width: 95% !important;
         margin: 0 auto !important;
       }
 
-      /* Optional: Adjust padding for readability on ultra-wide screens */
-      .conversation-container {
+      /* Expand only the conversation area; do not restyle generic page/layout roots */
+      [class*="response-content"],
+      [class*="markdown"],
+      [class="model-response-text"],
+      .conversation-container,
+      .full-width-container,
+      .conversation-container > *,
+      .conversation-container article > *,
+      .conversation-container [role="article"]  {
+        max-width: min(min(var(--gemini-vw, ${VW_SIZE}vw), 91vw), ${MAX_CHARS}ch) !important;
+        width: 100% !important;
+        margin-left: 0 !important;
+        margin-right: auto !important;
+        overflow-x: hidden !important;
+        overflow-y: visible !important;
+        overflow-wrap: anywhere !important;
+        word-break: break-word !important;
+        box-sizing: border-box !important;
+      }
+
+      /* Padding only inside actual conversation content */
+      .conversation-container,
+      [class="response-container"], {
         padding-left: 20px !important;
         padding-right: 20px !important;
       }
 
-      /* Trying to get the user input in the conversation area to also expand */
-      [class*="user-query"],
-  
-.conversation-container > *,
-.conversation-container article > *,
-.conversation-container [role="article"] 
-{
-        max-width: min(min(var(--copilot-vw, ${VW_SIZE}vw), 91vw), ${MAX_CHARS}ch) !important;
+      /* Default message width clamp: ONLY within conversation content */
+      [class*="query-content"]:not([class*=icon]),
+      [class*="query-content"]:not([class*=button])
+       {
+        max-width: min(min(var(--gemini-vw, ${VW_SIZE}vw), 91vw), ${MAX_CHARS}ch) !important;
         width: 100% !important;
         box-sizing: border-box !important;
         margin-left: auto !important;
         margin-right: 0 !important;
-        padding-left: auto !important;
+        padding-left: 0 !important;
         padding-right: 0 !important;
         display: block !important;
       }
 
-/* Tables: allow natural column sizing */
-.conversation-container table {
-  table-layout: auto !important;
-  width: 100% !important;
+      /*
+       * Tables are still narrow if their local message/article wrapper is width-clamped.
+       * Widen only wrappers that actually contain a table.
+       */
+      .conversation-container [role="article"]:has(table),
+      .conversation-container article:has(table),
+      .conversation-container div:has(> table),
+      ${GEMINI_CHAT_ROOT_PSEUDO} [role="article"]:has(table),
+      ${GEMINI_CHAT_ROOT_PSEUDO} article:has(table),
+      ${GEMINI_CHAT_ROOT_PSEUDO} div:has(> table) {
+        width: min(96vw, 1800px) !important;
+        max-width: min(96vw, 1800px) !important;
+        margin-left: 0 !important;
+        margin-right: auto !important;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+        box-sizing: border-box !important;
+      }
+
+      .conversation-container div:has(table),
+      .conversation-container section:has(table),
+      ${GEMINI_CHAT_ROOT_PSEUDO} div:has(table),
+      ${GEMINI_CHAT_ROOT_PSEUDO} section:has(table) {
+        width: 100% !important;
         max-width: 100% !important;
-word-break: normal !important;
-  overflow-wrap: anywhere; /* breaks only if absolutely necessary */
-  white-space: normal !important;
-}
+        min-width: 0 !important;
+        display: block !important;
+        overflow-x: visible !important;
+      }
+
+      /* Tables themselves */
+      .conversation-container table,
+      ${GEMINI_CHAT_ROOT_PSEUDO} table {
+        table-layout: fixed !important;
+        width: 100% !important;
+        min-width: 100% !important;
+        max-width: 100% !important;
+        border-collapse: collapse !important;
+        display: table !important;
+      }
+
+      .conversation-container thead,
+      .conversation-container tbody,
+      .conversation-container tr,
+      .conversation-container th,
+      .conversation-container td,
+      ${GEMINI_CHAT_ROOT_PSEUDO} thead,
+      ${GEMINI_CHAT_ROOT_PSEUDO} tbody,
+      ${GEMINI_CHAT_ROOT_PSEUDO} tr,
+      ${GEMINI_CHAT_ROOT_PSEUDO} th,
+      ${GEMINI_CHAT_ROOT_PSEUDO} td {
+        max-width: none !important;
+      }
+
+      .conversation-container th,
+      .conversation-container td,
+      ${GEMINI_CHAT_ROOT_PSEUDO} th,
+      ${GEMINI_CHAT_ROOT_PSEUDO} td {
+        white-space: normal !important;
+        overflow-wrap: anywhere !important;
+        word-break: break-word !important;
+        vertical-align: top !important;
+      }
+
+      /* Code blocks: wrap long lines without creating layout pressure */
+      .conversation-container pre,
+      .conversation-container code,
+      ${GEMINI_CHAT_ROOT_PSEUDO} pre,
+      ${GEMINI_CHAT_ROOT_PSEUDO} code {
+        white-space: pre-wrap !important;
+        overflow-wrap: anywhere !important;
+        word-break: break-word !important;
+        max-width: 100% !important;
+      }
+
+      .conversation-container pre,
+      ${GEMINI_CHAT_ROOT_PSEUDO} pre {
+        width: 100% !important;
+        overflow-x: hidden !important;
+        overflow-y: visible !important;
+        box-sizing: border-box !important;
+      }
     `);
   });
 }
@@ -1454,7 +1553,15 @@ function buildSendToQuickSubmenu(sourceWin, optsBase) {
 
   items.push({ type: 'separator' });
   items.push({ label: 'Choose…', click: async () => sendSelectionToSpecificQuickViaDialog(sourceWin, optsBase) });
-  items.push({ label: 'New Quick Chat Window', click: () => reveal(createQuickChatWindow()) });
+  items.push({
+    label: 'New Quick Chat Window',
+    click: async () => {
+      const w = createQuickChatWindow();
+      // Ensure we target the freshly created window so sendSelectionToQuick()
+      // performs clipboard write + reveal + paste scheduling.
+      await sendSelectionToQuick(sourceWin, { ...optsBase, targetQuickId: w?.__quickId ?? null });
+    }
+  });
   return items;
 }
 
@@ -1470,76 +1577,198 @@ ipcMain.on(IPC.QUICK_NEW, () => {
   catch (e) { console.error('IPC quick new failed:', e); }
 });
 
-// Minimal HTML → Markdown converter (headings, paragraphs, lists, code, links, quotes)
+// Turndown-backed HTML → Markdown converter.
+// Regex is only used here for targeted preprocessing/post-processing around Turndown.
 function htmlToMarkdown(html) {
-  if (!html || !html.trim()) return '';
-  // 1) Decode common entities so we operate on real tags
-  let md = decodeEntities(html);
-  // 2) Remove executable/unsafe blocks first
-  md = stripExecutableBlocks(md);
+const turndownService = createTurndownService();
 
-  // 3) Blockquotes
-  md = md.replace(/<blockquote[^>]*>/gi, '\n> ')
-         .replace(/<\/blockquote>/gi, '\n');
-
-  // 4) Headings
-  md = md.replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, (_, c) => `\n# ${stripTags(c)}\n`);
-  md = md.replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, (_, c) => `\n## ${stripTags(c)}\n`);
-  md = md.replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, (_, c) => `\n### ${stripTags(c)}\n`);
-  md = md.replace(/<h4[^>]*>([\s\S]*?)<\/h4>/gi, (_, c) => `\n#### ${stripTags(c)}\n`);
-  md = md.replace(/<h5[^>]*>([\s\S]*?)<\/h5>/gi, (_, c) => `\n##### ${stripTags(c)}\n`);
-  md = md.replace(/<h6[^>]*>([\s\S]*?)<\/h6>/gi, (_, c) => `\n###### ${stripTags(c)}\n`);
-
-  // 5) Paragraphs & line breaks
-  md = md.replace(/<p[^>]*>/gi, '\n')
-         .replace(/<\/p>/gi, '\n')
-         .replace(/<br\s*\/?>/gi, '\n');
-
-  // 6) Lists
-  md = md.replace(/<ul[^>]*>/gi, '\n')
-         .replace(/<\/ul>/gi, '\n');
-  md = md.replace(/<ol[^>]*>/gi, '\n')
-         .replace(/<\/ol>/gi, '\n');
-  md = md.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (_, c) => `- ${stripTags(c)}\n`);
-
-  // 7) Bold / Italic
-  md = md.replace(/<(b|strong)[^>]*>([\s\S]*?)<\/\1>/gi, (_, __, c) => `**${stripTags(c)}**`);
-  md = md.replace(/<(i|em)[^>]*>([\s\S]*?)<\/\1>/gi,   (_, __, c) => `*${stripTags(c)}*`);
-
-  // 8) Inline code
-  md = md.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, (_, c) => '`' + stripTags(c).replace(/\n+/g, ' ') + '`');
-
-  // 9) Preformatted blocks → fenced code
-  md = md.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_, c) => {
-    const inner = c.replace(/<\/?code[^>]*>/gi, '');
-    const clean = stripTags(inner).replace(/\r?\n/g, '\n');
-    return `\n~~~\n${clean.trim()}\n~~~\n`;
+function createTurndownService() {
+  const service = new TurndownService({
+    headingStyle: 'atx',
+    codeBlockStyle: 'fenced',
+    fence: '```',
+    bulletListMarker: '-',
+    emDelimiter: '*',
+    strongDelimiter: '**',
+    linkStyle: 'inlined',
+    linkReferenceStyle: 'full',
+    preformattedCode: true,
   });
 
-  // 10) Links (emit bare href if no text)
-  md = md.replace(/<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, (_m, href, text) => {
-    const t = stripTags(text).trim();
-    const h = href.trim();
-    return t ? `[${t}](${h})` : h;
+  try {
+    const { gfm, tables } = turndownPluginGfm;
+    // Be explicit that tables must go through the GFM table path.
+    if (tables) service.use(tables);
+    if (gfm) service.use(gfm)
+  } catch (err) {
+    console.error('turndown-plugin-gfm setup failed:', err);
+  }
+
+  // Remove obvious non-content / executable elements if any survive renderer cleanup.
+  try {
+    service.remove([
+      'script', 'style', 'noscript', 'template',
+      'button', 'input', 'select', 'textarea',
+      'svg', 'canvas', 'iframe'
+    ]);
+  } catch (err) {
+    console.error('Turndown remove() setup failed:', err);
+  }
+
+  // Preserve fenced code blocks exactly, including language hints when present.
+  service.addRule('fencedCodeBlocks', {
+    filter: 'pre',
+    replacement: function (_content, node) {
+      const codeNode =
+        node.firstElementChild && node.firstElementChild.nodeName === 'CODE'
+          ? node.firstElementChild
+          : node;
+      const raw = String(codeNode.textContent || '')
+        .replace(/\u00A0/g, ' ')
+        .replace(/\r\n?/g, '\n');
+      const className = String(codeNode.getAttribute?.('class') || '');
+      const language = (className.match(/(?:^|\s)language-([A-Za-z0-9_+-]+)/) || [])[1] || '';
+      const body = raw.replace(/^\n+|\n+$/g, '');
+      return `\n\n\`\`\`${language}\n${body}\n\`\`\`\n\n`;
+    }
   });
 
-  // 11) Images → alt + URL, or URL
-  md = md.replace(/<img[^>]*alt=["']([^"']*)["'][^>]*src=["']([^"']+)["'][^>]*>/gi, (_m, alt, src) => {
-    const a = alt.trim(); const s = src.trim();
-    return a ? `![${a}](${s})` : s;
+  // Convert <br> to hard line breaks consistently.
+  service.addRule('hardLineBreak', {
+    filter: 'br',
+    replacement: function () {
+      return '  \n';
+    }
   });
 
-  // 12) Strip remaining tags and normalize whitespace
-  md = stripTags(md);
+  // Treat HR explicitly so separators survive cleanup.
+  service.addRule('thematicBreak', {
+    filter: 'hr',
+    replacement: function () {
+      return '\n\n---\n\n';
+    }
+  });
 
-  // Normalize trailing whitespace only (do NOT collapse structural blank lines)
-  md = md.replace(/[ \t]+\n/g, '\n');
+  return service;
+}
 
-  // Ensure at least one blank line between block elements
-  md = md.replace(/\n{4,}/g, '\n\n');
+function splitMarkdownTableRow(line) {
+  const trimmed = String(line || '').trim();
+  const core = trimmed.replace(/^\|/, '').replace(/\|$/, '');
+  return core.split('|').map(cell => cell.trim());
+}
 
-  md = md.trim();
-  return md;
+function isMarkdownTableSeparatorLine(line) {
+  const cells = splitMarkdownTableRow(line);
+  if (!cells.length) return false;
+  return cells.every(cell => /^:?-{3,}:?$/.test(cell));
+}
+
+function isLikelyMarkdownTableBlock(lines) {
+  if (!Array.isArray(lines) || lines.length < 2) return false;
+  const nonEmpty = lines.filter(Boolean);
+  if (nonEmpty.length < 2) return false;
+  if (!nonEmpty[0].includes('|')) return false;
+  if (!isMarkdownTableSeparatorLine(nonEmpty[1])) return false;
+  return nonEmpty.every(line => !line || line.includes('|'));
+}
+
+function formatMarkdownTableBlock(block) {
+  const rawLines = String(block || '')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean);
+
+  if (!isLikelyMarkdownTableBlock(rawLines)) return block;
+
+  const rows = rawLines.map(splitMarkdownTableRow);
+  const columnCount = Math.max(...rows.map(r => r.length));
+
+  for (const row of rows) {
+    while (row.length < columnCount) row.push('');
+  }
+
+  const widths = new Array(columnCount).fill(3);
+  for (let r = 0; r < rows.length; r += 1) {
+    if (r === 1) continue; // separator row rebuilt below
+    for (let c = 0; c < columnCount; c += 1) {
+      widths[c] = Math.max(widths[c], rows[r][c].length, 3);
+    }
+  }
+
+  const separatorSource = rows[1];
+  const separator = separatorSource.map((cell, idx) => {
+    const left = cell.startsWith(':');
+    const right = cell.endsWith(':');
+    const dashes = '-'.repeat(Math.max(widths[idx], 3));
+    if (left && right) return `:${dashes}:`;
+    if (left) return `:${dashes}`;
+    if (right) return `${dashes}:`;
+    return dashes;
+  });
+
+  const formatted = rows.map((row, rowIdx) => {
+    const cells = (rowIdx === 1 ? separator : row).map((cell, idx) => {
+      const value = rowIdx === 1 ? cell : cell.padEnd(widths[idx], ' ');
+      return ` ${value} `;
+    });
+    return `|${cells.join('|')}|`;
+  });
+
+  return formatted.join('\n');
+}
+
+function normalizeMarkdownTables(md) {
+  const blocks = String(md || '').split(/\n{2,}/);
+  const normalized = blocks.map(block => {
+    const lines = block.split('\n').map(line => line.trimRight());
+    return isLikelyMarkdownTableBlock(lines.filter(Boolean))
+      ? formatMarkdownTableBlock(lines.join('\n'))
+      : block;
+  });
+  return normalized.join('\n\n');
+}
+
+function preprocessHtmlForMarkdown(html) {
+  let out = String(html || '');
+  if (!out.trim()) return '';
+
+  out = stripExecutableBlocks(out)
+    .replace(/<!--([\s\S]*?)-->/g, '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\u00A0/g, ' ');
+
+  // Gemini often renders diff/code lines as adjacent block nodes with no text newlines.
+  // Inject line boundaries before Turndown sees the HTML.
+  out = out
+    .replace(/<\/(div|p|li|tr|h[1-6]|blockquote|pre|table|ul|ol)>\s*</gi, '</$1>\n<')
+    .replace(/<(br)\s*\/?\s*>/gi, '<$1 />\n');
+
+  return out.trim();
+}
+
+function postProcessMarkdown(md) {
+  return normalizeMarkdownTables(
+    String(md || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/([^\n])\n(#{1,6}\s)/g, '$1\n\n$2')
+    .replace(/([^\n])\n([-*]\s)/g, '$1\n\n$2')
+    .trim()
+  );
+}
+
+  const preparedHtml = preprocessHtmlForMarkdown(html);
+  if (!preparedHtml) return '';
+
+  try {
+    return postProcessMarkdown(turndownService.turndown(preparedHtml));
+  } catch (err) {
+    console.error('Turndown conversion failed; falling back to plain text extraction:', err);
+    const safeHtml = stripExecutableBlocks(decodeEntities(preparedHtml));
+    return postProcessMarkdown(stripTags(safeHtml));
+  }
 }
 
 function stripTags(s) {
@@ -1551,7 +1780,7 @@ function stripTags(s) {
 
 // --- Centralized sanitizers ---
 function decodeEntities(s) {
-  // Minimal entity decode to operate on real tags and readable text
+  // Remove any remaining HTML tags; entity decoding is handled earlier when needed.
   return String(s || '')
     .replace(/&nbsp;/g, ' ')
     .replace(/&amp;/g, '&')
@@ -1718,11 +1947,32 @@ async function savePaneAsCleanHTML(win, filePath) {
     .gemini { color: #004b9a; }
     /* Generic content spacing */
     ul,ol { margin: 0.4em 0 0.4em 1.2em; }
-    pre, code { font-family: Consolas, Menlo, monospace; }
-    pre { background: #f5f7fa; border: 1px solid #e3e7ee; padding: 10px; border-radius: 6px; overflow: auto; }
+    pre, code {
+      font-family: Consolas, Menlo, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      max-width: 100%;
+    }
+    pre {
+      background: #f5f7fa;
+      border: 1px solid #e3e7ee;
+      padding: 10px;
+      border-radius: 6px;
+      overflow-x: hidden;
+      width: 100%;
+      box-sizing: border-box;
+    }
     blockquote { border-left: 3px solid #cbd5e1; margin: 0.4em 0; padding: 0.2em 0.8em; color: #555; }
-    table { border-collapse: collapse; }
-    td, th { border: 1px solid #e5e7eb; padding: 6px 8px; }
+    table { border-collapse: collapse; width: 100%; table-layout: fixed; }
+    td, th {
+      border: 1px solid #e5e7eb;
+      padding: 6px 8px;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      vertical-align: top;
+    }
     /* Make top-level container stretch full width */
     ${CHAT_SELECTOR} { width: 100%; max-width: 100%; }
   </style>
