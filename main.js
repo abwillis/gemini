@@ -1150,30 +1150,139 @@ function ensureSaveState(win) {
 async function selectChatPane(win) {
   const res = await win.webContents.executeJavaScript(`
     (function() {
-      const el = document.querySelector('${CHAT_SELECTOR}');
-      if (!el) return { ok:false, selectedTextLength:0 };
-      try {
-        // Try to reveal as much content as possible before selecting (helps some virtualized views)
-        el.scrollTo({ top: 0, behavior: 'auto' });
-      } catch {}
+      const info = (function() {
+  function safeText(el){ try { return String(el && (el.innerText || el.textContent) || ''); } catch { return ''; } }
+  function countOcc(text, needle){
+    if (!text) return 0;
+    let n=0, i=0;
+    while ((i = text.indexOf(needle, i)) !== -1) { n++; i += needle.length; }
+    return n;
+  }
+  function scoreEl(el){
+    if (!el) return -1;
+    let r; try { r = el.getBoundingClientRect(); } catch { r = {width:0,height:0}; }
+    if (!r || r.width < 200 || r.height < 150) return -1;
+    const t = safeText(el);
+    const len = t.trim().length;
+    const you = countOcc(t, 'You said');
+    const gem = countOcc(t, 'Gemini said');
+    const hasTable = (()=>{ try { return !!el.querySelector('table'); } catch { return false; } })();
+    const hasPre = (()=>{ try { return !!el.querySelector('pre, code'); } catch { return false; } })();
+    let scrollable = 0;
+    try {
+      const cs = getComputedStyle(el);
+      scrollable = (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) ? 1 : 0;
+    } catch {}
+    // Weight speaker labels heavily; they strongly indicate transcript.
+    return (len/50) + (you*40) + (gem*40) + (hasTable?10:0) + (hasPre?8:0) + (scrollable?6:0);
+  }
+
+  // Candidate roots: Gemini app shell + main role fallbacks.
+  const roots = [];
+  try { roots.push(document.querySelector('main.chat-app')); } catch {}
+  try { roots.push(document.querySelector('[data-test-id="chat-app"]')); } catch {}
+  try { roots.push(document.querySelector('[role="main"]')); } catch {}
+  try { roots.push(document.querySelector('main')); } catch {}
+  roots.push(document.body);
+
+  let best = null;
+  let bestScore = -1;
+
+  for (const root of roots) {
+    if (!root) continue;
+    // Evaluate root itself
+    const s0 = scoreEl(root);
+    if (s0 > bestScore) { bestScore = s0; best = root; }
+
+    // Evaluate descendants that could plausibly be the transcript container
+    let nodes = [];
+    try { nodes = Array.from(root.querySelectorAll('section, article, div')); } catch {}
+    for (const el of nodes) {
+      const s = scoreEl(el);
+      if (s > bestScore) { bestScore = s; best = el; }
+    }
+  }
+
+  if (!best || bestScore < 5) {
+    // Fallback: at least return shell if present
+    const shell = (function(){ try { return document.querySelector('main.chat-app') || document.querySelector('[data-test-id="chat-app"]') || document.querySelector('main') || document.body; } catch { return document.body; }})();
+    return { ok: !!shell, nodeFound: !!shell, score: bestScore, selectorHint: 'fallback', textLen: safeText(shell).trim().length };
+  }
+
+  // Try to scroll the chosen pane to the very top to force earlier messages to mount.
+  try {
+    if (best.scrollTo) best.scrollTo({ top: 0, behavior: 'auto' });
+  } catch {}
+
+  const t = safeText(best);
+  return {
+    ok: true,
+    score: bestScore,
+    textLen: t.trim().length,
+    youSaid: countOcc(t, 'You said'),
+    geminiSaid: countOcc(t, 'Gemini said'),
+    tag: (best.tagName || '').toLowerCase(),
+    id: best.id || '',
+    className: best.className || ''
+  };
+})();;
+      if (!info || !info.ok) return { ok:false, selectedTextLength:0, reason: info?.selectorHint || 'no-pane' };
+
+      // Re-find best element using same heuristic (so we can select it)
+      function safeText(el){ try { return String(el && (el.innerText || el.textContent) || ''); } catch { return ''; } }
+      function countOcc(text, needle){ if (!text) return 0; let n=0,i=0; while ((i=text.indexOf(needle,i))!==-1){n++;i+=needle.length;} return n; }
+      function scoreEl(el){
+        if (!el) return -1;
+        let r; try { r = el.getBoundingClientRect(); } catch { r = {width:0,height:0}; }
+        if (!r || r.width < 200 || r.height < 150) return -1;
+        const t = safeText(el);
+        const len = t.trim().length;
+        const you = countOcc(t, 'You said');
+        const gem = countOcc(t, 'Gemini said');
+        let scrollable = 0;
+        try { const cs = getComputedStyle(el); scrollable = (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) ? 1 : 0; } catch {}
+        return (len/50) + (you*40) + (gem*40) + (scrollable?6:0);
+      }
+      const roots = [];
+      try { roots.push(document.querySelector('main.chat-app')); } catch {}
+      try { roots.push(document.querySelector('[data-test-id="chat-app"]')); } catch {}
+      try { roots.push(document.querySelector('[role="main"]')); } catch {}
+      try { roots.push(document.querySelector('main')); } catch {}
+      roots.push(document.body);
+
+      let best=null, bestScore=-1;
+      for (const root of roots) {
+        if (!root) continue;
+        const s0 = scoreEl(root);
+        if (s0 > bestScore) { bestScore=s0; best=root; }
+        let nodes=[]; try { nodes = Array.from(root.querySelectorAll('section, article, div')); } catch {}
+        for (const el of nodes) {
+          const s = scoreEl(el);
+          if (s > bestScore) { bestScore=s; best=el; }
+        }
+      }
+      const el = best || document.body;
+      if (!el) return { ok:false, selectedTextLength:0, reason:'no-element' };
+
+      try { if (el.scrollTo) el.scrollTo({ top: 0, behavior: 'auto' }); } catch {}
+
       try {
         const sel = window.getSelection && window.getSelection();
-        if (sel) {
-          sel.removeAllRanges();
-          const range = document.createRange();
-          range.selectNodeContents(el);
-          sel.addRange(range);
-          const txt = String(sel.toString() || '');
-          return { ok:true, selectedTextLength: txt.length };
-        }
+        if (!sel) return { ok:false, selectedTextLength:0, reason:'no-selection-api', debug: info };
+        sel.removeAllRanges();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        sel.addRange(range);
+        const txt = String(sel.toString() || '');
+        return { ok:true, selectedTextLength: txt.length, debug: info };
       } catch (e) {
-        return { ok:false, selectedTextLength:0, err: String(e) };
+        return { ok:false, selectedTextLength:0, err: String(e), debug: info };
       }
-      return { ok:false, selectedTextLength:0 };
     })();
   `);
   return res;
 }
+
 
 // ---------- Selection → Markdown helpers ----------
 // Extract the current selection from the renderer as HTML fragment and text.
@@ -1198,21 +1307,15 @@ async function getSelectionFragment(win) {
   // Known non-content UI affordances:
   // copy buttons, feedback icons, toolbars, hover menus, references
   const JUNK_SELECTORS = [
-   'button',
    '[role="button"]',
-   '[data-testid*="copy"]',
-   '[data-testid*="feedback"]',
-   '[data-testid*="thumb"]',
-   '[data-testid*="reaction"]',
-   '[data-testid*="reference"]',
-   '[data-testid*="citation"]',
-   '[class*="copy" i]',
-   '[class*="feedback" i]',
-   '[class*="toolbar" i]',
-   '[class*="action" i]',
-   '[class*="hover" i]',
-   '[class*="menu" i]',
-   '[class*="icon" i]'
+   '[class*="button" i]',
+   '[class*="logo" i]',
+   '[class*="label" i]',
+   '[class*="input" i]',
+   'label',
+   'input',
+   'textarea',
+   '[role="textbox"]'
   ];
 
   container.querySelectorAll(JUNK_SELECTORS.join(',')).forEach(el => {
@@ -1684,7 +1787,112 @@ async function saveChatPaneAsMarkdown(win, filePath) {
   try {
    const result = await win.webContents.executeJavaScript(`
    (function() {
-    const root = document.querySelector('${CHAT_SELECTOR}');
+    const info = (function() {
+  function safeText(el){ try { return String(el && (el.innerText || el.textContent) || ''); } catch { return ''; } }
+  function countOcc(text, needle){
+    if (!text) return 0;
+    let n=0, i=0;
+    while ((i = text.indexOf(needle, i)) !== -1) { n++; i += needle.length; }
+    return n;
+  }
+  function scoreEl(el){
+    if (!el) return -1;
+    let r; try { r = el.getBoundingClientRect(); } catch { r = {width:0,height:0}; }
+    if (!r || r.width < 200 || r.height < 150) return -1;
+    const t = safeText(el);
+    const len = t.trim().length;
+    const you = countOcc(t, 'You said');
+    const gem = countOcc(t, 'Gemini said');
+    const hasTable = (()=>{ try { return !!el.querySelector('table'); } catch { return false; } })();
+    const hasPre = (()=>{ try { return !!el.querySelector('pre, code'); } catch { return false; } })();
+    let scrollable = 0;
+    try {
+      const cs = getComputedStyle(el);
+      scrollable = (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) ? 1 : 0;
+    } catch {}
+    // Weight speaker labels heavily; they strongly indicate transcript.
+    return (len/50) + (you*40) + (gem*40) + (hasTable?10:0) + (hasPre?8:0) + (scrollable?6:0);
+  }
+
+  // Candidate roots: Gemini app shell + main role fallbacks.
+  const roots = [];
+  try { roots.push(document.querySelector('main.chat-app')); } catch {}
+  try { roots.push(document.querySelector('[data-test-id="chat-app"]')); } catch {}
+  try { roots.push(document.querySelector('[role="main"]')); } catch {}
+  try { roots.push(document.querySelector('main')); } catch {}
+  roots.push(document.body);
+
+  let best = null;
+  let bestScore = -1;
+
+  for (const root of roots) {
+    if (!root) continue;
+    // Evaluate root itself
+    const s0 = scoreEl(root);
+    if (s0 > bestScore) { bestScore = s0; best = root; }
+
+    // Evaluate descendants that could plausibly be the transcript container
+    let nodes = [];
+    try { nodes = Array.from(root.querySelectorAll('section, article, div')); } catch {}
+    for (const el of nodes) {
+      const s = scoreEl(el);
+      if (s > bestScore) { bestScore = s; best = el; }
+    }
+  }
+
+  if (!best || bestScore < 5) {
+    // Fallback: at least return shell if present
+    const shell = (function(){ try { return document.querySelector('main.chat-app') || document.querySelector('[data-test-id="chat-app"]') || document.querySelector('main') || document.body; } catch { return document.body; }})();
+    return { ok: !!shell, nodeFound: !!shell, score: bestScore, selectorHint: 'fallback', textLen: safeText(shell).trim().length };
+  }
+
+  // Try to scroll the chosen pane to the very top to force earlier messages to mount.
+  try {
+    if (best.scrollTo) best.scrollTo({ top: 0, behavior: 'auto' });
+  } catch {}
+
+  const t = safeText(best);
+  return {
+    ok: true,
+    score: bestScore,
+    textLen: t.trim().length,
+    youSaid: countOcc(t, 'You said'),
+    geminiSaid: countOcc(t, 'Gemini said'),
+    tag: (best.tagName || '').toLowerCase(),
+    id: best.id || '',
+    className: best.className || ''
+  };
+})();;
+    // Choose a root that matches what Select Chat Pane would pick.
+    const root = (function(){
+      // Re-run minimal heuristic selection: prefer elements with "You said"/"Gemini said" labels.
+      function safeText(el){ try { return String(el && (el.innerText || el.textContent) || ''); } catch { return ''; } }
+      function countOcc(text, needle){ if (!text) return 0; let n=0,i=0; while ((i=text.indexOf(needle,i))!==-1){ n++; i+=needle.length; } return n; }
+      function scoreEl(el){
+        if (!el) return -1;
+        let r; try { r = el.getBoundingClientRect(); } catch { r = {width:0,height:0}; }
+        if (!r || r.width < 200 || r.height < 150) return -1;
+        const t = safeText(el);
+        const len = t.trim().length;
+        const you = countOcc(t,'You said');
+        const gem = countOcc(t,'Gemini said');
+        return (len/50) + (you*40) + (gem*40);
+      }
+      const roots=[];
+      try { roots.push(document.querySelector('main.chat-app')); } catch {}
+      try { roots.push(document.querySelector('[data-test-id="chat-app"]')); } catch {}
+      try { roots.push(document.querySelector('[role="main"]')); } catch {}
+      try { roots.push(document.querySelector('main')); } catch {}
+      roots.push(document.body);
+      let best=null, bestScore=-1;
+      for (const r0 of roots){
+        if (!r0) continue;
+        const s0 = scoreEl(r0); if (s0 > bestScore){ bestScore=s0; best=r0; }
+        let nodes=[]; try { nodes = Array.from(r0.querySelectorAll('section, article, div')); } catch {}
+        for (const el of nodes){ const s = scoreEl(el); if (s > bestScore){ bestScore=s; best=el; } }
+      }
+      return best || document.querySelector('${CHAT_SELECTOR}') || document.body;
+    })();
     if (!root) return { ok:false, html:'', title: document.title };
 
     // Clone so we never mutate the live DOM
@@ -1697,21 +1905,15 @@ async function saveChatPaneAsMarkdown(win, filePath) {
     // Known non-content UI affordances:
     // copy buttons, feedback icons, toolbars, hover menus, references
     const JUNK_SELECTORS = [
-     'button',
-     '[role="button"]',
-     '[data-testid*="copy"]',
-     '[data-testid*="feedback"]',
-     '[data-testid*="thumb"]',
-     '[data-testid*="reaction"]',
-     '[data-testid*="reference"]',
-     '[data-testid*="citation"]',
-     '[class*="copy" i]',
-     '[class*="feedback" i]',
-     '[class*="toolbar" i]',
-     '[class*="action" i]',
-     '[class*="hover" i]',
-     '[class*="menu" i]',
-     '[class*="icon" i]'
+   '[role="button"]',
+   '[class*="button" i]',
+   '[class*="logo" i]',
+   '[class*="label" i]',
+   '[class*="input" i]',
+   'label',
+   'input',
+   'textarea',
+   '[role="textbox"]'
     ];
 
     clone.querySelectorAll(JUNK_SELECTORS.join(',')).forEach(el => {
@@ -1773,7 +1975,7 @@ async function saveChatPaneAsText(win, filePath) {
   try {
     const result = await win.webContents.executeJavaScript(`
       (function() {
-        const el = document.querySelector('${CHAT_SELECTOR}');
+        const el = (function(){ try { return document.querySelector('main.chat-app') || document.querySelector('[data-test-id="chat-app"]') || document.querySelector('${CHAT_SELECTOR}') || document.body; } catch { return document.body; } })();
         if (!el) return { ok:false, html:'', title: document.title };
         return { ok:true, html: el.innerHTML, title: document.title };
       })();
