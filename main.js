@@ -312,17 +312,27 @@ function createQuickChatWindow() {
   win.webContents.setMaxListeners(0);
   win.loadURL(GEMINI_URL);
 
-  try { applyWideLayout(win.webContents); } catch (e) { console.error('applyWideLayout (quick deferred) failed:', e); }
+  try {
+    win.webContents.once('did-stop-loading', () => {
+      // Next tick ensures Chromium has painted once
+      setTimeout(() => {
+        try { applyMaxLayoutCSS(win); }
+        catch (e) { console.error('applyMaxLayoutCSS (quick deferred) failed:', e); }
+      }, 10);
+    });
+  } catch (e) {
+    console.error('applyMaxLayoutCSS quick defer wiring failed:', e);
+  }
 
   win.once('ready-to-show', () => {
     reveal(win);
-    try { applyDynamicWidth(win); } catch {}
-    try { attachVWResize(win); } catch {}
-    try { requestExpandedLayout(win); } catch {}
+//    try { applyDynamicWidth(win); } catch {}
+////    try { attachVWResize(win); } catch {}
+//    try { requestExpandedLayout(win); } catch {}
   });
 
   win.webContents.on('did-start-navigation', () => {
-    try { attachVWResize(win); } catch {}
+////    try { attachVWResize(win); } catch {}
   });
 
 
@@ -485,8 +495,7 @@ function createQuickChatWindow() {
 
 
 // --- Make the site use the full viewport by injecting CSS (CSP-safe) ---
-const CHAT_SELECTOR = '#mainChat';  // Root container for the chat UI
-const MESSAGE_LIST_SCOPE = '#mainChat div[id*="messagelist" i]';
+const CHAT_SELECTOR = '#mainChat';  // Legacy/fallback root selector for save helpers
 const GEMINI_CHAT_ROOT_SELECTORS = [
   '#mainChat',
   'main.chat-app',
@@ -494,12 +503,149 @@ const GEMINI_CHAT_ROOT_SELECTORS = [
   '[role="main"]',
   'main'
 ];
-const GEMINI_CHAT_ROOT_SELECTOR = GEMINI_CHAT_ROOT_SELECTORS.join(', ');
-const GEMINI_CHAT_ROOT_PSEUDO = `:is(${GEMINI_CHAT_ROOT_SELECTOR})`;
-
+const GEMINI_CHAT_MESSAGE_LIST_SELECTORS = [
+  '#mainChat div[id*="messagelist" i]',
+  '.conversation-container',
+  '[class="response-container"]',
+  '[role="article"]',
+  'main.chat-app',
+  '[data-test-id="chat-app"]',
+  '[role="main"]'
+];
+const GEMINI_CHAT_SCOPE_SELECTOR = GEMINI_CHAT_ROOT_SELECTORS.join(', ');
+const GEMINI_CHAT_SCOPE_PSEUDO = `:is(${GEMINI_CHAT_SCOPE_SELECTOR})`;
+const GEMINI_CHAT_MESSAGE_LIST_SELECTOR = GEMINI_CHAT_MESSAGE_LIST_SELECTORS.join(', ');
+const GEMINI_CHAT_MESSAGE_LIST_PSEUDO = `:is(${GEMINI_CHAT_MESSAGE_LIST_SELECTOR})`;
+const GEMINI_EXPORT_ROOT_CLASS = 'gemini-export-root';
+const GEMINI_EXPORT_ROOT_SELECTOR = `.${GEMINI_EXPORT_ROOT_CLASS}`;
 // Parameterized single-message selector
-const messageContentById = (id) => `#mainChat #${id}`;
-
+const messageContentById = (id) => `${GEMINI_CHAT_SCOPE_PSEUDO} #${id}, ${GEMINI_CHAT_MESSAGE_LIST_PSEUDO} #${id}, [id="${id}"]`;
+function buildLocateChatRootScript({ includeHtml = true } = {}) {
+  const selectorsJson = JSON.stringify(GEMINI_CHAT_ROOT_SELECTORS);
+  const includeHtmlLiteral = includeHtml ? 'true' : 'false';
+  return `
+    (function () {
+      const candidates = ${selectorsJson};
+      const transcriptSelectors = [
+        '.conversation-container',
+        '[class="response-container"]',
+        '[role="article"]',
+        'article',
+        'section',
+        'main'
+      ];
+      function visible(el) {
+        if (!el) return false;
+        const r = el.getBoundingClientRect?.();
+        return !!r && r.width > 0 && r.height > 0;
+      }
+      function textOf(el) {
+        try { return String(el?.innerText || el?.textContent || ''); } catch { return ''; }
+      }
+      function count(el, sel) {
+        try { return el?.querySelectorAll?.(sel)?.length || 0; } catch { return 0; }
+      }
+      function editablePenalty(el) {
+        const selfEditable = !!el?.matches?.('textarea, input, [contenteditable="true"], div[role="textbox"]');
+        if (selfEditable) return 2000;
+        return (count(el, 'textarea, input, [contenteditable="true"], div[role="textbox"]') * 900)
+          + (count(el, 'form') * 300)
+          + (count(el, '[role="button"], button') * 8);
+      }
+      function score(el) {
+        if (!el || !visible(el)) return -1;
+        const text = textOf(el).trim();
+        const len = Math.min(text.length, 5000);
+        const articleCount = count(el, '[role="article"], article');
+        const responseCount = count(el, '.conversation-container, [class="response-container"], [class*="response-content"], [class*="markdown"], [class="model-response-text"]');
+        const richCount = count(el, 'table, pre, code, ul, ol, blockquote');
+        const scrollable = (() => {
+          try {
+            const cs = getComputedStyle(el);
+            return (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) ? 1 : 0;
+          } catch {
+            return 0;
+          }
+        })();
+        return 1000
+          + Math.min(len, 1600)
+          + (articleCount * 90)
+          + (responseCount * 60)
+          + (richCount * 25)
+          + (scrollable * 50)
+          - editablePenalty(el);
+      }
+      const found = [];
+      for (const sel of candidates) {
+        try {
+          document.querySelectorAll(sel).forEach((root) => {
+            found.push({ sel, el: root });
+            transcriptSelectors.forEach((childSel) => {
+              try { root.querySelectorAll(childSel).forEach((el) => found.push({ sel: childSel, el })); } catch {}
+            });
+          });
+        } catch {}
+      }
+      if (!found.length) return null;
+      const scored = found
+        .map(({ sel, el }) => ({ sel, el, score: score(el), textLength: textOf(el).trim().length }))
+        .filter((entry) => entry.score >= 0)
+        .sort((a, b) => {
+          if (b.score !== a.score) return b.score - a.score;
+          return b.textLength - a.textLength;
+        });
+      const best = scored[0];
+      if (!best || !best.el) return null;
+      return {
+        selector: best.sel,
+        html: ${includeHtmlLiteral} ? best.el.outerHTML : '',
+        textLength: Number(best.textLength || 0),
+        score: Number(best.score || 0)
+      };
+    })();
+  `;
+}
+async function executeInAllFrames(win, source) {
+  if (!win?.webContents) return [];
+  const results = [];
+  try {
+    const top = await win.webContents.executeJavaScript(source, true).catch(() => null);
+    if (top) results.push({ where: 'top', value: top });
+  } catch {}
+  const frames = win.webContents.mainFrame?.framesInSubtree ?? [];
+  for (const frame of frames) {
+    try {
+      const value = await frame.executeJavaScript(source, true).catch(() => null);
+      if (value) results.push({ where: `frame:${frame.routingId}`, value });
+    } catch {}
+  }
+  return results;
+}
+async function findBestChatRoot(win, { includeHtml = true } = {}) {
+  const results = await executeInAllFrames(win, buildLocateChatRootScript({ includeHtml }));
+  if (!results.length) return null;
+  results.sort((a, b) => {
+    const aScore = Number(a?.value?.score || 0);
+    const bScore = Number(b?.value?.score || 0);
+    if (bScore !== aScore) return bScore - aScore;
+    const aLen = Number(a?.value?.textLength || 0);
+    const bLen = Number(b?.value?.textLength || 0);
+    return bLen - aLen;
+  });
+  return results[0];
+}
+async function getChatPaneSnapshot(win) {
+  const best = await findBestChatRoot(win, { includeHtml: true });
+  if (!best?.value) {
+    return { ok: false, html: '', textLength: 0, selector: null };
+  }
+  return {
+    ok: true,
+    html: String(best.value.html || ''),
+    textLength: Number(best.value.textLength || 0),
+    selector: best.value.selector || null
+  };
+}
 // === Safe 'did-stop-loading' wiring =========================================
 // A named handler so removeListener(...) can reliably detach the same function.
 function onDidStopLoading() {
@@ -581,163 +727,164 @@ const VW_SIZE = 100;
 const MIN_VW = 70;
 const MAX_VW = 100;
 //let   VW_WIDTH = 83;
-function applyWideLayout(wc) {
-  wc.on('did-stop-loading', () => {
-    wc.insertCSS(`
-      /* Keep the Gemini root scrollable, but do not force layout widths on root children */
-      ${GEMINI_CHAT_ROOT_PSEUDO} {
-        overflow-x: hidden !important;
-        overflow-y: visible !important;
-        scrollbar-gutter: stable !important;
-      }
+function buildMaxLayoutCSS({ specificMessageId } = {}) {
+  const CONTENT = [
+    specificMessageId ? messageContentById(specificMessageId) : null,
+    '.conversation-container [role="article"]',
+    '.conversation-container article',
+    '.conversation-container [class*="response-content"]',
+    '.conversation-container [class*="markdown"]',
+    '[class="response-container"]',
+    '[class="model-response-text"]'
+  ].join(',\n');
 
-      /*
-       * Tables are still narrow if their local message/article wrapper is width-clamped.
-       * Widen only wrappers that actually contain a table.
-       */
-      .conversation-container [role="article"]:has(table),
-      .conversation-container article:has(table),
-      .conversation-container div:has(> table),
-      ${GEMINI_CHAT_ROOT_PSEUDO} [role="article"]:has(table),
-      ${GEMINI_CHAT_ROOT_PSEUDO} article:has(table),
-      ${GEMINI_CHAT_ROOT_PSEUDO} div:has(> table) {
-        width: min(96vw, 1800px) !important;
-        max-width: 100% !important;
-        margin-left: 0 !important;
-        margin-right: auto !important;
-        padding-left: 0 !important;
-        padding-right: 0 !important;
-        box-sizing: border-box !important;
-      }
+  const TABLE_WRAPPERS = [
+    '.conversation-container [role="article"]:has(table)',
+    '.conversation-container article:has(table)',
+    '.conversation-container div:has(> table)',
+    `${GEMINI_CHAT_SCOPE_PSEUDO} [role="article"]:has(table)`,
+    `${GEMINI_CHAT_SCOPE_PSEUDO} article:has(table)`,
+    `${GEMINI_CHAT_SCOPE_PSEUDO} div:has(> table)`
+  ].join(',\n');
 
-      .conversation-container div:has(table),
-      .conversation-container section:has(table),
-      ${GEMINI_CHAT_ROOT_PSEUDO} div:has(table),
-      ${GEMINI_CHAT_ROOT_PSEUDO} section:has(table) {
-        width: 100% !important;
-        max-width: 100% !important;
-        min-width: 0 !important;
-        display: block !important;
-        overflow-x: visible !important;
-      }
-
-      /* Tables themselves */
-      .conversation-container table,
-      ${GEMINI_CHAT_ROOT_PSEUDO} table {
-        table-layout: fixed !important;
-        width: 100% !important;
-        min-width: 100% !important;
-        max-width: 100% !important;
-        border-collapse: collapse !important;
-        display: table !important;
-      }
-
-      .conversation-container thead,
-      .conversation-container tbody,
-      .conversation-container tr,
-      .conversation-container th,
-      .conversation-container td,
-      ${GEMINI_CHAT_ROOT_PSEUDO} thead,
-      ${GEMINI_CHAT_ROOT_PSEUDO} tbody,
-      ${GEMINI_CHAT_ROOT_PSEUDO} tr,
-      ${GEMINI_CHAT_ROOT_PSEUDO} th,
-      ${GEMINI_CHAT_ROOT_PSEUDO} td {
-        max-width: none !important;
-      }
-
-      .conversation-container th,
-      .conversation-container td,
-      ${GEMINI_CHAT_ROOT_PSEUDO} th,
-      ${GEMINI_CHAT_ROOT_PSEUDO} td {
-        white-space: normal !important;
-        overflow-wrap: anywhere !important;
-        word-break: break-word !important;
-        vertical-align: top !important;
-      }
-
-      /* Code blocks: wrap long lines without creating layout pressure */
-      .conversation-container pre,
-      .conversation-container code,
-      ${GEMINI_CHAT_ROOT_PSEUDO} pre,
-      ${GEMINI_CHAT_ROOT_PSEUDO} code {
-        white-space: pre-wrap !important;
-        overflow-wrap: anywhere !important;
-        word-break: break-word !important;
-        max-width: 93vw !important;
-        width: auto !important;
-      }
-
-      .conversation-container pre,
-      ${GEMINI_CHAT_ROOT_PSEUDO} pre {
-        width: 100% !important;
-        overflow-x: hidden !important;
-        overflow-y: visible !important;
-        box-sizing: border-box !important;
-      }
-
-      /* Expand only actual rendered conversation content */
-      [class*="response-content"],
-      [class*="markdown"],
-      [class="model-response-text"],
-      .conversation-container,
-      .full-width-container,
-      .conversation-container > *,
-      .conversation-container article > *,
-      .conversation-container [role="article"],
-      [class="response-container"],
-      [id="chat-history"],
-      [class*="chat-history"],
-      [data-test-id="chat-history-container"] {
-        max-width: 93vw !important;
-        width: 100% !important;
-        margin-left: 0 !important;
-        margin-right: auto !important;
-        overflow-x: hidden !important;
-        overflow-y: visible !important;
-        overflow-wrap: anywhere !important;
-        word-break: break-word !important;
-        box-sizing: border-box !important;
-      }
-
-      /* Padding only inside actual conversation content */
-/*
-      .conversation-container,
-      [class="response-container"] {
-        padding-left: 20px !important;
-        padding-right: 20px !important;
-      }
-*/
-      /* Expand the input/text area at the bottom without hiding it */
-      .input-area-container,
-      .bottom-container {
-        max-width: 95% !important;
-        width: 100% !important;
-        margin: 0 auto !important;
-        overflow: visible !important;
-        visibility: visible !important;
-      }
-
-      /* Composer visibility safeguards */
-      ${GEMINI_CHAT_ROOT_PSEUDO} textarea,
-      ${GEMINI_CHAT_ROOT_PSEUDO} [contenteditable="true"],
-      ${GEMINI_CHAT_ROOT_PSEUDO} div[role="textbox"] {
-        visibility: visible !important;
-        opacity: 1 !important;
-        display: block !important;
-        max-width: 100% !important;
-        overflow: visible !important;
-      }
-
-      /* Default message width clamp: ONLY within conversation content */
-     [class*="user-query"] {
-        max-width: 93vw !important;
-        width: 100% !important;
-        margin-left: auto !important;
-        margin-right: 0 !important;
-        display: block !important;
-      }
-    `);
-  });
+  return String.raw`
+    html { --gemini-vw: ${VW_SIZE}vw; }
+    html, body {
+      height: 100vh !important;
+      width: 100% !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      overflow-x: hidden !important;
+      overflow-y: auto !important;
+      background: #fff !important;
+      word-break: break-word !important;
+    }
+    @supports (overflow: clip) {
+      html, body { overflow-x: clip !important; }
+    }
+    ${GEMINI_CHAT_SCOPE_PSEUDO},
+    ${GEMINI_CHAT_SCOPE_PSEUDO} * {
+      box-sizing: border-box !important;
+      max-width: 100% !important;
+      overflow-wrap: anywhere !important;
+      word-break: break-word !important;
+    }
+    ${GEMINI_CHAT_SCOPE_PSEUDO} {
+      width: 100% !important;
+      max-width: none !important;
+      min-width: 0 !important;
+      overflow-x: hidden !important;
+      overflow-y: auto !important;
+      scrollbar-gutter: stable both-edges !important;
+    }
+    ${GEMINI_CHAT_MESSAGE_LIST_PSEUDO},
+    .conversation-container,
+    [class="response-container"] {
+      width: 100% !important;
+      max-width: none !important;
+      min-width: 0 !important;
+      margin-left: 0 !important;
+      margin-right: 0 !important;
+      padding-left: 0 !important;
+      padding-right: 0 !important;
+      overflow-x: hidden !important;
+      overflow-y: visible !important;
+    }
+    ${CONTENT} {
+      max-width: min(min(var(--gemini-vw, ${VW_SIZE}vw), 92vw), ${MAX_CHARS}ch) !important;
+      width: 100% !important;
+      margin-left: 0 !important;
+      margin-right: auto !important;
+      padding-left: 20px !important;
+      padding-right: 20px !important;
+    }
+    .input-area-container,
+    .bottom-container,
+    form,
+    [class*="input-area" i],
+    [class*="composer" i],
+    [class*="prompt-box" i],
+    [class*="text-input" i],
+    ${GEMINI_CHAT_SCOPE_PSEUDO} textarea,
+    ${GEMINI_CHAT_SCOPE_PSEUDO} [contenteditable="true"],
+    ${GEMINI_CHAT_SCOPE_PSEUDO} div[role="textbox"] {
+      width: 100% !important;
+      max-width: none !important;
+      min-width: 0 !important;
+      margin-left: 0 !important;
+      margin-right: 0 !important;
+      overflow: visible !important;
+      visibility: visible !important;
+      opacity: 1 !important;
+      flex: 1 1 auto !important;
+    }
+    [class*="user-query"] {
+      max-width: none !important;
+      width: auto !important;
+      margin-left: initial !important;
+      margin-right: initial !important;
+      display: block !important;
+    }
+    ${TABLE_WRAPPERS} {
+      width: min(94vw, 1800px) !important;
+      max-width: min(94vw, 1800px) !important;
+      margin-left: 0 !important;
+      margin-right: auto !important;
+      padding-left: 0 !important;
+      padding-right: 0 !important;
+    }
+    .conversation-container table,
+    ${GEMINI_CHAT_SCOPE_PSEUDO} table {
+      table-layout: fixed !important;
+      width: 100% !important;
+      min-width: 100% !important;
+      max-width: 100% !important;
+      border-collapse: collapse !important;
+      display: table !important;
+    }
+    .conversation-container th,
+    .conversation-container td,
+    ${GEMINI_CHAT_SCOPE_PSEUDO} th,
+    ${GEMINI_CHAT_SCOPE_PSEUDO} td {
+      white-space: normal !important;
+      overflow-wrap: anywhere !important;
+      word-break: break-word !important;
+      vertical-align: top !important;
+      max-width: none !important;
+    }
+    .conversation-container pre,
+    .conversation-container code,
+    ${GEMINI_CHAT_SCOPE_PSEUDO} pre,
+    ${GEMINI_CHAT_SCOPE_PSEUDO} code {
+      white-space: pre-wrap !important;
+      overflow-wrap: anywhere !important;
+      word-break: break-word !important;
+      max-width: 92vw !important;
+    }
+    .conversation-container pre,
+    ${GEMINI_CHAT_SCOPE_PSEUDO} pre {
+      width: 100% !important;
+      overflow-x: hidden !important;
+      box-sizing: border-box !important;
+    }
+  `;
+}
+function applyMaxLayoutCSS(win, { specificMessageId } = {}) {
+  if (!win) return;
+  const cacheKey = specificMessageId || 'default';
+  let css = maxLayoutCssCache.get(cacheKey);
+  if (!css) {
+    css = buildMaxLayoutCSS({ specificMessageId });
+    maxLayoutCssCache.set(cacheKey, css);
+  }
+  if (win.___geminiRole === 'quick' || win.__geminiRole === 'quick') {
+    injectCSSIntoAllFrames(win, css);
+    return;
+  }
+  if (!win.__maxLayoutKeyHolder) {
+    win.__maxLayoutKeyHolder = { key: null, css: '', __wired: false };
+  }
+  injectCSSOnLoad(win, css, win.__maxLayoutKeyHolder);
 }
 
 // ============================================================================
@@ -1262,142 +1409,98 @@ function ensureSaveState(win) {
 // ---------- Chat pane selection helper ----------
 // Select the entire chat pane content in the renderer and return selection stats
 async function selectChatPane(win) {
-  const res = await win.webContents.executeJavaScript(`
-    (function() {
-      const info = (function() {
-  function safeText(el){ try { return String(el && (el.innerText || el.textContent) || ''); } catch { return ''; } }
-  function countOcc(text, needle){
-    if (!text) return 0;
-    let n=0, i=0;
-    while ((i = text.indexOf(needle, i)) !== -1) { n++; i += needle.length; }
-    return n;
-  }
-  function scoreEl(el){
-    if (!el) return -1;
-    let r; try { r = el.getBoundingClientRect(); } catch { r = {width:0,height:0}; }
-    if (!r || r.width < 200 || r.height < 150) return -1;
-    const t = safeText(el);
-    const len = t.trim().length;
-    const you = countOcc(t, 'You said');
-    const gem = countOcc(t, 'Gemini said');
-    const hasTable = (()=>{ try { return !!el.querySelector('table'); } catch { return false; } })();
-    const hasPre = (()=>{ try { return !!el.querySelector('pre, code'); } catch { return false; } })();
-    let scrollable = 0;
-    try {
-      const cs = getComputedStyle(el);
-      scrollable = (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) ? 1 : 0;
-    } catch {}
-    // Weight speaker labels heavily; they strongly indicate transcript.
-    return (len/50) + (you*40) + (gem*40) + (hasTable?10:0) + (hasPre?8:0) + (scrollable?6:0);
-  }
-
-  // Candidate roots: Gemini app shell + main role fallbacks.
-  const roots = [];
-  try { roots.push(document.querySelector('main.chat-app')); } catch {}
-  try { roots.push(document.querySelector('[data-test-id="chat-app"]')); } catch {}
-  try { roots.push(document.querySelector('[role="main"]')); } catch {}
-  try { roots.push(document.querySelector('main')); } catch {}
-  roots.push(document.body);
-
-  let best = null;
-  let bestScore = -1;
-
-  for (const root of roots) {
-    if (!root) continue;
-    // Evaluate root itself
-    const s0 = scoreEl(root);
-    if (s0 > bestScore) { bestScore = s0; best = root; }
-
-    // Evaluate descendants that could plausibly be the transcript container
-    let nodes = [];
-    try { nodes = Array.from(root.querySelectorAll('section, article, div')); } catch {}
-    for (const el of nodes) {
-      const s = scoreEl(el);
-      if (s > bestScore) { bestScore = s; best = el; }
-    }
-  }
-
-  if (!best || bestScore < 5) {
-    // Fallback: at least return shell if present
-    const shell = (function(){ try { return document.querySelector('main.chat-app') || document.querySelector('[data-test-id="chat-app"]') || document.querySelector('main') || document.body; } catch { return document.body; }})();
-    return { ok: !!shell, nodeFound: !!shell, score: bestScore, selectorHint: 'fallback', textLen: safeText(shell).trim().length };
-  }
-
-  // Try to scroll the chosen pane to the very top to force earlier messages to mount.
-  try {
-    if (best.scrollTo) best.scrollTo({ top: 0, behavior: 'auto' });
-  } catch {}
-
-  const t = safeText(best);
-  return {
-    ok: true,
-    score: bestScore,
-    textLen: t.trim().length,
-    youSaid: countOcc(t, 'You said'),
-    geminiSaid: countOcc(t, 'Gemini said'),
-    tag: (best.tagName || '').toLowerCase(),
-    id: best.id || '',
-    className: best.className || ''
-  };
-})();;
-      if (!info || !info.ok) return { ok:false, selectedTextLength:0, reason: info?.selectorHint || 'no-pane' };
-
-      // Re-find best element using same heuristic (so we can select it)
-      function safeText(el){ try { return String(el && (el.innerText || el.textContent) || ''); } catch { return ''; } }
-      function countOcc(text, needle){ if (!text) return 0; let n=0,i=0; while ((i=text.indexOf(needle,i))!==-1){n++;i+=needle.length;} return n; }
-      function scoreEl(el){
-        if (!el) return -1;
-        let r; try { r = el.getBoundingClientRect(); } catch { r = {width:0,height:0}; }
-        if (!r || r.width < 200 || r.height < 150) return -1;
-        const t = safeText(el);
-        const len = t.trim().length;
-        const you = countOcc(t, 'You said');
-        const gem = countOcc(t, 'Gemini said');
-        let scrollable = 0;
-        try { const cs = getComputedStyle(el); scrollable = (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) ? 1 : 0; } catch {}
-        return (len/50) + (you*40) + (gem*40) + (scrollable?6:0);
+  const js = `
+    (function () {
+      const candidates = ${JSON.stringify(GEMINI_CHAT_ROOT_SELECTORS)};
+      const transcriptSelectors = [
+        '.conversation-container',
+        '[class="response-container"]',
+        '[role="article"]',
+        'article',
+        'section',
+        'main'
+      ];
+      function visible(el) {
+        if (!el) return false;
+        const r = el.getBoundingClientRect?.();
+        return !!r && r.width > 0 && r.height > 0;
       }
-      const roots = [];
-      try { roots.push(document.querySelector('main.chat-app')); } catch {}
-      try { roots.push(document.querySelector('[data-test-id="chat-app"]')); } catch {}
-      try { roots.push(document.querySelector('[role="main"]')); } catch {}
-      try { roots.push(document.querySelector('main')); } catch {}
-      roots.push(document.body);
-
-      let best=null, bestScore=-1;
-      for (const root of roots) {
-        if (!root) continue;
-        const s0 = scoreEl(root);
-        if (s0 > bestScore) { bestScore=s0; best=root; }
-        let nodes=[]; try { nodes = Array.from(root.querySelectorAll('section, article, div')); } catch {}
-        for (const el of nodes) {
-          const s = scoreEl(el);
-          if (s > bestScore) { bestScore=s; best=el; }
+      function textOf(el) {
+        try { return String(el?.innerText || el?.textContent || ''); } catch { return ''; }
+      }
+      function count(el, sel) {
+        try { return el?.querySelectorAll?.(sel)?.length || 0; } catch { return 0; }
+      }
+      function editablePenalty(el) {
+        const selfEditable = !!el?.matches?.('textarea, input, [contenteditable="true"], div[role="textbox"]');
+        if (selfEditable) return 2000;
+        return (count(el, 'textarea, input, [contenteditable="true"], div[role="textbox"]') * 900)
+          + (count(el, 'form') * 300)
+          + (count(el, '[role="button"], button') * 8);
+      }
+      function score(el) {
+        if (!el || !visible(el)) return -1;
+        const text = textOf(el).trim();
+        const len = Math.min(text.length, 5000);
+        const articleCount = count(el, '[role="article"], article');
+        const responseCount = count(el, '.conversation-container, [class="response-container"], [class*="response-content"], [class*="markdown"], [class="model-response-text"]');
+        const richCount = count(el, 'table, pre, code, ul, ol, blockquote');
+        const scrollable = (() => {
+          try {
+            const cs = getComputedStyle(el);
+            return (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) ? 1 : 0;
+          } catch {
+            return 0;
+          }
+        })();
+        return 1000
+          + Math.min(len, 1600)
+          + (articleCount * 90)
+          + (responseCount * 60)
+          + (richCount * 25)
+          + (scrollable * 50)
+          - editablePenalty(el);
+      }
+      const found = [];
+      for (const sel of candidates) {
+        try {
+          document.querySelectorAll(sel).forEach((root) => {
+            found.push(root);
+            transcriptSelectors.forEach((childSel) => {
+              try { root.querySelectorAll(childSel).forEach((el) => found.push(el)); } catch {}
+            });
+          });
+        } catch {}
+      }
+      let best = null;
+      let bestScore = -1;
+      for (const el of found) {
+        const s = score(el);
+        if (s > bestScore) {
+          best = el;
+          bestScore = s;
         }
       }
-      const el = best || document.body;
-      if (!el) return { ok:false, selectedTextLength:0, reason:'no-element' };
-
-      try { if (el.scrollTo) el.scrollTo({ top: 0, behavior: 'auto' }); } catch {}
-
-      try {
-        const sel = window.getSelection && window.getSelection();
-        if (!sel) return { ok:false, selectedTextLength:0, reason:'no-selection-api', debug: info };
-        sel.removeAllRanges();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        sel.addRange(range);
-        const txt = String(sel.toString() || '');
-        return { ok:true, selectedTextLength: txt.length, debug: info };
-      } catch (e) {
-        return { ok:false, selectedTextLength:0, err: String(e), debug: info };
-      }
+      if (!best) return { ok: false, selectedTextLength: 0 };
+      try { best.scrollIntoView({ block: 'start', inline: 'nearest' }); } catch {}
+      const sel = window.getSelection?.();
+      if (!sel) return { ok: false, selectedTextLength: 0 };
+      sel.removeAllRanges();
+      const range = document.createRange();
+      range.selectNodeContents(best);
+      sel.addRange(range);
+      const txt = String(sel.toString() || '');
+      return { ok: !!txt.length, selectedTextLength: txt.length };
     })();
-  `);
-  return res;
+  `;
+  const results = await executeInAllFrames(win, js);
+  const success = results
+    .map(r => r.value)
+    .filter(v => v?.ok)
+    .sort((a, b) => Number(b.selectedTextLength || 0) - Number(a.selectedTextLength || 0))[0];
+  return success || { ok: false, selectedTextLength: 0 };
 }
-
-
+// ---------- Selection → Markdown helpers ----------
 // ---------- Selection → Markdown helpers ----------
 // Extract the current selection from the renderer as HTML fragment and text.
 async function getSelectionFragment(win) {
@@ -2443,17 +2546,28 @@ function createWindow() {
 
   mainWindow.loadURL(GEMINI_URL); // Load your app
 
-  try { applyWideLayout(mainWindow.webContents); } catch (e) { console.error('applyWideLayout (deferred) failed:', e); }
+  try {
+    mainWindow.webContents.once('did-stop-loading', () => {
+      // Next tick ensures Chromium has painted once
+      setTimeout(() => {
+        try { applyMaxLayoutCSS(mainWindow); }
+        catch (e) { console.error('applyMaxLayoutCSS (deferred) failed:', e); }
+      }, 0);
+    });
+  } catch (e) {
+    console.error('applyMaxLayoutCSS quick defer wiring failed:', e);
+  }
 
-  try { applyDynamicWidth(mainWindow); } catch (e) { console.error('applyDynamicWidth failed:', e); }
-  try { attachVWResize(mainWindow); } catch (e) { console.error('attachVWResize failed:', e); }
-  try { requestExpandedLayout(mainWindow); } catch (e) { console.error('requestExpandedLayout (outer) failed:', e); }
+
+//  try { applyDynamicWidth(mainWindow); } catch (e) { console.error('applyDynamicWidth failed:', e); }
+////  try { attachVWResize(mainWindow); } catch (e) { console.error('attachVWResize failed:', e); }
+//  try { requestExpandedLayout(mainWindow); } catch (e) { console.error('requestExpandedLayout (outer) failed:', e); }
 
   // Build native context menu purely from main, based on Chromium's params
 
   // Keep the 'did-stop-loading' handler singular when SPA navigations occur.
   mainWindow.webContents.on('did-start-navigation', () => {
-    try { attachVWResize(mainWindow); } catch {}
+////    try { attachVWResize(mainWindow); } catch {}
   });
   mainWindow.webContents.on('destroyed', () => {
     try { mainWindow?.webContents?.removeListener('did-stop-loading', onDidStopLoading);
