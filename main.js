@@ -756,7 +756,6 @@ function buildMaxLayoutCSS({ specificMessageId } = {}) {
       padding: 0 !important;
       overflow-x: hidden !important;
       overflow-y: auto !important;
-      background: #fff !important;
       word-break: break-word !important;
     }
     @supports (overflow: clip) {
