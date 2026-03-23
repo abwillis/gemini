@@ -576,7 +576,7 @@ function attachVWResize(win) {
 }
 
 // --- Dynamic width constants (added) ---
-const MAX_CHARS = 1024;
+const MAX_CHARS = 2048;
 const VW_SIZE = 100;
 const MIN_VW = 70;
 const MAX_VW = 100;
@@ -587,56 +587,8 @@ function applyWideLayout(wc) {
       /* Keep the Gemini root scrollable, but do not force layout widths on root children */
       ${GEMINI_CHAT_ROOT_PSEUDO} {
         overflow-x: hidden !important;
-        overflow-y: auto !important;
-        scrollbar-gutter: stable !important;
-      }
-
-      /* Expand the input/text area at the bottom */
-      .input-area-container,
-      .bottom-container {
-        max-width: 95% !important;
-        margin: 0 auto !important;
-      }
-
-      /* Expand only the conversation area; do not restyle generic page/layout roots */
-      [class*="response-content"],
-      [class*="markdown"],
-      [class="model-response-text"],
-      .conversation-container,
-      .full-width-container,
-      .conversation-container > *,
-      .conversation-container article > *,
-      .conversation-container [role="article"]  {
-        max-width: min(min(var(--gemini-vw, ${VW_SIZE}vw), 91vw), ${MAX_CHARS}ch) !important;
-        width: 100% !important;
-        margin-left: 0 !important;
-        margin-right: auto !important;
-        overflow-x: hidden !important;
         overflow-y: visible !important;
-        overflow-wrap: anywhere !important;
-        word-break: break-word !important;
-        box-sizing: border-box !important;
-      }
-
-      /* Padding only inside actual conversation content */
-      .conversation-container,
-      [class="response-container"], {
-        padding-left: 20px !important;
-        padding-right: 20px !important;
-      }
-
-      /* Default message width clamp: ONLY within conversation content */
-      [class*="query-content"]:not([class*=icon]),
-      [class*="query-content"]:not([class*=button])
-       {
-        max-width: min(min(var(--gemini-vw, ${VW_SIZE}vw), 91vw), ${MAX_CHARS}ch) !important;
-        width: 100% !important;
-        box-sizing: border-box !important;
-        margin-left: auto !important;
-        margin-right: 0 !important;
-        padding-left: 0 !important;
-        padding-right: 0 !important;
-        display: block !important;
+        scrollbar-gutter: stable !important;
       }
 
       /*
@@ -650,7 +602,7 @@ function applyWideLayout(wc) {
       ${GEMINI_CHAT_ROOT_PSEUDO} article:has(table),
       ${GEMINI_CHAT_ROOT_PSEUDO} div:has(> table) {
         width: min(96vw, 1800px) !important;
-        max-width: min(96vw, 1800px) !important;
+        max-width: 100% !important;
         margin-left: 0 !important;
         margin-right: auto !important;
         padding-left: 0 !important;
@@ -711,7 +663,8 @@ function applyWideLayout(wc) {
         white-space: pre-wrap !important;
         overflow-wrap: anywhere !important;
         word-break: break-word !important;
-        max-width: 100% !important;
+        max-width: 93vw !important;
+        width: auto !important;
       }
 
       .conversation-container pre,
@@ -720,6 +673,68 @@ function applyWideLayout(wc) {
         overflow-x: hidden !important;
         overflow-y: visible !important;
         box-sizing: border-box !important;
+      }
+
+      /* Expand only actual rendered conversation content */
+      [class*="response-content"],
+      [class*="markdown"],
+      [class="model-response-text"],
+      .conversation-container,
+      .full-width-container,
+      .conversation-container > *,
+      .conversation-container article > *,
+      .conversation-container [role="article"],
+      [class="response-container"],
+      [id="chat-history"],
+      [class*="chat-history"],
+      [data-test-id="chat-history-container"] {
+        max-width: 93vw !important;
+        width: 100% !important;
+        margin-left: 0 !important;
+        margin-right: auto !important;
+        overflow-x: hidden !important;
+        overflow-y: visible !important;
+        overflow-wrap: anywhere !important;
+        word-break: break-word !important;
+        box-sizing: border-box !important;
+      }
+
+      /* Padding only inside actual conversation content */
+/*
+      .conversation-container,
+      [class="response-container"] {
+        padding-left: 20px !important;
+        padding-right: 20px !important;
+      }
+*/
+      /* Expand the input/text area at the bottom without hiding it */
+      .input-area-container,
+      .bottom-container {
+        max-width: 95% !important;
+        width: 100% !important;
+        margin: 0 auto !important;
+        overflow: visible !important;
+        visibility: visible !important;
+      }
+
+      /* Composer visibility safeguards */
+      ${GEMINI_CHAT_ROOT_PSEUDO} textarea,
+      ${GEMINI_CHAT_ROOT_PSEUDO} [contenteditable="true"],
+      ${GEMINI_CHAT_ROOT_PSEUDO} div[role="textbox"] {
+        visibility: visible !important;
+        opacity: 1 !important;
+        display: block !important;
+        max-width: 100% !important;
+        overflow: visible !important;
+      }
+
+      /* Default message width clamp: ONLY within conversation content */
+     [class*="user-query"] {
+        max-width: 93vw !important;
+        width: 100% !important;
+        margin-left: auto !important;
+        margin-right: 0 !important;
+        display: block !important;
       }
     `);
   });
