@@ -411,10 +411,9 @@ function createQuickChatWindow() {
         enabled: hasSelection,
         click: async () => {
           try {
-            const { hasSelection: ok, html, text } = await getSelectionFragment(win);
-            if (!ok) return;
-            const md = htmlToMarkdown(html || text);
-            clipboard.writeText(md);
+            const result = await buildSelectionMarkdownForExport(win);
+            if (!result?.ok) return;
+            clipboard.writeText(String(result.markdown ?? ''));
           } catch (err) {
             console.error('Copy Selection as Markdown failed:', err);
           }
@@ -2674,18 +2673,55 @@ function stripExecutableBlocks(input) {
   out = out.replace(/\son\w+=(?:"[^"]*"|'[^']*')/gi, '');
   return out;
 }
-
+async function buildSelectionMarkdownForExport(win) {
+ try {
+  if (!win) return { ok: false, markdown: '', reason: 'no-window' };
+  let html = '';
+  let text = '';
+  let hasSelection = false;
+  try {
+   const sel = await getSelectionFragment(win);
+   hasSelection = !!sel?.hasSelection;
+   html = String(sel?.html ?? '');
+   text = String(sel?.text ?? '');
+  } catch {}
+  if (!hasSelection) {
+   return { ok: false, markdown: '', reason: 'no-selection' };
+  }
+  // If the current selection is effectively the whole chat pane, prefer the
+  // widened snapshot export path used by Save Chat Pane.
+  let exportHtml = html;
+  try {
+   const selectedLen = String(text ?? '').trim().length;
+   const pane = await buildChatPaneExportSnapshot(win);
+   const paneTextLen = Number(pane?.diagnostics?.textLength ?? 0);
+   if (pane?.ok && paneTextLen > 0 && selectedLen > 0) {
+    const ratio = selectedLen / paneTextLen;
+    if (ratio >= 0.80) {
+     exportHtml = String(pane?.html ?? html ?? '');
+    }
+   }
+  } catch {}
+  return {
+   ok: true,
+   markdown: htmlToMarkdown(exportHtml || text),
+   reason: 'ok'
+  };
+ } catch (err) {
+  console.error('buildSelectionMarkdownForExport failed:', err);
+  return { ok: false, markdown: '', reason: String(err?.message ?? err) };
+ }
+}
 // --- Save selection as Markdown helper ---
 async function saveSelectionAsMarkdown(win) {
   try {
     if (!win) return;
-    const { hasSelection, html, text } = await getSelectionFragment(win);
-    if (!hasSelection) {
-      // Optional: inform user; keep silent if you prefer
-      try { dialog.showErrorBox('Save Selection as Markdown', 'No selection found.'); } catch {}
-      return;
+    const result = await buildSelectionMarkdownForExport(win);
+    if (!result?.ok) {
+     try { dialog.showErrorBox('Save Selection as Markdown', 'No selection found.'); } catch {}
+     return;
     }
-    const md = htmlToMarkdown(html || text);
+    const md = String(result.markdown ?? '');
     const { filePath, canceled } = await dialog.showSaveDialog(win, {
       title: 'Save Selection as Markdown',
       defaultPath: 'selection.md',
@@ -3281,10 +3317,9 @@ function createWindow() {
         enabled: hasSelection,
         click: async () => {
           try {
-            const { hasSelection: ok, html, text } = await getSelectionFragment(mainWindow);
-            if (!ok) return;
-            const md = htmlToMarkdown(html || text);
-            clipboard.writeText(md);
+            const result = await buildSelectionMarkdownForExport(mainWindow);
+            if (!result?.ok) return;
+            clipboard.writeText(String(result.markdown ?? ''));
           } catch (err) {
             console.error('Copy Selection as Markdown failed:', err);
           }
