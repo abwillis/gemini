@@ -2467,7 +2467,7 @@ const turndownService = createTurndownService();
 function createTurndownService() {
   const service = new TurndownService({
     headingStyle: 'atx',
-    codeBlockStyle: 'fenced',
+    codeBlockStyle: 'indented',
     fence: '```',
     bulletListMarker: '-',
     emDelimiter: '*',
@@ -2497,8 +2497,8 @@ function createTurndownService() {
     console.error('Turndown remove() setup failed:', err);
   }
 
-  // Preserve fenced code blocks exactly, including language hints when present.
-  service.addRule('fencedCodeBlocks', {
+  // Emit code blocks as plain text instead of fenced or indented markdown.
+  service.addRule('plainTextCodeBlocks', {
     filter: 'pre',
     replacement: function (_content, node) {
       const codeNode =
@@ -2508,10 +2508,8 @@ function createTurndownService() {
       const raw = String(codeNode.textContent || '')
         .replace(/\u00A0/g, ' ')
         .replace(/\r\n?/g, '\n');
-      const className = String(codeNode.getAttribute?.('class') || '');
-      const language = (className.match(/(?:^|\s)language-([A-Za-z0-9_+-]+)/) || [])[1] || '';
       const body = raw.replace(/^\n+|\n+$/g, '');
-      return `\n\n\`\`\`${language}\n${body}\n\`\`\`\n\n`;
+      return `\n\n${body}\n\n`;
     }
   });
 
