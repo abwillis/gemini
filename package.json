@@ -1,6 +1,6 @@
 {
   "name": "gemini-for-linux",
-  "version": "1.04.03",
+  "version": "1.04.04",
   "description": "Gemini for Linux",
   "main": "main.js",
   "scripts": {

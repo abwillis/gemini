@@ -2942,9 +2942,6 @@ async function saveChatPaneAsMarkdown(win, filePath) {
       return;
     }
 
-    try {
-     console.log('saveChatPaneAsMarkdown snapshot diagnostics:', snapshot.diagnostics || null);
-    } catch {}
     // Convert cleaned semantic HTML → Markdown
     // (No entity decoding; structure already preserved)
     const paneHtml = String(snapshot.html || '');
@@ -2956,45 +2953,7 @@ async function saveChatPaneAsMarkdown(win, filePath) {
     const withLineBreaks = paneHtml.replace(/></g, '>\n<');
     const safeHtml = stripExecutableBlocks(withLineBreaks);
     const normalizedHtml = normalizeHtmlForMarkdownShared(safeHtml);
-    try {
-     const preDumpPaths = await writeMarkdownDebugDump(filePath, {
-      rawHtml: paneHtml,
-      normalizedHtml,
-      outerContextHtml: String(snapshot.outerContextHtml || ''),
-      grandparentContextHtml: String(snapshot.grandparentContextHtml || ''),
-      diagnostics: snapshot.diagnostics || null,
-      markdown: ''
-     });
-     console.log('saveChatPaneAsMarkdown pre-conversion debug dump:', {
-      rawHtmlPath: preDumpPaths.rawHtmlPath,
-      normalizedHtmlPath: preDumpPaths.normalizedHtmlPath,
-      diagnosticsPath: preDumpPaths.diagnosticsPath,
-      outerContextHtmlPath: preDumpPaths.outerContextHtmlPath,
-      grandparentContextHtmlPath: preDumpPaths.grandparentContextHtmlPath
-     });
-    } catch (dumpErr) {
-     console.error('saveChatPaneAsMarkdown pre-conversion debug dump failed:', dumpErr);
-    }
     const md = htmlToMarkdown(safeHtml);
-    try {
-      const postDumpPaths = await writeMarkdownDebugDump(filePath, {
-      rawHtml: paneHtml,
-      normalizedHtml,
-      outerContextHtml: String(snapshot.outerContextHtml || ''),
-      grandparentContextHtml: String(snapshot.grandparentContextHtml || ''),
-      diagnostics: snapshot.diagnostics || null,
-      markdown: md
-     });
-     console.log('saveChatPaneAsMarkdown post-conversion debug dump:', {
-      rawHtmlPath: postDumpPaths.rawHtmlPath,
-      normalizedHtmlPath: postDumpPaths.normalizedHtmlPath,
-      diagnosticsPath: postDumpPaths.diagnosticsPath,
-      outerContextHtmlPath: postDumpPaths.outerContextHtmlPath,
-      grandparentContextHtmlPath: postDumpPaths.grandparentContextHtmlPath
-     });
-    } catch (dumpErr) {
-   console.error('saveChatPaneAsMarkdown post-conversion debug dump failed:', dumpErr);
-    }
     await fs.promises.writeFile(filePath, md, 'utf8');
     } catch (err) {
       console.error('Save Chat Pane as Markdown failed:', err);
