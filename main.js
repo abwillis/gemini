@@ -527,6 +527,14 @@ function buildLocateChatRootScript({ includeHtml = true } = {}) {
     (function () {
       const candidates = ${selectorsJson};
       const transcriptSelectors = [
+        'message-content',
+        '.markdown.markdown-main-panel',
+        '[id^="model-response-message-content"]',
+        'structured-content-container',
+        '.model-response-text',
+        '.response-content',
+        '.response-container-content',
+        '.presented-response-container',
         '.conversation-container',
         '[class="response-container"]',
         '[role="article"]',
@@ -545,6 +553,43 @@ function buildLocateChatRootScript({ includeHtml = true } = {}) {
       function count(el, sel) {
         try { return el?.querySelectorAll?.(sel)?.length || 0; } catch { return 0; }
       }
+      function semanticBonus(el) {
+       try {
+        let bonus = 0;
+        if (el.matches?.('message-content, .markdown.markdown-main-panel, [id^="model-response-message-content"]')) bonus += 1400;
+        if (el.matches?.('structured-content-container, .model-response-text')) bonus += 1000;
+        if (el.matches?.('.response-content, .response-container-content, .presented-response-container')) bonus += 700;
+        if (count(el, 'table, .horizontal-scroll-wrapper, .table-block-component, table-block') > 0) bonus += 180;
+        return bonus;
+       } catch {
+        return 0;
+       }
+      }
+      function chromePenalty(el) {
+       try {
+        let penalty = 0;
+        if (el.matches?.(
+         'user-query,' +
+         'user-query-content,' +
+         '.user-query-container,' +
+         '.query-content,' +
+         '.response-footer,' +
+         '.response-container-footer,' +
+         'message-actions,' +
+         'sources-list,' +
+         'tts-control,' +
+         'bard-avatar,' +
+         '.avatar-gutter'
+        )) penalty += 2200;
+        const cls = String(el.className || '');
+        if (/(user-query|prompt|action|button|toolbar|footer|sources-list|message-actions|thumb-|tts-|avatar-gutter)/i.test(cls)) {
+         penalty += 1200;
+        }
+        return penalty;
+       } catch {
+        return 0;
+       }
+      }
       function editablePenalty(el) {
         const selfEditable = !!el?.matches?.('textarea, input, [contenteditable="true"], div[role="textbox"]');
         if (selfEditable) return 2000;
@@ -557,7 +602,7 @@ function buildLocateChatRootScript({ includeHtml = true } = {}) {
         const text = textOf(el).trim();
         const len = Math.min(text.length, 5000);
         const articleCount = count(el, '[role="article"], article');
-        const responseCount = count(el, '.conversation-container, [class="response-container"], [class*="response-content"], [class*="markdown"], [class="model-response-text"]');
+        const responseCount = count(el, 'message-content, .markdown, [id^="model-response-message-content"], structured-content-container, .model-response-text, .response-content, .response-container-content, .presented-response-container, .conversation-container, [class="response-container"]');
         const richCount = count(el, 'table, pre, code, ul, ol, blockquote');
         const scrollable = (() => {
           try {
@@ -573,6 +618,8 @@ function buildLocateChatRootScript({ includeHtml = true } = {}) {
           + (responseCount * 60)
           + (richCount * 25)
           + (scrollable * 50)
+          + semanticBonus(el)
+          - chromePenalty(el)
           - editablePenalty(el);
       }
       const found = [];
@@ -646,6 +693,678 @@ async function getChatPaneSnapshot(win) {
     selector: best.value.selector || null
   };
 }
+
+async function executeInTargetFrame(win, where, source) {
+ if (!win?.webContents) return null;
+ try {
+  if (!where || where === 'top') {
+   return await win.webContents.executeJavaScript(source, true).catch(() => null);
+  }
+  const m = /^frame:(\d+)$/.exec(String(where || ''));
+  if (!m) return null;
+  const routingId = Number(m[1]);
+  const frames = win.webContents.mainFrame?.framesInSubtree ?? [];
+  const frame = frames.find(f => Number(f?.routingId) === routingId);
+  if (!frame) return null;
+  return await frame.executeJavaScript(source, true).catch(() => null);
+ } catch {
+  return null;
+ }
+}
+function buildExportChatRootSnapshotScript() {
+ const selectorsJson = JSON.stringify(GEMINI_CHAT_ROOT_SELECTORS);
+ return `
+ (function () {
+  const candidates = ${selectorsJson};
+  const transcriptSelectors = [
+   'message-content',
+   '.markdown.markdown-main-panel',
+   '[id^="model-response-message-content"]',
+   'structured-content-container',
+   '.model-response-text',
+   '.response-content',
+   '.response-container-content',
+   '.presented-response-container',
+   '.conversation-container',
+   '[class="response-container"]',
+   '[role="article"]',
+   'article',
+   'section',
+   'main'
+  ];
+  function visible(el) {
+   if (!el) return false;
+   const r = el.getBoundingClientRect?.();
+   return !!r && r.width > 0 && r.height > 0;
+  }
+  function textOf(el) {
+   try { return String(el?.innerText || el?.textContent || ''); } catch { return ''; }
+  }
+  function count(el, sel) {
+   try { return el?.querySelectorAll?.(sel)?.length || 0; } catch { return 0; }
+  }
+  function semanticBonus(el) {
+   try {
+    let bonus = 0;
+    if (el.matches?.('message-content, .markdown.markdown-main-panel, [id^="model-response-message-content"]')) bonus += 1400;
+    if (el.matches?.('structured-content-container, .model-response-text')) bonus += 1000;
+    if (el.matches?.('.response-content, .response-container-content, .presented-response-container')) bonus += 700;
+    if (count(el, 'table, .horizontal-scroll-wrapper, .table-block-component, table-block') > 0) bonus += 180;
+    return bonus;
+   } catch {
+    return 0;
+   }
+  }
+  function chromePenalty(el) {
+   try {
+    let penalty = 0;
+    if (el.matches?.(
+     'user-query,' +
+     'user-query-content,' +
+     '.user-query-container,' +
+     '.query-content,' +
+     '.response-footer,' +
+     '.response-container-footer,' +
+     'message-actions,' +
+     'sources-list,' +
+     'tts-control,' +
+     'bard-avatar,' +
+     '.avatar-gutter'
+    )) penalty += 2200;
+    const cls = String(el.className || '');
+    if (/(user-query|prompt|action|button|toolbar|footer|sources-list|message-actions|thumb-|tts-|avatar-gutter)/i.test(cls)) {
+     penalty += 1200;
+    }
+    return penalty;
+   } catch {
+    return 0;
+   }
+  }
+  function editablePenalty(el) {
+   const selfEditable = !!el?.matches?.('textarea, input, [contenteditable="true"], div[role="textbox"]');
+   if (selfEditable) return 2000;
+   return (count(el, 'textarea, input, [contenteditable="true"], div[role="textbox"]') * 900)
+    + (count(el, 'form') * 300)
+    + (count(el, '[role="button"], button') * 8);
+  }
+  function score(el) {
+   if (!el || !visible(el)) return -1;
+   const text = textOf(el).trim();
+   const len = Math.min(text.length, 5000);
+   const articleCount = count(el, '[role="article"], article');
+   const responseCount = count(el, 'message-content, .markdown, [id^="model-response-message-content"], structured-content-container, .model-response-text, .response-content, .response-container-content, .presented-response-container, .conversation-container, [class="response-container"]');
+   const richCount = count(el, 'table, [role="table"], [role="grid"], pre, code, ul, ol, blockquote');
+   const scrollable = (() => {
+    try {
+     const cs = getComputedStyle(el);
+     return (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) ? 1 : 0;
+    } catch {
+     return 0;
+    }
+   })();
+   return 1000
+    + Math.min(len, 1600)
+    + (articleCount * 90)
+    + (responseCount * 60)
+    + (richCount * 25)
+    + (scrollable * 50)
+    + semanticBonus(el)
+    - chromePenalty(el)
+    - editablePenalty(el);
+  }
+  function semantifyAriaTables(root) {
+   const tableLikes = Array.from(root.querySelectorAll('[role="table"], [role="grid"]'))
+    .filter(el => !el.closest('table'));
+   for (const node of tableLikes) {
+    try {
+     const rowCandidates = [];
+     try {
+      node.querySelectorAll(':scope > [role="row"]').forEach(r => rowCandidates.push(r));
+     } catch {}
+     try {
+      node.querySelectorAll(':scope > [role="rowgroup"] > [role="row"]').forEach(r => rowCandidates.push(r));
+     } catch {}
+     if (!rowCandidates.length) {
+      node.querySelectorAll('[role="row"]').forEach(r => rowCandidates.push(r));
+     }
+     const rows = Array.from(new Set(rowCandidates));
+     if (!rows.length) continue;
+     const table = document.createElement('table');
+     const tbody = document.createElement('tbody');
+     let produced = 0;
+     for (const row of rows) {
+      const tr = document.createElement('tr');
+      const cellCandidates = [];
+      try {
+       row.querySelectorAll(':scope > [role="columnheader"], :scope > [role="rowheader"], :scope > [role="cell"]').forEach(c => cellCandidates.push(c));
+      } catch {}
+      if (!cellCandidates.length) {
+       row.querySelectorAll('[role="columnheader"], [role="rowheader"], [role="cell"]').forEach(c => cellCandidates.push(c));
+      }
+      const cells = Array.from(new Set(cellCandidates));
+      if (!cells.length) continue;
+      for (const cell of cells) {
+       const isHeader = cell.matches?.('[role="columnheader"], [role="rowheader"]');
+       const out = document.createElement(isHeader ? 'th' : 'td');
+       out.innerHTML = cell.innerHTML;
+       tr.appendChild(out);
+      }
+      tbody.appendChild(tr);
+      produced += 1;
+     }
+     if (!produced) continue;
+     table.appendChild(tbody);
+     node.replaceWith(table);
+    } catch {}
+   }
+  }
+  function describeNode(el) {
+   if (!el) return null;
+   try {
+    const tag = String(el.tagName || '').toLowerCase();
+    const id = String(el.id || '');
+    const className = String(el.className || '');
+    return { tag, id, className };
+   } catch {
+    return null;
+   }
+  }
+  function tableSignalCount(el) {
+   if (!el) return 0;
+   try {
+    return count(el, [
+     'table',
+     '[role="table"]',
+     '[role="grid"]',
+     'table-block',
+     '.table-block',
+     '.table-block-component',
+     '.table-content',
+     '.horizontal-scroll-wrapper'
+    ].join(', '));
+   } catch {
+    return 0;
+   }
+  }
+  function serializedTableSignalCount(el) {
+   if (!el) return 0;
+   try {
+    const html = String(el.outerHTML || '');
+    if (!html) return 0;
+    const matches = html.match(
+     /<table\b|role="table"|role="grid"|<table-block\b|class="[^"]*(?:table-block-component|table-block|table-content|horizontal-scroll-wrapper)[^"]*"/gi
+    );
+    return matches ? matches.length : 0;
+   } catch {
+    return 0;
+   }
+  }
+  function combinedTableSignalCount(el) {
+   try {
+    return Math.max(tableSignalCount(el), serializedTableSignalCount(el));
+   } catch {
+    return 0;
+   }
+  }
+  function shouldStopPromotion(el) {
+   try {
+    if (!el) return true;
+    const tag = String(el.tagName || '').toLowerCase();
+    if (tag === 'body' || tag === 'html') return true;
+    if (el.matches?.('#chat-history, main, [role="main"], body, html')) return true;
+    return false;
+   } catch {
+    return true;
+   }
+  }
+  function isPromotionCandidate(el) {
+   try {
+    if (!el) return false;
+    if (el.matches?.(
+     'message-content,' +
+     'structured-content-container,' +
+     '.response-content,' +
+     '.response-container-content,' +
+     '.presented-response-container,' +
+     '.response-container,' +
+     '.conversation-container,' +
+     '.table-block-component,' +
+     '.horizontal-scroll-wrapper,' +
+     'table-block,' +
+     'infinite-scroller'
+    )) return true;
+    const cls = String(el.className || '');
+    return /(response|conversation|table-block|horizontal-scroll-wrapper|chat-history)/i.test(cls);
+   } catch {
+    return false;
+   }
+  }
+  function promoteExportRoot(el) {
+   if (!el) return el;
+   const original = el;
+   const originalSignals = combinedTableSignalCount(original);
+   if (originalSignals > 0) return original;
+   let cur = original;
+   while (cur && !shouldStopPromotion(cur)) {
+    const parent = cur.parentElement || null;
+    if (!parent) break;
+    const parentSignals = combinedTableSignalCount(parent);
+    if (parentSignals > 0 && isPromotionCandidate(parent)) {
+     return parent;
+    }
+    cur = parent;
+   }
+   return original;
+  }
+  function cloneContainsTableSignals(root) {
+   if (!root) return false;
+   try {
+    return combinedTableSignalCount(root) > 0;
+   } catch {
+    return false;
+   }
+  }
+  function rescuePromotedRoot(initialRoot) {
+   if (!initialRoot) return initialRoot;
+   if (cloneContainsTableSignals(initialRoot)) return initialRoot;
+   let cur = initialRoot;
+   while (cur && !shouldStopPromotion(cur)) {
+    const parent = cur.parentElement || null;
+    if (!parent) break;
+    if (isPromotionCandidate(parent) && cloneContainsTableSignals(parent)) {
+     return parent;
+    }
+    cur = parent;
+   }
+   return initialRoot;
+  }
+  function directElementChildren(el) {
+   try {
+    return Array.from(el.children || []).filter(n => n && n.nodeType === 1);
+   } catch {
+    return [];
+   }
+  }
+  function textLen(el) {
+   try { return String(el?.innerText || el?.textContent || '').trim().length; } catch { return 0; }
+  }
+  function isLikelyUiJunk(el) {
+   try {
+    if (!el) return true;
+    if (el.matches?.('button, label, input, textarea, select, nav, aside, form, [role="button"], [role="textbox"]')) return true;
+    const cls = String(el.className || '');
+    if (/(button|toolbar|composer|prompt|input|editor|footer|header|nav|sidebar)/i.test(cls)) return true;
+    return false;
+   } catch {
+    return true;
+   }
+  }
+  function semantifyPseudoTables(root) {
+   const candidates = Array.from(root.querySelectorAll('div, section, article'))
+    .filter(node => {
+     try {
+      if (!node || node.closest('table, [role="table"], [role="grid"], pre, code, ul, ol, blockquote')) return false;
+      if (isLikelyUiJunk(node)) return false;
+      const rows = directElementChildren(node).filter(r => !isLikelyUiJunk(r));
+      if (rows.length < 2) return false;
+      const rowShapes = rows
+       .map(r => directElementChildren(r).filter(c => !isLikelyUiJunk(c)))
+       .filter(cells => cells.length >= 2);
+      if (rowShapes.length < 2) return false;
+      const counts = rowShapes.map(cells => cells.length);
+      const firstCount = counts[0];
+      if (!firstCount || firstCount < 2) return false;
+      if (!counts.every(n => n === firstCount)) return false;
+      const enoughText = rowShapes.every(cells => cells.some(cell => textLen(cell) > 0));
+      if (!enoughText) return false;
+      return true;
+     } catch {
+      return false;
+     }
+    });
+   for (const node of candidates) {
+    try {
+      const rowNodes = directElementChildren(node).filter(r => !isLikelyUiJunk(r));
+      const rowCells = rowNodes
+       .map(r => directElementChildren(r).filter(c => !isLikelyUiJunk(c)))
+       .filter(cells => cells.length >= 2);
+      if (rowCells.length < 2) continue;
+      const colCount = rowCells[0].length;
+      if (!rowCells.every(cells => cells.length === colCount)) continue;
+      const table = document.createElement('table');
+      const tbody = document.createElement('tbody');
+      for (let r = 0; r < rowCells.length; r += 1) {
+       const tr = document.createElement('tr');
+       const cells = rowCells[r];
+       const looksLikeHeaderRow = (r === 0) && cells.every(cell => {
+        const txt = String(cell.innerText || cell.textContent || '').trim();
+        return txt.length > 0 && txt.length <= 120;
+       });
+       for (const cell of cells) {
+        const out = document.createElement(looksLikeHeaderRow ? 'th' : 'td');
+        out.innerHTML = cell.innerHTML;
+        tr.appendChild(out);
+       }
+       tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      node.replaceWith(table);
+    } catch {}
+   }
+  }
+
+  const found = [];
+  for (const sel of candidates) {
+   try {
+    document.querySelectorAll(sel).forEach((root) => {
+     found.push({ sel, el: root });
+     transcriptSelectors.forEach((childSel) => {
+      try { root.querySelectorAll(childSel).forEach((el) => found.push({ sel: childSel, el })); } catch {}
+     });
+    });
+   } catch {}
+  }
+  const scored = found
+   .map(({ sel, el }) => ({ sel, el, score: score(el), textLength: textOf(el).trim().length }))
+   .filter((entry) => entry.score >= 0)
+   .sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return b.textLength - a.textLength;
+   });
+  const best = scored[0];
+  if (!best || !best.el) {
+    return {
+      ok: false,
+      html: '',
+      outerContextHtml: '',
+      grandparentContextHtml: '',
+      diagnostics: {
+       selector: null,
+       score: 0,
+       textLength: 0,
+       tables: 0,
+       tableRows: 0,
+       tableCells: 0,
+       ariaTables: 0,
+       codeBlocks: 0,
+       codes: 0,
+       selectedNode: null,
+       exportNode: null,
+       parentNode: null,
+       grandparentNode: null
+      }
+    };
+  }
+  const exportRoot = rescuePromotedRoot(promoteExportRoot(best.el));
+  const parent = exportRoot.parentElement ??
+ null;
+  const grandparent = parent?.parentElement ??
+ null;
+  function isLikelyUserPromptNode(el) {
+   if (!el) return false;
+   try {
+    if (el.matches?.(
+     'user-query,' +
+     'user-query-content,' +
+     '.user-query-container,' +
+     '.query-content'
+    )) return true;
+    const cls = String(el.className ??
+ '');
+    const tag = String(el.tagName ??
+ '').toLowerCase();
+    return (
+     /(user-query|query-content)/i.test(cls) ||
+     tag === 'user-query' ||
+     tag === 'user-query-content'
+    );
+   } catch {
+    return false;
+   }
+  }
+  const exportBoundary = grandparent ?? parent ?? exportRoot;
+  function findPreviousContextSibling(startEl) {
+   let cur = startEl ?? null;
+   while (cur) {
+    try {
+     let prev = cur.previousElementSibling ?? null;
+     while (prev) {
+      if (isLikelyUserPromptNode(prev)) return prev;
+      prev = prev.previousElementSibling ?? null;
+     }
+     const parentEl = cur.parentElement ?? null;
+     if (!parentEl) break;
+     const tag = String(parentEl.tagName ?? '').toLowerCase();
+     if (tag === 'body' || tag === 'html') break;
+     cur = parentEl;
+    } catch {
+     break;
+    }
+   }
+   return null;
+  }
+  const previousContextSibling = findPreviousContextSibling(exportBoundary);
+  const clone = exportRoot.cloneNode(true);
+  const preCleanupTableSignals = combinedTableSignalCount(clone);
+  const preCleanupTables = count(clone, 'table');
+  const preCleanupTableRows = count(clone, 'table tr');
+  const preCleanupTableCells = count(clone, 'table th, table td');
+  const preCleanupAriaTables = count(clone, '[role="table"], [role="grid"]');
+  const JUNK_SELECTORS = [
+   '[role="button"]',
+   '[class*="button" i]',
+   '[class*="logo" i]',
+   '[class*="label" i]',
+   '[class*="input" i]',
+   'label',
+   'input',
+   'textarea',
+   '[role="textbox"]'
+  ];
+  clone.querySelectorAll(JUNK_SELECTORS.join(',')).forEach(el => {
+   try { el.remove(); } catch {}
+  });
+  const PRESERVE_SELECTORS = [
+   'pre',
+   'code',
+   'table',
+   '[role="table"]',
+   '[role="grid"]',
+   'ul',
+   'ol',
+   '.horizontal-scroll-wrapper',
+   '.table-block-component',
+   'table-block',
+   '.table-block',
+   '.table-content'
+  ].join(', ');
+  clone.querySelectorAll(PRESERVE_SELECTORS).forEach(el => {
+   try { el.setAttribute('data-preserve', 'true'); } catch {}
+  });
+  clone.querySelectorAll('[data-preserve]').forEach(el => {
+   try {
+    el.querySelectorAll('*').forEach(child => child.setAttribute('data-preserve-descendant', 'true'));
+   } catch {}
+  });
+
+  // TEMP DEBUG: bypass div/span prune entirely.
+  // The latest debug still shows tables present pre-cleanup but gone post-cleanup,
+  // so this disables the prune step to verify whether it is the last destructive stage.
+  // clone.querySelectorAll('div, span').forEach(el => {
+  //  try {
+  //   if (el.closest?.('[data-preserve], [data-preserve-descendant]')) {
+  //    return;
+  //   }
+  //   if (
+  //    !el.textContent.trim() &&
+  //    !el.querySelector('[data-preserve], [data-preserve-descendant]') &&
+  //    !el.querySelector(PRESERVE_SELECTORS)
+  //   ) {
+  //    el.remove();
+  //   }
+  //  } catch {}
+  // });
+
+  // TEMP DEBUG: bypass semantifyAriaTables entirely.
+  // The latest debug still shows tables present pre-cleanup but gone post-cleanup
+  // even with the div/span prune disabled, so this isolates whether aria-table
+  // normalization is the remaining destructive sta
+  // semantifyAriaTables(clone);
+  // Keep pseudo-table synthesis disabled for this pass.
+  // The current debug data already proves semantic <table> nodes exist pre-cleanup,
+  // so disabling this avoids introducing another moving part while isolating cleanup loss.
+  // semantifyPseudoTables(clone);
+  const postCleanupTableSignals = combinedTableSignalCount(clone);
+  const postCleanupTables = count(clone, 'table');
+  const postCleanupTableRows = count(clone, 'table tr');
+  const postCleanupTableCells = count(clone, 'table th, table td');
+  const postCleanupAriaTables = count(clone, '[role="table"], [role="grid"]');
+  const diagnostics = {
+   selector: best.sel || null,
+   score: Number(best.score || 0),
+   textLength: Number(best.textLength || 0),
+   preCleanupTableSignals,
+   preCleanupTables,
+   preCleanupTableRows,
+   preCleanupTableCells,
+   preCleanupAriaTables,
+   postCleanupTableSignals,
+   postCleanupTables,
+   postCleanupTableRows,
+   postCleanupTableCells,
+   postCleanupAriaTables,
+   tables: postCleanupTables,
+   tableRows: postCleanupTableRows,
+   tableCells: postCleanupTableCells,
+   ariaTables: postCleanupAriaTables,
+   codeBlocks: count(clone, 'pre'),
+   codes: count(clone, 'code'),
+   selectedNodeTableSignals: combinedTableSignalCount(best.el),
+   exportNodeTableSignals: combinedTableSignalCount(exportRoot),
+   selectedNode: describeNode(best.el),
+   exportNode: describeNode(exportRoot),
+   parentNode: describeNode(parent),
+   grandparentNode: describeNode(grandparent),
+   exportBoundaryNode: describeNode(exportBoundary),
+   previousContextSiblingNode: describeNode(previousContextSibling)
+  };
+  const exportHtml =
+   String(
+    (previousContextSibling ? (previousContextSibling.outerHTML + '\\n') : '') +
+    (
+     grandparent?.outerHTML ??
+     parent?.outerHTML ??
+     clone.innerHTML ??
+     ''
+    )
+   );
+  return {
+   ok: true,
+   html: exportHtml,
+   outerContextHtml: String(parent?.outerHTML || ''),
+   grandparentContextHtml: String(grandparent?.outerHTML || ''),
+   diagnostics
+  };
+ })();
+ `;
+}
+async function buildChatPaneExportSnapshot(win) {
+ const results = await executeInAllFrames(win, buildExportChatRootSnapshotScript());
+ const okResults = results
+ .map(r => ({ where: r.where, value: r.value }))
+ .filter(r => r?.value?.ok);
+ if (okResults.length) {
+ okResults.sort((a, b) => {
+ const aSignals = Number(a?.value?.diagnostics?.preCleanupTableSignals || 0);
+ const bSignals = Number(b?.value?.diagnostics?.preCleanupTableSignals || 0);
+ if (bSignals !== aSignals) return bSignals - aSignals;
+ const aScore = Number(a?.value?.diagnostics?.score || 0);
+ const bScore = Number(b?.value?.diagnostics?.score || 0);
+ if (bScore !== aScore) return bScore - aScore;
+ const aLen = Number(a?.value?.diagnostics?.textLength || 0);
+ const bLen = Number(b?.value?.diagnostics?.textLength || 0);
+ return bLen - aLen;
+ });
+ return okResults[0].value;
+ }
+ const best = await findBestChatRoot(win, { includeHtml: true });
+ return {
+ ok: false,
+ html: '',
+ outerContextHtml: '',
+ grandparentContextHtml: '',
+ diagnostics: {
+ selector: best?.value?.selector || null,
+ score: Number(best?.value?.score || 0),
+ textLength: Number(best?.value?.textLength || 0),
+ locateWhere: best?.where || null,
+ reason: 'No export snapshot candidate returned ok=true in any frame'
+ }
+ };
+}
+
+function getMarkdownDebugDumpPaths(filePath) {
+ const parsed = path.parse(String(filePath || 'gemini-chat.md'));
+ const base = path.join(parsed.dir, parsed.name);
+ return {
+  rawHtmlPath: `${base}.debug-export.raw.html`,
+  normalizedHtmlPath: `${base}.debug-export.normalized.html`,
+  diagnosticsPath: `${base}.debug-export.json`,
+  outerContextHtmlPath: `${base}.debug-export.context.outer.html`,
+  grandparentContextHtmlPath: `${base}.debug-export.context.grandparent.html`
+ };
+}
+async function writeMarkdownDebugDump(filePath, payload = {}) {
+ const {
+  rawHtml = '',
+  normalizedHtml = '',
+  outerContextHtml = '',
+  grandparentContextHtml = '',
+  diagnostics = null,
+  markdown = ''
+ } = payload || {};
+ const paths = getMarkdownDebugDumpPaths(filePath);
+ const meta = {
+  generatedAt: new Date().toISOString(),
+  files: {
+   rawHtml: path.basename(paths.rawHtmlPath),
+   normalizedHtml: path.basename(paths.normalizedHtmlPath),
+   diagnostics: path.basename(paths.diagnosticsPath),
+   outerContextHtml: path.basename(paths.outerContextHtmlPath),
+   grandparentContextHtml: path.basename(paths.grandparentContextHtmlPath)
+  },
+  lengths: {
+   rawHtml: String(rawHtml || '').length,
+   normalizedHtml: String(normalizedHtml || '').length,
+   outerContextHtml: String(outerContextHtml || '').length,
+   grandparentContextHtml: String(grandparentContextHtml || '').length,
+   markdown: String(markdown || '').length
+  },
+  diagnostics: diagnostics || null
+ };
+ await fs.promises.writeFile(paths.rawHtmlPath, String(rawHtml || ''), 'utf8');
+ await fs.promises.writeFile(paths.normalizedHtmlPath, String(normalizedHtml || ''), 'utf8');
+ await fs.promises.writeFile(paths.outerContextHtmlPath, String(outerContextHtml || ''), 'utf8');
+ await fs.promises.writeFile(paths.grandparentContextHtmlPath, String(grandparentContextHtml || ''), 'utf8');
+ await fs.promises.writeFile(paths.diagnosticsPath, JSON.stringify(meta, null, 2), 'utf8');
+ return paths;
+}
+
+function normalizeHtmlForMarkdownShared(html) {
+ let out = String(html || '');
+ if (!out.trim()) return '';
+ out = stripExecutableBlocks(out)
+  .replace(/<!--([\s\S]*?)-->/g, '')
+  .replace(/\r\n?/g, '\n')
+  .replace(/\u00A0/g, ' ');
+ // Gemini often renders diff/code lines as adjacent block nodes with no text newlines.
+ // Inject line boundaries before Turndown sees the HTML.
+ out = out
+  .replace(/<\/(div|p|li|tr|h[1-6]|blockquote|pre|table|ul|ol)>\s*</gi, '</$1>\n<')
+  .replace(/<(br)\s*\/?\s*>/gi, '<$1 />\n');
+ return out.trim();
+}
+
 // === Safe 'did-stop-loading' wiring =========================================
 // A named handler so removeListener(...) can reliably detach the same function.
 function onDidStopLoading() {
@@ -825,8 +1544,8 @@ function buildMaxLayoutCSS({ specificMessageId } = {}) {
       display: block !important;
     }
     ${TABLE_WRAPPERS} {
-      width: min(94vw, 1800px) !important;
-      max-width: min(94vw, 1800px) !important;
+      width: 100% !important;
+      max-width: min(min(var(--gemini-vw, ${VW_SIZE}vw), 92vw), ${MAX_CHARS}ch) !important;
       margin-left: 0 !important;
       margin-right: auto !important;
       padding-left: 0 !important;
@@ -837,7 +1556,7 @@ function buildMaxLayoutCSS({ specificMessageId } = {}) {
       table-layout: fixed !important;
       width: 100% !important;
       min-width: 100% !important;
-      max-width: 100% !important;
+      max-width: min(min(var(--gemini-vw, ${VW_SIZE}vw), 92vw), ${MAX_CHARS}ch) !important;
       border-collapse: collapse !important;
       display: table !important;
     }
@@ -1412,6 +2131,14 @@ async function selectChatPane(win) {
     (function () {
       const candidates = ${JSON.stringify(GEMINI_CHAT_ROOT_SELECTORS)};
       const transcriptSelectors = [
+        'message-content',
+        '.markdown.markdown-main-panel',
+        '[id^="model-response-message-content"]',
+        'structured-content-container',
+        '.model-response-text',
+        '.response-content',
+        '.response-container-content',
+        '.presented-response-container',
         '.conversation-container',
         '[class="response-container"]',
         '[role="article"]',
@@ -1430,6 +2157,43 @@ async function selectChatPane(win) {
       function count(el, sel) {
         try { return el?.querySelectorAll?.(sel)?.length || 0; } catch { return 0; }
       }
+      function semanticBonus(el) {
+       try {
+        let bonus = 0;
+        if (el.matches?.('message-content, .markdown.markdown-main-panel, [id^="model-response-message-content"]')) bonus += 1400;
+        if (el.matches?.('structured-content-container, .model-response-text')) bonus += 1000;
+        if (el.matches?.('.response-content, .response-container-content, .presented-response-container')) bonus += 700;
+        if (count(el, 'table, .horizontal-scroll-wrapper, .table-block-component, table-block') > 0) bonus += 180;
+        return bonus;
+       } catch {
+        return 0;
+       }
+      }
+      function chromePenalty(el) {
+       try {
+        let penalty = 0;
+        if (el.matches?.(
+         'user-query,' +
+         'user-query-content,' +
+         '.user-query-container,' +
+         '.query-content,' +
+         '.response-footer,' +
+         '.response-container-footer,' +
+         'message-actions,' +
+         'sources-list,' +
+         'tts-control,' +
+         'bard-avatar,' +
+         '.avatar-gutter'
+        )) penalty += 2200;
+        const cls = String(el.className || '');
+        if (/(user-query|prompt|action|button|toolbar|footer|sources-list|message-actions|thumb-|tts-|avatar-gutter)/i.test(cls)) {
+         penalty += 1200;
+        }
+        return penalty;
+       } catch {
+        return 0;
+       }
+      }
       function editablePenalty(el) {
         const selfEditable = !!el?.matches?.('textarea, input, [contenteditable="true"], div[role="textbox"]');
         if (selfEditable) return 2000;
@@ -1442,7 +2206,7 @@ async function selectChatPane(win) {
         const text = textOf(el).trim();
         const len = Math.min(text.length, 5000);
         const articleCount = count(el, '[role="article"], article');
-        const responseCount = count(el, '.conversation-container, [class="response-container"], [class*="response-content"], [class*="markdown"], [class="model-response-text"]');
+        const responseCount = count(el, 'message-content, .markdown, [id^="model-response-message-content"], structured-content-container, .model-response-text, .response-content, .response-container-content, .presented-response-container, .conversation-container, [class="response-container"]');
         const richCount = count(el, 'table, pre, code, ul, ol, blockquote');
         const scrollable = (() => {
           try {
@@ -1458,6 +2222,8 @@ async function selectChatPane(win) {
           + (responseCount * 60)
           + (richCount * 25)
           + (scrollable * 50)
+          + semanticBonus(el)
+          - chromePenalty(el)
           - editablePenalty(el);
       }
       const found = [];
@@ -1846,24 +2612,6 @@ function normalizeMarkdownTables(md) {
   return normalized.join('\n\n');
 }
 
-function preprocessHtmlForMarkdown(html) {
-  let out = String(html || '');
-  if (!out.trim()) return '';
-
-  out = stripExecutableBlocks(out)
-    .replace(/<!--([\s\S]*?)-->/g, '')
-    .replace(/\r\n?/g, '\n')
-    .replace(/\u00A0/g, ' ');
-
-  // Gemini often renders diff/code lines as adjacent block nodes with no text newlines.
-  // Inject line boundaries before Turndown sees the HTML.
-  out = out
-    .replace(/<\/(div|p|li|tr|h[1-6]|blockquote|pre|table|ul|ol)>\s*</gi, '</$1>\n<')
-    .replace(/<(br)\s*\/?\s*>/gi, '<$1 />\n');
-
-  return out.trim();
-}
-
 function postProcessMarkdown(md) {
   return normalizeMarkdownTables(
     String(md || '')
@@ -1876,7 +2624,7 @@ function postProcessMarkdown(md) {
   );
 }
 
-  const preparedHtml = preprocessHtmlForMarkdown(html);
+  const preparedHtml = normalizeHtmlForMarkdownShared(html);
   if (!preparedHtml) return '';
 
   try {
@@ -2152,187 +2900,68 @@ async function promptSaveChatPane(win) {
 async function saveChatPaneAsMarkdown(win, filePath) {
   if (!win) return;
   try {
-   const result = await win.webContents.executeJavaScript(`
-   (function() {
-    const info = (function() {
-  function safeText(el){ try { return String(el && (el.innerText || el.textContent) || ''); } catch { return ''; } }
-  function countOcc(text, needle){
-    if (!text) return 0;
-    let n=0, i=0;
-    while ((i = text.indexOf(needle, i)) !== -1) { n++; i += needle.length; }
-    return n;
-  }
-  function scoreEl(el){
-    if (!el) return -1;
-    let r; try { r = el.getBoundingClientRect(); } catch { r = {width:0,height:0}; }
-    if (!r || r.width < 200 || r.height < 150) return -1;
-    const t = safeText(el);
-    const len = t.trim().length;
-    const you = countOcc(t, 'You said');
-    const gem = countOcc(t, 'Gemini said');
-    const hasTable = (()=>{ try { return !!el.querySelector('table'); } catch { return false; } })();
-    const hasPre = (()=>{ try { return !!el.querySelector('pre, code'); } catch { return false; } })();
-    let scrollable = 0;
-    try {
-      const cs = getComputedStyle(el);
-      scrollable = (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) ? 1 : 0;
-    } catch {}
-    // Weight speaker labels heavily; they strongly indicate transcript.
-    return (len/50) + (you*40) + (gem*40) + (hasTable?10:0) + (hasPre?8:0) + (scrollable?6:0);
-  }
-
-  // Candidate roots: Gemini app shell + main role fallbacks.
-  const roots = [];
-  try { roots.push(document.querySelector('main.chat-app')); } catch {}
-  try { roots.push(document.querySelector('[data-test-id="chat-app"]')); } catch {}
-  try { roots.push(document.querySelector('[role="main"]')); } catch {}
-  try { roots.push(document.querySelector('main')); } catch {}
-  roots.push(document.body);
-
-  let best = null;
-  let bestScore = -1;
-
-  for (const root of roots) {
-    if (!root) continue;
-    // Evaluate root itself
-    const s0 = scoreEl(root);
-    if (s0 > bestScore) { bestScore = s0; best = root; }
-
-    // Evaluate descendants that could plausibly be the transcript container
-    let nodes = [];
-    try { nodes = Array.from(root.querySelectorAll('section, article, div')); } catch {}
-    for (const el of nodes) {
-      const s = scoreEl(el);
-      if (s > bestScore) { bestScore = s; best = el; }
-    }
-  }
-
-  if (!best || bestScore < 5) {
-    // Fallback: at least return shell if present
-    const shell = (function(){ try { return document.querySelector('main.chat-app') || document.querySelector('[data-test-id="chat-app"]') || document.querySelector('main') || document.body; } catch { return document.body; }})();
-    return { ok: !!shell, nodeFound: !!shell, score: bestScore, selectorHint: 'fallback', textLen: safeText(shell).trim().length };
-  }
-
-  // Try to scroll the chosen pane to the very top to force earlier messages to mount.
-  try {
-    if (best.scrollTo) best.scrollTo({ top: 0, behavior: 'auto' });
-  } catch {}
-
-  const t = safeText(best);
-  return {
-    ok: true,
-    score: bestScore,
-    textLen: t.trim().length,
-    youSaid: countOcc(t, 'You said'),
-    geminiSaid: countOcc(t, 'Gemini said'),
-    tag: (best.tagName || '').toLowerCase(),
-    id: best.id || '',
-    className: best.className || ''
-  };
-})();;
-    // Choose a root that matches what Select Chat Pane would pick.
-    const root = (function(){
-      // Re-run minimal heuristic selection: prefer elements with "You said"/"Gemini said" labels.
-      function safeText(el){ try { return String(el && (el.innerText || el.textContent) || ''); } catch { return ''; } }
-      function countOcc(text, needle){ if (!text) return 0; let n=0,i=0; while ((i=text.indexOf(needle,i))!==-1){ n++; i+=needle.length; } return n; }
-      function scoreEl(el){
-        if (!el) return -1;
-        let r; try { r = el.getBoundingClientRect(); } catch { r = {width:0,height:0}; }
-        if (!r || r.width < 200 || r.height < 150) return -1;
-        const t = safeText(el);
-        const len = t.trim().length;
-        const you = countOcc(t,'You said');
-        const gem = countOcc(t,'Gemini said');
-        return (len/50) + (you*40) + (gem*40);
-      }
-      const roots=[];
-      try { roots.push(document.querySelector('main.chat-app')); } catch {}
-      try { roots.push(document.querySelector('[data-test-id="chat-app"]')); } catch {}
-      try { roots.push(document.querySelector('[role="main"]')); } catch {}
-      try { roots.push(document.querySelector('main')); } catch {}
-      roots.push(document.body);
-      let best=null, bestScore=-1;
-      for (const r0 of roots){
-        if (!r0) continue;
-        const s0 = scoreEl(r0); if (s0 > bestScore){ bestScore=s0; best=r0; }
-        let nodes=[]; try { nodes = Array.from(r0.querySelectorAll('section, article, div')); } catch {}
-        for (const el of nodes){ const s = scoreEl(el); if (s > bestScore){ bestScore=s; best=el; } }
-      }
-      return best || document.querySelector('${CHAT_SELECTOR}') || document.body;
-    })();
-    if (!root) return { ok:false, html:'', title: document.title };
-
-    // Clone so we never mutate the live DOM
-    const clone = root.cloneNode(true);
-
-    // -------------------------------
-    // DOM CLEANUP (Gemini-specific)
-    // -------------------------------
-
-    // Known non-content UI affordances:
-    // copy buttons, feedback icons, toolbars, hover menus, references
-    const JUNK_SELECTORS = [
-   '[role="button"]',
-   '[class*="button" i]',
-   '[class*="logo" i]',
-   '[class*="label" i]',
-   '[class*="input" i]',
-   'label',
-   'input',
-   'textarea',
-   '[role="textbox"]'
-    ];
-
-    clone.querySelectorAll(JUNK_SELECTORS.join(',')).forEach(el => {
-     try { el.remove(); } catch {}
-    });
-
-    // Explicitly preserve semantic structures
-    clone.querySelectorAll('pre, code, table, ul, ol').forEach(el => {
-     try { el.setAttribute('data-preserve', 'true'); } catch {}
-    });
-
-    // Remove empty wrapper nodes that add no content,
-    // but do NOT touch semantic structures
-    clone.querySelectorAll('div, span').forEach(el => {
-     try {
-      if (
-       !el.textContent.trim() &&
-       !el.querySelector('[data-preserve]') &&
-       !el.querySelector('pre, code, table, ul, ol')
-      ) {
-       el.remove();
-      }
-     } catch {}
-    });
-
-    return {
-     ok: true,
-     html: clone.innerHTML,
-     title: document.title
-    };
-   })();
-   `);
-
-    if (!result?.ok) {
+    const snapshot = await buildChatPaneExportSnapshot(win);
+    if (!snapshot?.ok) {
       try { dialog.showErrorBox('Save Chat Pane as Markdown', 'Chat pane not found.'); } catch {}
       return;
     }
 
+    try {
+     console.log('saveChatPaneAsMarkdown snapshot diagnostics:', snapshot.diagnostics || null);
+    } catch {}
     // Convert cleaned semantic HTML → Markdown
     // (No entity decoding; structure already preserved)
-    const paneHtml = String(result.html || '');
+    const paneHtml = String(snapshot.html || '');
 
-  // IMPORTANT:
-  // Gemini renders diff lines as separate block elements (div/span)
-  // with NO newline text nodes. Inject newlines between blocks so
-  // diffs and code retain line structure.
-  const withLineBreaks = paneHtml.replace(/></g, '>\n<');
-  const safeHtml = stripExecutableBlocks(withLineBreaks);
+    // IMPORTANT:
+    // Gemini renders diff lines as separate block elements (div/span)
+    // with NO newline text nodes. Inject newlines between blocks so
+    // diffs and code retain line structure.
+    const withLineBreaks = paneHtml.replace(/></g, '>\n<');
+    const safeHtml = stripExecutableBlocks(withLineBreaks);
+    const normalizedHtml = normalizeHtmlForMarkdownShared(safeHtml);
+    try {
+     const preDumpPaths = await writeMarkdownDebugDump(filePath, {
+      rawHtml: paneHtml,
+      normalizedHtml,
+      outerContextHtml: String(snapshot.outerContextHtml || ''),
+      grandparentContextHtml: String(snapshot.grandparentContextHtml || ''),
+      diagnostics: snapshot.diagnostics || null,
+      markdown: ''
+     });
+     console.log('saveChatPaneAsMarkdown pre-conversion debug dump:', {
+      rawHtmlPath: preDumpPaths.rawHtmlPath,
+      normalizedHtmlPath: preDumpPaths.normalizedHtmlPath,
+      diagnosticsPath: preDumpPaths.diagnosticsPath,
+      outerContextHtmlPath: preDumpPaths.outerContextHtmlPath,
+      grandparentContextHtmlPath: preDumpPaths.grandparentContextHtmlPath
+     });
+    } catch (dumpErr) {
+     console.error('saveChatPaneAsMarkdown pre-conversion debug dump failed:', dumpErr);
+    }
     const md = htmlToMarkdown(safeHtml);
+    try {
+      const postDumpPaths = await writeMarkdownDebugDump(filePath, {
+      rawHtml: paneHtml,
+      normalizedHtml,
+      outerContextHtml: String(snapshot.outerContextHtml || ''),
+      grandparentContextHtml: String(snapshot.grandparentContextHtml || ''),
+      diagnostics: snapshot.diagnostics || null,
+      markdown: md
+     });
+     console.log('saveChatPaneAsMarkdown post-conversion debug dump:', {
+      rawHtmlPath: postDumpPaths.rawHtmlPath,
+      normalizedHtmlPath: postDumpPaths.normalizedHtmlPath,
+      diagnosticsPath: postDumpPaths.diagnosticsPath,
+      outerContextHtmlPath: postDumpPaths.outerContextHtmlPath,
+      grandparentContextHtmlPath: postDumpPaths.grandparentContextHtmlPath
+     });
+    } catch (dumpErr) {
+   console.error('saveChatPaneAsMarkdown post-conversion debug dump failed:', dumpErr);
+    }
     await fs.promises.writeFile(filePath, md, 'utf8');
-  } catch (err) {
-    console.error('Save Chat Pane as Markdown failed:', err);
+    } catch (err) {
+      console.error('Save Chat Pane as Markdown failed:', err);
     try { dialog.showErrorBox('Save failed', String(err?.message || err)); } catch {}
   }
 }
