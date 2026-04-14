@@ -3479,7 +3479,7 @@ function createTray() {
   // Fall back to app icon if tray image is missing
   tray = new Tray(smallImage || appIconImage || nativeImage.createFromPath(path.join(__dirname, 'assets', 'gemini-for-linux.png')));
 
-  tray.setToolTip('Microsoft Gemini');
+  tray.setToolTip('Gemini for Linux');
 
   const contextMenu = Menu.buildFromTemplate([
     {
