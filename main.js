@@ -58,8 +58,8 @@ function quoteify(text) {
 
 function setRoleTitle(win, role, id) {
   try {
-    if (role === 'main') win.setTitle('Gemini — Main Chat');
-    else win.setTitle(`Gemini — Quick Chat ${id}`);
+    if (role === 'main') win.setTitle('Gemini Main Chat');
+    else win.setTitle(`Gemini Quick Chat ${id}`);
   } catch {}
 }
 
@@ -71,6 +71,17 @@ function setRoleTitle(win, role, id) {
     win.focus();
     try { win.moveTop(); } catch {}
   }
+
+function safeShowError(title, message) {
+  try {
+    dialog.showErrorBox(
+      String(title ?? 'Error'),
+      String(message ?? 'An error occurred')
+    );
+  } catch (err) {
+    console.error('Could not show error dialog:', err);
+  }
+}
 
 // ============================================================================
 // Multi-Quick Chat window management + send-to-specific-#N helpers
@@ -230,7 +241,7 @@ async function scheduleQuickPaste(wc, { autoSubmit = false } = {}) {
 async function chooseQuickChatTargetDialog(parentWin) {
   const ids = listQuickIds();
   const buttons = ids.map(id => `Quick Chat ${id}`);
-  buttons.push('New Quick Chat…');
+  buttons.push('New Quick Chat');
   buttons.push('Cancel');
 
   const res = await dialog.showMessageBox(parentWin || mainWindow, {
@@ -262,7 +273,7 @@ function createQuickChatWindow() {
     x: typeof initialBounds.x === 'number' ? initialBounds.x : undefined,
     y: typeof initialBounds.y === 'number' ? initialBounds.y : undefined,
     show: false,
-    title: `Gemini — Quick Chat ${id}`,
+    title: `Gemini Quick Chat ${id}`,
     icon: appIconImage,
     webPreferences: {
       nodeIntegration: false,
@@ -338,144 +349,18 @@ function createQuickChatWindow() {
 
   // --- Right-click native context menu (same as Main Chat) ---
   win.webContents.on('context-menu', (_event, params) => {
-    // params: { isEditable, selectionText, selectionTextIsEditable, mediaType, linkURL, inputFieldType, x, y, ... }
-    const isEditable = !!params.isEditable;
-    const hasSelection = !!params.selectionText && params.selectionText.length > 0;
-
-    // Always offer at least a minimal fallback menu so users are not left without options
-    const minimalTemplate = [
-      { role: 'selectAll', accelerator: 'Ctrl+A', enabled: true },
-      { type: 'separator' },
-      {
-        label: 'Inspect Element',
-        accelerator: 'Ctrl+Shift+C',
-        click: () => {
-          try {
-            win.webContents.inspectElement(params.x, params.y);
-            if (!win.webContents.isDevToolsOpened()) {
-              win.webContents.openDevTools({ mode: 'right' });
-            }
-          } catch (err) {
-            console.error('Inspect failed:', err);
-          }
-        }
-      }
-    ];
-
-    const template = [
-      { role: 'cut', accelerator: 'Ctrl+X', enabled: isEditable },
-      { role: 'copy', accelerator: 'Ctrl+C', enabled: (hasSelection || isEditable) },
-      { role: 'paste', accelerator: 'Ctrl+V', enabled: isEditable },
-      { type: 'separator' },
-      { role: 'selectAll', accelerator: 'Ctrl+A', enabled: true },
-      { type: 'separator' },
-      {
-        label: 'Send to Quick Chat',
-        submenu: buildSendToQuickSubmenu(win, { mode: SEND_MODE.PLAIN, autoSubmit: false })
-      },
-      {
-        label: 'Send as Quote to Quick Chat',
-        submenu: buildSendToQuickSubmenu(win, { mode: SEND_MODE.QUOTE, autoSubmit: false })
-      },
-      {
-        label: 'Send & Auto-Submit to Quick Chat',
-        submenu: buildSendToQuickSubmenu(win, { mode: SEND_MODE.PLAIN, autoSubmit: true })
-      },
-      { type: 'separator' },
-      {
-        label: 'Select Chat Pane',
-        accelerator: 'Ctrl+Shift+A',
-        enabled: true,
-        click: async () => {
-          try {
-            const res = await selectChatPane(win);
-            if (!res?.ok) {
-              try { dialog.showErrorBox('Select Chat Pane', 'Could not select the chat pane.'); } catch {}
-            }
-          } catch (err) {
-            console.error('Select Chat Pane failed:', err);
-            try { dialog.showErrorBox('Select Chat Pane failed', String(err?.message ?? err)); } catch {}
-          }
-        }
-      },
-      {
-        label: 'Save Chat Pane…',
-        click: async () => {
-          await promptSaveChatPane(win);
-        }
-      },
-      { type: 'separator' },
-      {
-        label: 'Copy Selection as Markdown',
-        accelerator: 'Ctrl+Shift+M',
-        enabled: hasSelection,
-        click: async () => {
-          try {
-            const result = await buildSelectionMarkdownForExport(win);
-            if (!result?.ok) return;
-            clipboard.writeText(String(result.markdown ?? ''));
-          } catch (err) {
-            console.error('Copy Selection as Markdown failed:', err);
-          }
-        }
-      },
-      {
-        label: 'Save Selection as Markdown…',
-        enabled: hasSelection,
-        click: async () => {
-          await saveSelectionAsMarkdown(win);
-        }
-      },
-      {
-        label: 'Save Selection as Plain Text…',
-        enabled: hasSelection,
-        click: async () => {
-          try {
-            const { hasSelection: ok, html, text } = await getSelectionFragment(win);
-            if (!ok) {
-              try { dialog.showErrorBox('Save Selection as Text', 'No selection found.'); } catch {}
-              return;
-            }
-            const safeHtml = stripExecutableBlocks(decodeEntities(html || text));
-            let plain = stripTags(safeHtml)
-              .replace(/[ 	]+\n/g, '\n')
-              .replace(/\n{3,}/g, '\n\n')
-              .trim();
-            const { filePath, canceled } = await dialog.showSaveDialog(win, {
-              title: 'Save Selection as Plain Text',
-              defaultPath: 'selection.txt',
-              filters: [{ name: 'Plain Text', extensions: ['txt'] }]
-            });
-            if (canceled || !filePath) return;
-            await fs.promises.writeFile(filePath, plain, 'utf8');
-          } catch (err) {
-            console.error('Save Selection as Plain Text failed:', err);
-            try { dialog.showErrorBox('Save failed', String(err?.message ?? err)); } catch {}
-          }
-        }
-      },
-      { type: 'separator' },
-      {
-        label: 'Inspect Element',
-        accelerator: 'Ctrl+Shift+C',
-        click: () => {
-          try {
-            win.webContents.inspectElement(params.x, params.y);
-            if (!win.webContents.isDevToolsOpened()) {
-              win.webContents.openDevTools({ mode: 'right' });
-            }
-          } catch (err) {
-            console.error('Inspect failed:', err);
-          }
-        }
-      }
-    ];
-
     let menu;
     try {
-      menu = Menu.buildFromTemplate(template);
+      menu = Menu.buildFromTemplate(
+        buildContextMenuTemplate(win, params, {
+          includeQuickChatFeatures: true,
+          includeChatPaneFeatures: true,
+          includeMarkdownExport: true
+        })
+      );
     } catch (err) {
       console.error('Context menu template error:', err);
+      const hasSelection = !!params?.selectionText && params.selectionText.length > 0;
       menu = Menu.buildFromTemplate([{ role: 'copy', enabled: hasSelection }, { role: 'selectAll' }]);
     }
 
@@ -1959,7 +1844,7 @@ function appendEditItems(editSubmenu) {
 //    { role: 'cut' }, { role: 'copy' }, { role: 'paste' },
 //    { role: 'selectAll' }, { type: 'separator' },
     {
-      label: 'Find…',
+      label: 'Find',
       accelerator: 'Ctrl+F',
       click: () => {
         const w = BrowserWindow.getFocusedWindow() || mainWindow;
@@ -2017,7 +1902,7 @@ function appendEditItems(editSubmenu) {
   click: async () => { const src = BrowserWindow.getFocusedWindow() || mainWindow; await sendSelectionToQuick(src, { mode: SEND_MODE.PLAIN, autoSubmit: true, targetQuickId: null }); }
  },
  {
-  label: 'Send Selection to Specific Quick Chat…',
+  label: 'Send Selection to Specific Quick Chat',
   accelerator: 'Ctrl+Alt+W',
   click: async () => { const src = BrowserWindow.getFocusedWindow() || mainWindow; await sendSelectionToSpecificQuickViaDialog(src, { mode: SEND_MODE.PLAIN, autoSubmit: false }); }
  },
@@ -2044,11 +1929,11 @@ function appendEditItems(editSubmenu) {
   Menu.buildFromTemplate(template).items.forEach(i => editSubmenu.append(i));
 }
 
-// --- Help menu: add About… screen (under the menu bar) ----------------------
+// --- Help menu: add About screen (under the menu bar) ----------------------
 function appendHelpItems(helpSubmenu) {
   const template = [
     new MenuItem({
-      label: 'About…',
+      label: 'About',
       // Optional: make F1 open About; change/remove if you already use F1 elsewhere
       accelerator: 'F1',
       click: async () => {
@@ -2076,7 +1961,7 @@ function appendHelpItems(helpSubmenu) {
     //   click: () => shell.openExternal('https://your.docs.url/')
     // }),
     // new MenuItem({
-    //   label: 'Report Issue…',
+    //   label: 'Report Issue',
     //   click: () => shell.openExternal('https://your.issues.url/')
     // }),
   ];
@@ -2121,6 +2006,123 @@ function augmentApplicationMenu(win) {
 
 function ensureSaveState(win) {
   if (win && typeof win.__lastSavePath === 'undefined') win.__lastSavePath = null;
+}
+
+function buildContextMenuTemplate(win, params, options = {}) {
+  const {
+    includeQuickChatFeatures = true,
+    includeChatPaneFeatures = true,
+    includeMarkdownExport = true
+  } = options;
+
+  const isEditable = !!params?.isEditable;
+  const hasSelection = !!params?.selectionText && params.selectionText.length > 0;
+
+  const inspectItem = {
+    label: 'Inspect Element',
+    accelerator: 'Ctrl+Shift+C',
+    click: () => {
+      try {
+        win.webContents.inspectElement(params.x, params.y);
+        if (!win.webContents.isDevToolsOpened()) {
+          win.webContents.openDevTools({ mode: 'right' });
+        }
+      } catch (err) {
+        console.error('Inspect failed:', err);
+      }
+    }
+  };
+
+  const template = [
+    { role: 'cut', accelerator: 'Ctrl+X', enabled: isEditable },
+    { role: 'copy', accelerator: 'Ctrl+C', enabled: (hasSelection || isEditable) },
+    { role: 'paste', accelerator: 'Ctrl+V', enabled: isEditable },
+    { type: 'separator' },
+    { role: 'selectAll', accelerator: 'Ctrl+A', enabled: true }
+  ];
+
+  if (includeQuickChatFeatures) {
+    template.push(
+      { type: 'separator' },
+      {
+        label: 'Send to Quick Chat',
+        submenu: buildSendToQuickSubmenu(win, { mode: SEND_MODE.PLAIN, autoSubmit: false })
+      },
+      {
+        label: 'Send as Quote to Quick Chat',
+        submenu: buildSendToQuickSubmenu(win, { mode: SEND_MODE.QUOTE, autoSubmit: false })
+      },
+      {
+        label: 'Send & Auto-Submit to Quick Chat',
+        submenu: buildSendToQuickSubmenu(win, { mode: SEND_MODE.PLAIN, autoSubmit: true })
+      }
+    );
+  }
+
+  if (includeChatPaneFeatures) {
+    template.push(
+      { type: 'separator' },
+      {
+        label: 'Select Chat Pane',
+        accelerator: 'Ctrl+Shift+A',
+        enabled: true,
+        click: async () => {
+          try {
+            const res = await selectChatPane(win);
+            if (!res?.ok) {
+              safeShowError('Select Chat Pane', 'Could not select the chat pane.');
+            }
+          } catch (err) {
+            console.error('Select Chat Pane failed:', err);
+            safeShowError('Select Chat Pane failed', String(err?.message ?? err));
+          }
+        }
+      },
+      {
+        label: 'Save Chat Pane',
+        click: async () => {
+          await promptSaveChatPane(win);
+        }
+      }
+    );
+  }
+
+  if (includeMarkdownExport) {
+    template.push(
+      { type: 'separator' },
+      {
+        label: 'Copy Selection as Markdown',
+        accelerator: 'Ctrl+Shift+M',
+        enabled: hasSelection,
+        click: async () => {
+          try {
+            const result = await buildSelectionMarkdownForExport(win);
+            if (!result?.ok) return;
+            clipboard.writeText(String(result.markdown ?? ''));
+          } catch (err) {
+            console.error('Copy Selection as Markdown failed:', err);
+          }
+        }
+      },
+      {
+        label: 'Save Selection as Markdown',
+        enabled: hasSelection,
+        click: async () => {
+          await saveSelectionAsMarkdown(win);
+        }
+      },
+      {
+        label: 'Save Selection as Plain Text',
+        enabled: hasSelection,
+        click: async () => {
+          await saveSelectionAsPlainText(win);
+        }
+      }
+    );
+  }
+
+  template.push({ type: 'separator' }, inspectItem);
+  return template;
 }
 
 // ---------- Chat pane selection helper ----------
@@ -2434,7 +2436,7 @@ function buildSendToQuickSubmenu(sourceWin, optsBase) {
   }
 
   items.push({ type: 'separator' });
-  items.push({ label: 'Choose…', click: async () => sendSelectionToSpecificQuickViaDialog(sourceWin, optsBase) });
+  items.push({ label: 'Choose', click: async () => sendSelectionToSpecificQuickViaDialog(sourceWin, optsBase) });
   items.push({
     label: 'New Quick Chat Window',
     click: async () => {
@@ -2710,6 +2712,34 @@ async function buildSelectionMarkdownForExport(win) {
   return { ok: false, markdown: '', reason: String(err?.message ?? err) };
  }
 }
+
+// --- Save selection as Plain Text helper ---
+async function saveSelectionAsPlainText(win) {
+  try {
+    if (!win) return;
+    const { hasSelection: ok, html, text } = await getSelectionFragment(win);
+    if (!ok) {
+      safeShowError('Save Selection as Text', 'No selection found.');
+      return;
+    }
+    const safeHtml = stripExecutableBlocks(decodeEntities(html || text));
+    let plain = stripTags(safeHtml)
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    const { filePath, canceled } = await dialog.showSaveDialog(win, {
+      title: 'Save Selection as Plain Text',
+      defaultPath: 'selection.txt',
+      filters: [{ name: 'Plain Text', extensions: ['txt'] }]
+    });
+    if (canceled || !filePath) return;
+    await fs.promises.writeFile(filePath, plain, 'utf8');
+  } catch (err) {
+    console.error('Save Selection as Plain Text failed:', err);
+    safeShowError('Save failed', String(err?.message ?? err));
+  }
+}
+
 // --- Save selection as Markdown helper ---
 async function saveSelectionAsMarkdown(win) {
   try {
@@ -2910,7 +2940,7 @@ async function promptSaveChatPane(win) {
   if (!win) return;
   try {
     const { filePath, canceled } = await dialog.showSaveDialog(win, {
-      title: 'Save Chat Pane As…',
+      title: 'Save Chat Pane As',
       defaultPath: 'gemini-chat.md',  // Default to Markdown file name
       // Put Markdown first so it's the preselected filter
       filters: [
@@ -2994,13 +3024,13 @@ async function saveChatAsPDF(win, filePath) {
   await fs.promises.writeFile(filePath, pdf);
 }
 
-// ---------- File menu (Save / Save As…) ----------
+// ---------- File menu (Save / Save As) ----------
 function appendFileItems(fileSubmenu, win) {
   ensureSaveState(win);
   const items = [
     new MenuItem({ type: 'separator' }),
     new MenuItem({
-      label: 'Save Chat Pane…',
+      label: 'Save Chat Pane',
       accelerator: 'Ctrl+S',
       click: async () => {
         try { await promptSaveChatPane(win); }
@@ -3011,7 +3041,7 @@ function appendFileItems(fileSubmenu, win) {
       }
     }),
     new MenuItem({
-      label: 'Save Selection as Markdown…',
+      label: 'Save Selection as Markdown',
       accelerator: 'Ctrl+Shift+M',
       click: async () => {
         try { await saveSelectionAsMarkdown(win); }
@@ -3038,7 +3068,7 @@ function appendFileItems(fileSubmenu, win) {
 
 async function saveAsDialog(win) {
   const { filePath, canceled } = await dialog.showSaveDialog(win, {
-    title: 'Save Page As…',
+    title: 'Save Page As',
     defaultPath: 'gemini.html',
     filters: [
       { name: 'Web Page, HTML only', extensions: ['html'] },
@@ -3063,7 +3093,7 @@ function createWindow() {
  const taIcon = nativeImage.createFromPath(getIconPath('gemini-for-linux.png'));
  /*     console.log('Native path resolved:', taIcon); // Echo to terminal
  if (taIcon.isEmpty()) {
-  console.error('ICON FAILED TO LOAD — path is wrong or file corrupted');
+  console.error('ICON FAILED TO LOAD path is wrong or file corrupted');
  } else {
   console.log('ICON LOADED SUCCESSFULLY');
   console.log('Size:', taIcon.getSize());           // → { width: 512, height: 512 }
@@ -3085,7 +3115,7 @@ function createWindow() {
   // Assign to the outer-scoped variable (do NOT redeclare with const here)
   mainWindow = new BrowserWindow({
   skipTaskbar: false,
-  title: 'Gemini — Main Chat',
+  title: 'Gemini Main Chat',
     width: initialBounds.width,
     height: initialBounds.height,
     x: typeof initialBounds.x === 'number' ? initialBounds.x : undefined,
@@ -3109,7 +3139,7 @@ function createWindow() {
 
   });
 
-  // Ensure menu bar is visible so users can access Edit → Find…
+  // Ensure menu bar is visible so users can access Edit → Find
   mainWindow.setMenuBarVisibility(true);
 
   // --- Right-click native context menu with Cut/Copy/Paste/SelectAll ---
@@ -3122,13 +3152,20 @@ function createWindow() {
   ]);
 
   function popupContext(win, params) {
-    const menu = Menu.buildFromTemplate([
-      { role: 'cut',        accelerator: 'Ctrl+X', enabled: !!params?.isEditable },
-      { role: 'copy',       accelerator: 'Ctrl+C', enabled: !!(params?.hasSelection || params?.isEditable) },
-      { role: 'paste',      accelerator: 'Ctrl+V', enabled: !!params?.isEditable },
-      { type: 'separator' },
-      { role: 'selectAll',  accelerator: 'Ctrl+A', enabled: true  },
-    ]);
+    const menu = Menu.buildFromTemplate(
+      buildContextMenuTemplate(
+        win,
+        {
+          ...params,
+          selectionText: params?.selectionText ?? (params?.hasSelection ? 'x' : '')
+        },
+        {
+          includeQuickChatFeatures: false,
+          includeChatPaneFeatures: false,
+          includeMarkdownExport: false
+        }
+      )
+    );
     menu.popup({ window: win });
   }
 
@@ -3199,149 +3236,19 @@ function createWindow() {
   });
 
   mainWindow.webContents.on('context-menu', (_event, params) => {
-    // params: { isEditable, selectionText, selectionTextIsEditable, mediaType, linkURL, inputFieldType, x, y, ... }
-    const isEditable = !!params.isEditable;
-    const hasSelection = !!params.selectionText && params.selectionText.length > 0;
-
-    // Always offer at least a minimal fallback menu so users are not left without options
-    const minimalTemplate = [
-      { role: 'selectAll', accelerator: 'Ctrl+A', enabled: true },
-      { type: 'separator' },
-      {
-        label: 'Inspect Element',
-        accelerator: 'Ctrl+Shift+C',
-        click: () => {
-          try {
-            mainWindow.webContents.inspectElement(params.x, params.y);
-            if (!mainWindow.webContents.isDevToolsOpened()) {
-              mainWindow.webContents.openDevTools({ mode: 'right' });
-            }
-          } catch (err) {
-            console.error('Inspect failed:', err);
-          }
-        }
-      }
-    ];
-
-    const template = [
-      { role: 'cut',   accelerator: 'Ctrl+X', enabled: isEditable },
-      { role: 'copy',  accelerator: 'Ctrl+C', enabled: (hasSelection || isEditable) },
-      { role: 'paste', accelerator: 'Ctrl+V', enabled: isEditable },
-      { type: 'separator' },
-      { role: 'selectAll', accelerator: 'Ctrl+A', enabled: true },
- { type: 'separator' },
- {
-  label: 'Send to Quick Chat',
-  submenu: buildSendToQuickSubmenu(mainWindow, { mode: SEND_MODE.PLAIN, autoSubmit: false })
- },
- {
-  label: 'Send as Quote to Quick Chat',
-  submenu: buildSendToQuickSubmenu(mainWindow, { mode: SEND_MODE.QUOTE, autoSubmit: false })
- },
- {
-  label: 'Send & Auto‑Submit to Quick Chat',
-  submenu: buildSendToQuickSubmenu(mainWindow, { mode: SEND_MODE.PLAIN, autoSubmit: true })
- },
- { type: 'separator' },
- {
-  label: 'Select Chat Pane',
-        accelerator: 'Ctrl+Shift+A',
-        enabled: true, // ✅ Always enabled regardless of selection
-        click: async () => {
-          try {
-            const res = await selectChatPane(mainWindow);
-            if (!res?.ok) {
-              try { dialog.showErrorBox('Select Chat Pane', 'Could not select the chat pane.'); } catch {}
-            }
-          } catch (err) {
-            console.error('Select Chat Pane failed:', err);
-            try { dialog.showErrorBox('Select Chat Pane failed', String(err?.message || err)); } catch {}
-          }
-        }
-      },
-
-      // ---- NEW: Save Chat Pane… (right-click) ----
-      {
-        label: 'Save Chat Pane…',
-        click: async () => {
-          await promptSaveChatPane(mainWindow);
-        }
-      },
-      { type: 'separator' },
-      {
-        label: 'Copy Selection as Markdown',
-        accelerator: 'Ctrl+Shift+M',
-        enabled: hasSelection,
-        click: async () => {
-          try {
-            const result = await buildSelectionMarkdownForExport(mainWindow);
-            if (!result?.ok) return;
-            clipboard.writeText(String(result.markdown ?? ''));
-          } catch (err) {
-            console.error('Copy Selection as Markdown failed:', err);
-          }
-        }
-      },
-      {
-        label: 'Save Selection as Markdown…',
-        enabled: hasSelection,
-        click: async () => {
-          await saveSelectionAsMarkdown(mainWindow);
-        }
-      },
-      {
-        label: 'Save Selection as Plain Text…',
-        enabled: hasSelection,
-        click: async () => {
-          try {
-            const { hasSelection: ok, html, text } = await getSelectionFragment(mainWindow);
-            if (!ok) {
-              try { dialog.showErrorBox('Save Selection as Text', 'No selection found.'); } catch {}
-              return;
-            }
-            const safeHtml = stripExecutableBlocks(decodeEntities(html || text));
-            let plain = stripTags(safeHtml)
-              .replace(/[ \t]+\n/g, '\n')
-              .replace(/\n{3,}/g, '\n\n')
-              .trim();
-            const { filePath, canceled } = await dialog.showSaveDialog(mainWindow, {
-              title: 'Save Selection as Plain Text',
-              defaultPath: 'selection.txt',
-              filters: [{ name: 'Plain Text', extensions: ['txt'] }]
-            });
-            if (canceled || !filePath) return;
-            await fs.promises.writeFile(filePath, plain, 'utf8');
-          } catch (err) {
-            console.error('Save Selection as Plain Text failed:', err);
-            try { dialog.showErrorBox('Save failed', String(err?.message || err)); } catch {}
-          }
-        }
-      },
-      { type: 'separator' },
-      {
-        label: 'Inspect Element',
-        accelerator: 'Ctrl+Shift+C',
-        click: () => {
-          try {
-            // Focus the element under the right-click position
-            mainWindow.webContents.inspectElement(params.x, params.y);
-            // Ensure DevTools is open so the Elements panel is visible
-            if (!mainWindow.webContents.isDevToolsOpened()) {
-              // Dock to the right; you can use 'bottom' or omit the mode
-              mainWindow.webContents.openDevTools({ mode: 'right' });
-            }
-          } catch (err) {
-            console.error('Inspect failed:', err);
-          }
-        }
-      }
-    ];
+    let menu;
     try { 
-      menu = Menu.buildFromTemplate(template);
+      menu = Menu.buildFromTemplate(
+        buildContextMenuTemplate(mainWindow, params, {
+          includeQuickChatFeatures: true,
+          includeChatPaneFeatures: true,
+          includeMarkdownExport: true
+        })
+      );
     }
     catch (err) {
       console.error('Context menu template error:', err);
-      // Fallback: minimal safe menu
+      const hasSelection = !!params?.selectionText && params.selectionText.length > 0;
       menu = Menu.buildFromTemplate([{ role: 'copy', enabled: hasSelection }, { role: 'selectAll' }]);
     }
     try { menu.popup({ window: mainWindow }); }
@@ -3492,9 +3399,9 @@ function createTray() {
     },
     { type: 'separator' },
 
-    // ---- NEW: About… item ----
+    // ---- NEW: About item ----
     {
-      label: 'About…',
+      label: 'About',
       click: async () => {
         const info = getRuntimeInfo();
         try {
