@@ -1,0 +1,394 @@
+diff --git a/main.js b/main.js
+index 7c855cd..9c6c90c 100644
+--- a/main.js
++++ b/main.js
+@@ -33,6 +33,8 @@ const GEMINI_URL = 'https://gemini.google.com';
+ const IPC = Object.freeze({
+   SEND_SELECTION: 'gemini:send-selection',
+   QUICK_NEW: 'gemini:quick-new',
++  DIRECT_OPEN_LINK: 'gemini:direct-open-link',
++  PRELOAD_PING: 'gemini:preload-ping',
+ });
+ 
+ const SEND_MODE = Object.freeze({
+@@ -40,6 +42,216 @@ const SEND_MODE = Object.freeze({
+   QUOTE: 'quote',
+ });
+ 
++// ============================================================================
++// Shift+click direct-open download support
++// ============================================================================
++const DIRECT_OPEN_REQUEST_TTL_MS = 15000;
++const directOpenRequests = new Map(); // senderWC.id -> { url, expiresAt }
++const tempOpenedFiles = new Set();    // best-effort cleanup on quit
++
++function safeShowError(title, message) {
++  try {
++    dialog.showErrorBox(
++      String(title ?? 'Error'),
++      String(message ?? 'An error occurred')
++    );
++  } catch (err) {
++    console.error('Could not show error dialog:', err);
++  }
++}
++
++function debugDirectOpen(...args) {
++  try {
++    console.log('[direct-open]', ...args);
++  } catch {}
++}
++
++function normalizeComparableUrl(input) {
++  try {
++    const u = new URL(String(input || '').trim());
++    u.hash = '';
++    return u.toString();
++  } catch {
++    return String(input || '').trim();
++  }
++}
++
++function sanitizeDownloadFilename(name) {
++  const raw = String(name || '').trim() || 'download';
++  const cleaned = raw
++    .replace(/[\\/:*?"<>|]/g, '_')
++    .replace(/\s+/g, ' ')
++    .trim();
++  return cleaned || 'download';
++}
++
++function buildDirectOpenTempPath(filename) {
++  const safeName = sanitizeDownloadFilename(filename);
++  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
++  return path.join(app.getPath('temp'), `gemini-open-${stamp}-${safeName}`);
++}
++
++function pruneExpiredDirectOpenRequests() {
++  const now = Date.now();
++  for (const [key, value] of directOpenRequests.entries()) {
++    if (!value || value.expiresAt <= now) {
++      directOpenRequests.delete(key);
++    }
++  }
++}
++
++function itemUrlMatchesDirectOpenRequest(item, request) {
++  if (!request?.url) return false;
++
++  const requested = normalizeComparableUrl(request.url);
++  const candidates = new Set();
++
++  try {
++    const current = item?.getURL?.();
++    if (current) candidates.add(normalizeComparableUrl(current));
++  } catch {}
++
++  try {
++    const chain = item?.getURLChain?.();
++    if (Array.isArray(chain)) {
++      for (const u of chain) {
++        if (u) candidates.add(normalizeComparableUrl(u));
++      }
++    }
++  } catch {}
++
++  if (candidates.has(requested)) return true;
++
++  // Redirects sometimes preserve the requested URL as a prefix/query ancestor.
++  for (const u of candidates) {
++    if (u === requested) return true;
++    if (u.startsWith(requested) || requested.startsWith(u)) return true;
++  }
++
++  return false;
++}
++
++function registerDirectOpenDownloadHandler() {
++  const ses = session.fromPartition(GEMINI_PARTITION);
++  if (!ses || ses.__geminiDirectOpenDownloadHandlerAttached) return;
++  ses.__geminiDirectOpenDownloadHandlerAttached = true;
++
++  // Prevent Chromium from prompting with the normal save dialog for a tagged
++  // Shift+click download. We decide the path in will-download.
++  ses.on('download-created', (_event, item, webContents) => {
++    try {
++      pruneExpiredDirectOpenRequests();
++      const senderId = webContents?.id;
++      if (!senderId) return;
++      const request = directOpenRequests.get(senderId);
++      if (!request) return;
++      debugDirectOpen('download-created', {
++        senderId,
++        requestUrl: request.url,
++        itemUrl: item?.getURL?.(),
++        itemUrlChain: (typeof item?.getURLChain === 'function') ? item.getURLChain() : [],
++        itemFilename: (typeof item?.getFilename === 'function') ? item.getFilename() : null,
++      });
++      if (request.expiresAt <= Date.now()) {
++        directOpenRequests.delete(senderId);
++        return;
++      }
++      if (itemUrlMatchesDirectOpenRequest(item, request) && typeof item.setSaveDialogOptions === 'function') {
++        item.setSaveDialogOptions({ defaultPath: '' });
++      }
++    } catch {}
++  });
++
++  ses.on('will-download', (event, item, webContents) => {
++    try {
++      pruneExpiredDirectOpenRequests();
++      const senderId = webContents?.id;
++      if (!senderId) return;
++      const request = directOpenRequests.get(senderId);
++      if (!request) return;
++
++      const matches = itemUrlMatchesDirectOpenRequest(item, request);
++      debugDirectOpen('will-download', {
++        senderId,
++        requestUrl: request.url,
++        itemUrl: item?.getURL?.(),
++        itemUrlChain: (typeof item?.getURLChain === 'function') ? item.getURLChain() : [],
++        itemFilename: (typeof item?.getFilename === 'function') ? item.getFilename() : null,
++        matches,
++      });
++
++      if (request.expiresAt <= Date.now()) {
++        directOpenRequests.delete(senderId);
++        return;
++      }
++
++      directOpenRequests.delete(senderId);
++
++      const filename =
++        sanitizeDownloadFilename(
++          item?.getFilename?.() ||
++          (() => {
++            try {
++              const u = new URL(String(request.url || ''));
++              return path.basename(u.pathname || '') || 'download';
++            } catch {
++              return 'download';
++            }
++          })()
++        );
++
++      const tempPath = buildDirectOpenTempPath(filename);
++      tempOpenedFiles.add(tempPath);
++
++      debugDirectOpen('about to setSavePath', {
++        tempPath,
++        itemUrl: item?.getURL?.(),
++        itemFilename: (typeof item?.getFilename === 'function') ? item.getFilename() : null,
++        totalBytes: (typeof item?.getTotalBytes === 'function') ? item.getTotalBytes() : null,
++      });
++
++      item.on('updated', (_evt, state) => {
++        debugDirectOpen('download updated', {
++          state,
++          receivedBytes: (typeof item?.getReceivedBytes === 'function') ? item.getReceivedBytes() : null,
++          totalBytes: (typeof item?.getTotalBytes === 'function') ? item.getTotalBytes() : null,
++          isPaused: (typeof item?.isPaused === 'function') ? item.isPaused() : null,
++        });
++      });
++
++      debugDirectOpen('setSavePath', tempPath);
++      try {
++        item.setSavePath(tempPath);
++      } catch (err) {
++        console.error('Direct-open setSavePath failed:', err);
++        tempOpenedFiles.delete(tempPath);
++        return;
++      }
++
++      item.once('done', async (_evt, state) => {
++        debugDirectOpen('download done', { state, tempPath });
++        if (state !== 'completed') {
++          try { await fs.promises.unlink(tempPath); } catch {}
++          tempOpenedFiles.delete(tempPath);
++          return;
++        }
++        try {
++          const openError = await shell.openPath(tempPath);
++          if (openError) {
++            safeShowError('Open downloaded file failed', String(openError));
++          }
++        } catch (err) {
++          console.error('Direct-open shell.openPath failed:', err);
++          safeShowError('Open downloaded file failed', String(err?.message ?? err));
++        }
++      });
++    } catch (err) {
++      directOpenRequests.delete(webContents?.id);
++      console.error('Direct-open will-download handler failed:', err);
++    }
++  });
++}
++
+ function normalizeSendOptions(opts) {
+   const o = (opts && typeof opts === 'object') ? opts : {};
+   return {
+@@ -2456,6 +2668,31 @@ ipcMain.on(IPC.SEND_SELECTION, async (event, opts) => {
+   catch (e) { console.error('IPC send selection failed:', e); }
+ });
+ 
++ipcMain.on(IPC.DIRECT_OPEN_LINK, (event, payload) => {
++  try {
++    pruneExpiredDirectOpenRequests();
++    const href = String(payload?.href || '').trim();
++    if (!href) return;
++    directOpenRequests.set(event.sender.id, {
++      url: href,
++      expiresAt: Date.now() + DIRECT_OPEN_REQUEST_TTL_MS,
++    });
++    debugDirectOpen('ipc request queued', {
++      senderId: event.sender.id,
++      href,
++    });
++  } catch (err) {
++    console.error('IPC direct-open-link failed:', err);
++  }
++});
++ipcMain.on(IPC.PRELOAD_PING, (event, payload) => {
++  debugDirectOpen('preload ping', {
++    senderId: event.sender.id,
++    href: payload?.href,
++    ts: payload?.ts,
++  });
++});
++
+ ipcMain.on(IPC.QUICK_NEW, () => {
+   try { reveal(createQuickChatWindow()); }
+   catch (e) { console.error('IPC quick new failed:', e); }
+@@ -3445,6 +3682,7 @@ function createTray() {
+ }
+ 
+ app.whenReady().then(() => {
++  registerDirectOpenDownloadHandler();
+   createWindow();
+   createTray();
+ //  createAppMenu();
+@@ -3467,6 +3705,7 @@ app.on('window-all-closed', () => {
+ app.on('before-quit', () => {
+   isQuitting = true;
+   try {
++    pruneExpiredDirectOpenRequests();
+     if (mainWindow && !mainWindow.isDestroyed()) {
+       mainWindow.webContents.executeJavaScript(`(function(){
+         try {
+@@ -3484,6 +3723,12 @@ app.on('before-quit', () => {
+       try { if (w && !w.isDestroyed()) w.destroy(); } catch {}
+     }
+   } catch {}
++    try {
++      for (const p of tempOpenedFiles) {
++        try { fs.unlinkSync(p); } catch {}
++      }
++      tempOpenedFiles.clear();
++    } catch {}
+ } catch {}
+ });
+ 
+diff --git a/package.json b/package.json
+index 1581288..6bf4550 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "gemini-for-linux",
+-  "version": "1.05.00",
++  "version": "1.05.01",
+   "description": "Gemini for Linux",
+   "main": "main.js",
+   "scripts": {
+diff --git a/preload.js b/preload.js
+index ed08849..ff40aff 100644
+--- a/preload.js
++++ b/preload.js
+@@ -1,5 +1,21 @@
+ // preload.js
+ const { contextBridge, ipcRenderer } = require('electron');
++
++const IPC = Object.freeze({
++  SEND_SELECTION: 'gemini:send-selection',
++  QUICK_NEW: 'gemini:quick-new',
++  DIRECT_OPEN_LINK: 'gemini:direct-open-link',
++  PRELOAD_PING: 'gemini:preload-ping',
++});
++
++// Prove that the preload actually executed in the running app.
++try {
++  ipcRenderer.send(IPC.PRELOAD_PING, {
++    href: String(location.href || ''),
++    ts: Date.now(),
++  });
++} catch {}
++
+ // ============================================================================
+ // Host API (Quick Chat interactions are clipboard-based in main)
+ // ============================================================================
+@@ -10,7 +26,7 @@ contextBridge.exposeInMainWorld('geminiHost', {
+    * options = { mode: 'plain'|'quote', autoSubmit: boolean, targetQuickId?: number }
+    */
+   sendSelection(options = {}) {
+-    ipcRenderer.send('gemini:send-selection', {
++    ipcRenderer.send(IPC.SEND_SELECTION, {
+       mode: options.mode || 'plain',
+       autoSubmit: !!options.autoSubmit,
+       targetQuickId: (typeof options.targetQuickId === 'number') ? options.targetQuickId : null
+@@ -20,6 +36,54 @@ contextBridge.exposeInMainWorld('geminiHost', {
+    * Create a new Quick Chat window.
+    */
+   newQuickChat() {
+-    ipcRenderer.send('gemini:quick-new');
++    ipcRenderer.send(IPC.QUICK_NEW);
+   }
+ });
++
++// ============================================================================
++// Shift+click on file/download links => ask main process to auto-open the
++// resulting download from a temp file using the OS default application.
++// ============================================================================
++function shouldIgnoreHref(href) {
++  const s = String(href || '').trim();
++  if (!s) return true;
++  return (
++    s.startsWith('#') ||
++    /^javascript:/i.test(s) ||
++    /^mailto:/i.test(s) ||
++    /^tel:/i.test(s)
++  );
++}
++
++function findAnchorFromEventTarget(target) {
++  try {
++    if (!target) return null;
++    if (typeof target.closest === 'function') {
++      return target.closest('a[href]');
++    }
++  } catch {}
++  return null;
++}
++
++function onShiftClickDirectOpen(event) {
++  try {
++    if (event.defaultPrevented) return;
++    if (!event.shiftKey) return;
++    if (event.button !== 0) return; // left click only
++
++    const anchor = findAnchorFromEventTarget(event.target);
++    if (!anchor) return;
++
++    const href = anchor.href || anchor.getAttribute('href') || '';
++    if (shouldIgnoreHref(href)) return;
++
++    ipcRenderer.send(IPC.DIRECT_OPEN_LINK, {
++      href: String(href),
++      ts: Date.now(),
++    });
++  } catch (err) {
++    try { console.error('[direct-open][preload] handler failed', err); } catch {}
++  }
++}
++
++window.addEventListener('click', onShiftClickDirectOpen, true);
