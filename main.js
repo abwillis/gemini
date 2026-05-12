@@ -496,6 +496,11 @@ function refreshTrayMenu() {
         const qm = initQuickChat();
         const ids = qm.listQuickIds();
         if (ids.length) {
+            items.push({ label: 'New Quick Chat', click: () => initQuickChat().createQuickChatWindow() });
+            items.push({ label: 'Show Active Quick Chat', click: () => {
+                const w = initQuickChat().getActiveQuickChatWindow();
+                if (w) reveal(w);
+            }});
             for (const id of ids) {
                 items.push({
                     label: `Quick Chat ${id}`,
@@ -505,11 +510,44 @@ function refreshTrayMenu() {
             items.push({ type: 'separator' });
         }
     } catch {}
-    items.push(
-        { label: 'About', click: () => showAboutDialog({ icon: appIconImage }) },
-        { type: 'separator' },
-        { label: 'Quit', click: () => { isQuitting = true; app.quit(); } }
-    );
+    // Save Chat Pane
+    items.push({
+        label: 'Save Chat Pane',
+        click: () => { if (mainWindow) promptSaveChatPane(mainWindow); }
+    });
+    items.push({ type: 'separator' });
+    // Session management
+    items.push({
+        label: 'Reload',
+        click: () => reloadApp({ ignoreCache: false })
+    });
+    items.push({
+        label: 'Toggle Always on Top',
+        click: () => toggleActiveWindowAlwaysOnTop()
+    });
+    items.push({
+        label: 'Clear Session/Cache',
+        submenu: [
+            { label: 'Clear ' + APP_LABEL + ' Cache', click: () => clearAppCache() },
+            { label: 'Clear Cookies / Sign Out', click: () => clearCookiesAndSignOut() },
+        ]
+    });
+    items.push({ type: 'separator' });
+    // Config & Logs
+    items.push({
+        label: 'Open Logs Folder',
+        click: () => openLogsFolder()
+    });
+    items.push({
+        label: 'Open Config File',
+        click: () => openConfigFile()
+    });
+    items.push({ type: 'separator' });
+    // About & Quit
+    items.push({ label: 'About', click: () => showAboutDialog() });
+    items.push({ type: 'separator' });
+    items.push({ label: 'Quit', click: () => { isQuitting = true; app.quit(); } });
+
     tray.setContextMenu(Menu.buildFromTemplate(items));
 }
 
