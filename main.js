@@ -416,6 +416,7 @@ function createWindow() {
 
     const taIcon = nativeImage.createFromPath(getIconPath('gemini-for-linux.png'));
     if (!appIconImage || appIconImage.isEmpty()) appIconImage = taIcon;
+    console.log('ICON DEBUG:', 'empty:', appIconImage.isEmpty(), 'size:', appIconImage.getSize());
     if (!trayImage24 || trayImage24.isEmpty?.()) {
         try { trayImage24 = taIcon.resize({ width: 24, height: 24 }); } catch {}
     }
