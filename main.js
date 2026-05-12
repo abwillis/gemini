@@ -41,8 +41,8 @@ const { createExporters, EXPORT_SCOPES } = require('./lib/exporters');
 const APP_LABEL = 'Gemini';
 const APP_SLUG  = 'gemini';
 
-const GEMINI_URL       = 'https://gemini.google.com';
-const GEMINI_PARTITION = String(process.env.GEMINI_PARTITION ?? 'persist:gemini-for-linux').trim();
+let GEMINI_URL       = 'https://gemini.google.com';
+let GEMINI_PARTITION = String(process.env.GEMINI_PARTITION ?? 'persist:gemini-for-linux').trim();
 
 const IPC = Object.freeze({
     SEND_SELECTION:  'gemini:send-selection',
@@ -71,6 +71,121 @@ const DEFAULT_APP_CONFIG = Object.freeze({
 });
 
 let APP_CONFIG = { ...DEFAULT_APP_CONFIG };
+
+// ============================================================================
+// Config file — auto-create, load, merge with defaults
+// ============================================================================
+function getConfigFilePath() {
+    return path.join(app.getPath('userData'), 'config.json');
+}
+
+function getLogFilePath() {
+    const logsDir = path.join(app.getPath('userData'), 'logs');
+    try { fs.mkdirSync(logsDir, { recursive: true }); } catch {}
+    return path.join(logsDir, APP_CONFIG.logFileName || DEFAULT_APP_CONFIG.logFileName);
+}
+
+function ensureConfigFile() {
+    const cfgPath = getConfigFilePath();
+    let existing = {};
+    try {
+        const raw = fs.readFileSync(cfgPath, 'utf8');
+        existing = JSON.parse(raw);
+        if (!existing || typeof existing !== 'object') existing = {};
+    } catch {
+        // File missing or corrupt — will be (re)created below
+    }
+    // Merge: existing keys win, new defaults are added
+    const merged = { ...DEFAULT_APP_CONFIG, ...existing };
+    // Validate / coerce types
+    merged.appUrl = String(merged.appUrl || DEFAULT_APP_CONFIG.appUrl).trim();
+    merged.partition = String(
+        process.env.GEMINI_PARTITION ?? merged.partition ?? DEFAULT_APP_CONFIG.partition
+    ).trim();
+    if (typeof merged.enableLayoutCss !== 'boolean')             merged.enableLayoutCss = DEFAULT_APP_CONFIG.enableLayoutCss;
+    if (typeof merged.enableDirectOpen !== 'boolean')            merged.enableDirectOpen = DEFAULT_APP_CONFIG.enableDirectOpen;
+    if (typeof merged.enableQuickChat !== 'boolean')             merged.enableQuickChat = DEFAULT_APP_CONFIG.enableQuickChat;
+    if (typeof merged.findContentVisibilityOverride !== 'boolean') merged.findContentVisibilityOverride = DEFAULT_APP_CONFIG.findContentVisibilityOverride;
+    if (typeof merged.devToolsEnabled !== 'boolean')             merged.devToolsEnabled = DEFAULT_APP_CONFIG.devToolsEnabled;
+    if (typeof merged.enableConsoleLogging !== 'boolean')        merged.enableConsoleLogging = DEFAULT_APP_CONFIG.enableConsoleLogging;
+    if (typeof merged.enableFileLogging !== 'boolean')           merged.enableFileLogging = DEFAULT_APP_CONFIG.enableFileLogging;
+    if (typeof merged.quickPasteDelayMs !== 'number')            merged.quickPasteDelayMs = DEFAULT_APP_CONFIG.quickPasteDelayMs;
+    if (!merged.appUrl) merged.appUrl = DEFAULT_APP_CONFIG.appUrl;
+    merged.logFileName = String(merged.logFileName || DEFAULT_APP_CONFIG.logFileName)
+        .replace(/[^a-zA-Z0-9._-]/g, '-');
+    // Write back (adds any new keys introduced in this version)
+    try {
+        fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
+        fs.writeFileSync(cfgPath, JSON.stringify(merged, null, 2), 'utf8');
+    } catch (err) {
+        console.error('Failed to write config file:', err);
+    }
+    return merged;
+}
+
+function loadAppConfig() {
+    const merged = ensureConfigFile();
+    APP_CONFIG = merged;
+    // Let config override the compile-time URL and partition
+    GEMINI_URL = APP_CONFIG.appUrl || GEMINI_URL;
+    GEMINI_PARTITION = APP_CONFIG.partition || GEMINI_PARTITION;
+    return APP_CONFIG;
+}
+
+// ============================================================================
+// Dual-channel logging — console + file
+// ============================================================================
+function setupLogging() {
+    const config = APP_CONFIG;
+    const origLog   = console.log.bind(console);
+    const origInfo  = console.info.bind(console);
+    const origDebug = console.debug.bind(console);
+    const origWarn  = console.warn.bind(console);
+    const origError = console.error.bind(console);
+
+    // Suppress console output if disabled (but keep originals for file logging)
+    const noop = () => {};
+    const cLog   = config.enableConsoleLogging ? origLog   : noop;
+    const cInfo  = config.enableConsoleLogging ? origInfo  : noop;
+    const cDebug = config.enableConsoleLogging ? origDebug : noop;
+    const cWarn  = config.enableConsoleLogging ? origWarn  : noop;
+    const cError = config.enableConsoleLogging ? origError : noop;
+
+    if (!config.enableFileLogging) {
+        // No file logging — just apply console suppression if needed
+        console.log = cLog; console.info = cInfo; console.debug = cDebug;
+        console.warn = cWarn; console.error = cError;
+        return;
+    }
+
+    // File logging enabled
+    const logPath = getLogFilePath();
+
+    function formatArgs(args) {
+        return args.map(a => {
+            if (typeof a === 'string') return a;
+            try { return JSON.stringify(a); } catch { return String(a); }
+        }).join(' ');
+    }
+
+    function appendToLog(level, args) {
+        try {
+            const timestamp = new Date().toISOString();
+            const line = `[${timestamp}] [${level}] ${formatArgs(args)}\n`;
+            fs.appendFileSync(logPath, line, 'utf8');
+        } catch {}
+    }
+
+    console.log   = (...args) => { cLog(...args);   appendToLog('LOG',   args); };
+    console.info  = (...args) => { cInfo(...args);  appendToLog('INFO',  args); };
+    console.debug = (...args) => { cDebug(...args); appendToLog('DEBUG', args); };
+    console.warn  = (...args) => { cWarn(...args);  appendToLog('WARN',  args); };
+    console.error = (...args) => { cError(...args); appendToLog('ERROR', args); };
+}
+
+// --- Initialize config + logging before anything else ---
+try { loadAppConfig(); } catch (err) { console.error('Config load failed:', err); }
+try { setupLogging(); } catch (err) { console.error('Logging setup failed:', err); }
 
 function getAppConfig() { return APP_CONFIG; }
 
@@ -161,6 +276,9 @@ const sessionHelpers = createSessionHelpers({
     getAppConfig,
     getAppPartition: () => GEMINI_PARTITION,
     getAppUrl: () => GEMINI_URL,
+    getConfigFilePath,
+    getLogFilePath,
+    ensureConfigFile,
     getMainWindow: () => mainWindow,
     getAppIconImage: () => appIconImage,
     safeShowError,
