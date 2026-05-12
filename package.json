@@ -1,6 +1,6 @@
 {
   "name": "gemini-for-linux",
-  "version": "1.06.01",
+  "version": "1.06.02",
   "description": "Gemini for Linux",
   "main": "main.js",
   "scripts": {
@@ -16,7 +16,11 @@
       "output": "dist"
     },
     "files": [
-      "**/*"
+      "main.js",
+      "preload.js",
+      "package.json",
+      "assets/**",
+      "lib/**"
     ],
     "asarUnpack": [
       "**/*.node",
