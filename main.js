@@ -1,3489 +1,561 @@
-// main.js
+// main.js — Gemini for Linux (refactored orchestrator)
+'use strict';
+
 const { app, BrowserWindow, Menu, MenuItem, Tray, nativeImage, shell, ipcMain, dialog, screen, clipboard, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const TurndownService = require('turndown');
-const turndownPluginGfm = require('turndown-plugin-gfm');
 
-// Force a persistent Chromium storage partition for Gemini.
-// Electron: partitions starting with "persist:" use a persistent session. [5](https://www.electronjs.org/docs/latest/api/session)
+// === App-specific modules ===
+const {
+    CHAT_ROOT_SELECTORS, CHAT_MESSAGE_LIST_SELECTORS,
+    CHAT_SCOPE_SELECTOR, CHAT_SCOPE_PSEUDO,
+    CHAT_MESSAGE_LIST_SELECTOR, CHAT_MESSAGE_LIST_PSEUDO,
+    EXPORT_ROOT_CLASS, EXPORT_ROOT_SELECTOR,
+    CODE_PREVIEW_IFRAME_SELECTOR, DOM_CLEANUP_SELECTORS,
+    cleanupDOMFragmentScript, buildChatPaneDetectionScript,
+    buildLocateChatRootScript,
+} = require('./lib/chat-dom');
+
+const {
+    SELECTORS, IGNORE_SELECTORS, IGNORE_JOINED,
+    messageContentById, MAX_CHARS, VW_SIZE, MIN_VW, MAX_VW,
+    applyDynamicWidth, attachVWResize, buildMaxLayoutCSS,
+    maxLayoutCssCache, injectedFrameIdsByWC, insertedMainCssKeyByWC, cssApplyDebounceByWC,
+    injectCSSOnLoad, injectCSSIntoAllFrames, applyMaxLayoutCSS, requestExpandedLayout,
+    buildFindContentVisibilityCSS, enableFindContentVisibility, disableFindContentVisibility,
+} = require('./lib/layout-css');
+
+// === Shared modules ===
+const { createWindowState } = require('./lib/window-state');
+const { createQuickChatManager } = require('./lib/quick-chat');
+const { createFindInPage } = require('./lib/find-in-page');
+const { createDirectOpen } = require('./lib/direct-open');
+const { createSessionHelpers } = require('./lib/session-helpers');
+const { createContextMenu } = require('./lib/context-menu');
+const { createAppMenu } = require('./lib/app-menu');
+const { createExporters, EXPORT_SCOPES } = require('./lib/exporters');
+
+// ============================================================================
+// App identity & constants
+// ============================================================================
+const APP_LABEL = 'Gemini';
+const APP_SLUG  = 'gemini';
+
+const GEMINI_URL       = 'https://gemini.google.com';
 const GEMINI_PARTITION = String(process.env.GEMINI_PARTITION ?? 'persist:gemini-for-linux').trim();
 
-let mainWindow = null;
-let quickChatWindows = [];         // Multi-Quick Chat windows
-let activeQuickChatId = null;      // last-focused quick window id
-let quickChatIdCounter = 0;
-let tray = null;
-let isQuitting = false;
-let lastSavePath = null;  // (legacy) Remember where "Save" last wrote to (per session/window)
-let findModal = null;  // === Find modal ===
-let appIconImage = null;  // Cached icon images
-let trayImage24 = null;  // Cached icon images
-
-// --- Clipboard-based Quick Chat paste timing ---------------------------------
-// Requirement: copy selection -> open/focus Quick Chat -> wait 3s -> paste.
-const QUICK_PASTE_NEW_WINDOW_DELAY_MS = 300;
-const QUICK_PASTE_DELAY_MS = 3000; // NOTE: This is now a fallback timeout only. Primary path waits for input readiness.
-const QUICK_PASTE_POST_KEY_DELAY_MS = 40; // tiny gap between paste and optional Enter
-
-
-// --- Quick Chat / IPC constants --------------------------------------------
-const GEMINI_URL = 'https://gemini.google.com';
-
 const IPC = Object.freeze({
-  SEND_SELECTION: 'gemini:send-selection',
-  QUICK_NEW: 'gemini:quick-new',
+    SEND_SELECTION:  'gemini:send-selection',
+    QUICK_NEW:       'gemini:quick-new',
+    DIRECT_OPEN_LINK:'gemini:direct-open-link',
+    PRELOAD_PING:    'gemini:preload-ping',
 });
 
-const SEND_MODE = Object.freeze({
-  PLAIN: 'plain',
-  QUOTE: 'quote',
+const SEND_MODE = Object.freeze({ PLAIN: 'plain', QUOTE: 'quote' });
+
+const DEFAULT_APP_CONFIG = Object.freeze({
+    appUrl: GEMINI_URL,
+    partition: GEMINI_PARTITION,
+    enableLayoutCss: true,
+    enableDirectOpen: true,
+    enableQuickChat: true,
+    defaultExportFormat: 'md',
+    defaultPaneExportProfile: 'cleanMarkdown',
+    defaultSelectionExportProfile: 'cleanMarkdown',
+    quickPasteDelayMs: 3000,
+    findContentVisibilityOverride: false,
+    devToolsEnabled: true,
+    enableConsoleLogging: true,
+    enableFileLogging: false,
+    logFileName: 'gemini-for-linux.log',
 });
 
-function normalizeSendOptions(opts) {
-  const o = (opts && typeof opts === 'object') ? opts : {};
-  return {
-    mode: (o.mode === SEND_MODE.QUOTE) ? SEND_MODE.QUOTE : SEND_MODE.PLAIN,
-    autoSubmit: !!o.autoSubmit,
-    targetQuickId: (typeof o.targetQuickId === 'number' && Number.isFinite(o.targetQuickId)) ? o.targetQuickId : null,
-  };
-}
+let APP_CONFIG = { ...DEFAULT_APP_CONFIG };
 
-function quoteify(text) {
-  return String(text ?? '')
-    .split('\n')
-    .map(line => `> ${line}`)
-    .join('\n');
-}
+function getAppConfig() { return APP_CONFIG; }
 
-function setRoleTitle(win, role, id) {
-  try {
-    if (role === 'main') win.setTitle('Gemini Main Chat');
-    else win.setTitle(`Gemini Quick Chat ${id}`);
-  } catch {}
-}
+// ============================================================================
+// State
+// ============================================================================
+let mainWindow  = null;
+let tray        = null;
+let isQuitting  = false;
+let appIconImage = null;
+let trayImage24  = null;
 
-  // Unified reveal helper to avoid repeated show/focus chains
-  function reveal(win) {
+// ============================================================================
+// Utility
+// ============================================================================
+function reveal(win) {
     if (!win) return;
     if (win.isMinimized()) win.restore();
     if (!win.isVisible()) win.show();
     win.focus();
     try { win.moveTop(); } catch {}
-  }
+}
 
 function safeShowError(title, message) {
-  try {
-    dialog.showErrorBox(
-      String(title ?? 'Error'),
-      String(message ?? 'An error occurred')
-    );
-  } catch (err) {
-    console.error('Could not show error dialog:', err);
-  }
+    try { dialog.showErrorBox(String(title ?? 'Error'), String(message ?? 'An error occurred')); }
+    catch (err) { console.error('Could not show error dialog:', err); }
 }
 
 // ============================================================================
-// Multi-Quick Chat window management + send-to-specific-#N helpers
+// Window-state persistence
 // ============================================================================
-function getQuickById(id) {
-  return quickChatWindows.find(w => w && !w.isDestroyed() && w.__quickId === id) || null;
-}
+const windowState = createWindowState({ app, screen, fs, path });
+const { loadWindowState, getInitialWindowBounds, scheduleSaveWindowState } = windowState;
 
-function listQuickIds() {
-  return quickChatWindows
-    .filter(w => w && !w.isDestroyed() && typeof w.__quickId === 'number')
-    .map(w => w.__quickId)
-    .sort((a, b) => a - b);
-}
-
-function getActiveQuickChatWindow({ createIfMissing = true } = {}) {
-  const active = activeQuickChatId ? getQuickById(activeQuickChatId) : null;
-  if (active) return active;
-  const any = quickChatWindows.find(w => w && !w.isDestroyed());
-  if (any) return any;
-  if (!createIfMissing) return null;
-  return createQuickChatWindow();
-}
-
-function getTargetQuickWindow(targetQuickId, { createIfMissing = true } = {}) {
-  if (typeof targetQuickId === 'number') {
-    const exact = getQuickById(targetQuickId);
-    if (exact) return exact;
-    return getActiveQuickChatWindow({ createIfMissing });
-  }
-  return getActiveQuickChatWindow({ createIfMissing });
-}
-
-function registerQuickWindow(win) {
-  if (!win) return;
-  quickChatWindows = quickChatWindows.filter(w => w && !w.isDestroyed());
-  if (!quickChatWindows.includes(win)) quickChatWindows.push(win);
-}
-
-function onQuickFocus(win) {
-  try { activeQuickChatId = win.__quickId || null; } catch {}
-}
-
-function onQuickClosed(win) {
-  quickChatWindows = quickChatWindows.filter(w => w && w !== win && !w.isDestroyed());
-  if (activeQuickChatId && win && win.__quickId === activeQuickChatId) {
-    activeQuickChatId = quickChatWindows.at(-1)?.__quickId || null;
-  }
+function attachWindowStatePersistence(win, boundsKey) {
+    win.on('resize', () => scheduleSaveWindowState(win, boundsKey));
+    win.on('move',   () => scheduleSaveWindowState(win, boundsKey));
+    win.on('close',  () => scheduleSaveWindowState(win, boundsKey));
 }
 
 // ============================================================================
-// Clipboard paste helpers (iframe-safe)
+// did-stop-loading handler
 // ============================================================================
-function getPasteModifiers() {
-  // Cmd+V on macOS, Ctrl+V elsewhere
-  return (process.platform === 'darwin') ? ['meta'] : ['control'];
-}
-
-function sendPasteKeystroke(wc) {
-  if (!wc) return false;
-  try {
-    const mods = getPasteModifiers();
-    wc.sendInputEvent({ type: 'keyDown', keyCode: 'V', modifiers: mods });
-    wc.sendInputEvent({ type: 'keyUp',   keyCode: 'V', modifiers: mods });
-    return true;
-  } catch (e) {
-    console.error('sendPasteKeystroke failed:', e);
-    return false;
-  }
-}
-
-function sendEnterKeystroke(wc) {
-  if (!wc) return false;
-  try {
-    wc.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' });
-    wc.sendInputEvent({ type: 'keyUp',   keyCode: 'Enter' });
-    return true;
-  } catch (e) {
-    console.error('sendEnterKeystroke failed:', e);
-    return false;
-  }
-}
-
-function delayMs(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/**
- * Wait until the Gemini chat input appears and is visible.
- * This avoids a fixed delay and pastes as soon as the UI is ready.
- *
- * Returns true if ready before timeout, else false.
- */
-async function waitForChatInput(wc, timeoutMs = 4000) {
-  const start = Date.now();
-  const pollIntervalMs = 200;
-
-  // A small set of selectors to detect an input surface.
-  // The UI can change; we keep this conservative and generic.
-  const probeScript = `
-    (function () {
-      try {
-        // Common cases: textarea or contenteditable editor
-        const el =
-          document.querySelector('textarea') ||
-          document.querySelector('[contenteditable="true"]') ||
-          document.querySelector('div[role="textbox"]');
-        if (!el) return false;
-
-        // Visible-ish check: offsetParent null usually means display:none or detached.
-        // Also ensure it has a client rect (not 0x0).
-        const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
-        const visible = (el.offsetParent !== null) && r && (r.width > 0) && (r.height > 0);
-        return !!visible;
-      } catch (e) {
-        return false;
-      }
-    })();
-  `;
-
-  while ((Date.now() - start) < timeoutMs) {
-    const ok = await wc.executeJavaScript(probeScript, true).catch(() => false);
-    if (ok) return true;
-    await delayMs(pollIntervalMs);
-  }
-  return false;
-}
-
-/**
- * Dynamic paste: wait for input readiness (up to timeout), then paste.
- * Falls back to QUICK_PASTE_DELAY_MS if readiness isn't detected in time.
- */
-async function scheduleQuickPaste(wc, { autoSubmit = false } = {}) {
-  if (!wc) return;
-
-  // Primary: wait for UI readiness
-  const ready = await waitForChatInput(wc, 4000);
-  if (ready) {
-    setTimeout(() => {
-      const pasted = sendPasteKeystroke(wc);
-      if (autoSubmit && pasted) {
-        setTimeout(() => sendEnterKeystroke(wc), QUICK_PASTE_POST_KEY_DELAY_MS);
-      }
-    }, QUICK_PASTE_NEW_WINDOW_DELAY_MS);
-    return;
-  }
-
-  // Fallback: preserve old behavior in case selectors break / UI changes
-  setTimeout(() => {
-    const pasted = sendPasteKeystroke(wc);
-    if (autoSubmit && pasted) {
-      setTimeout(() => sendEnterKeystroke(wc), QUICK_PASTE_POST_KEY_DELAY_MS);
-    }
-  }, QUICK_PASTE_DELAY_MS);
-}
-
-async function chooseQuickChatTargetDialog(parentWin) {
-  const ids = listQuickIds();
-  const buttons = ids.map(id => `Quick Chat ${id}`);
-  buttons.push('New Quick Chat');
-  buttons.push('Cancel');
-
-  const res = await dialog.showMessageBox(parentWin || mainWindow, {
-    type: 'question',
-    buttons,
-    defaultId: 0,
-    cancelId: buttons.length - 1,
-    title: 'Send to Quick Chat',
-    message: 'Choose a Quick Chat target window:',
-    noLink: true
-  });
-
-  if (res.response === buttons.length - 1) return null;
-  if (res.response === buttons.length - 2) return createQuickChatWindow();
-  const chosenId = ids[res.response];
-  return getQuickById(chosenId);
-}
-
-function createQuickChatWindow() {
-  quickChatIdCounter += 1;
-  const id = quickChatIdCounter;
-  const boundsKey = `quick-${id}`;
-  const initialBounds = getInitialWindowBounds(boundsKey);
-
-  const win = new BrowserWindow({
-    skipTaskbar: false,
-    width: initialBounds.width,
-    height: initialBounds.height,
-    x: typeof initialBounds.x === 'number' ? initialBounds.x : undefined,
-    y: typeof initialBounds.y === 'number' ? initialBounds.y : undefined,
-    show: false,
-    title: `Gemini Quick Chat ${id}`,
-    icon: appIconImage,
-    webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true,
-      preload: path.join(__dirname, 'preload.js'),
-      partition: GEMINI_PARTITION,
-      devTools: true,
-      backgroundThrottling: true,
-      spellcheck: false
-    },
-    type: 'normal',
-    autoHideMenuBar: false
-  });
-
-  win.__geminiRole = 'quick';
-  win.__quickId = id;
-  win.__boundsKey = boundsKey;
-  setRoleTitle(win, 'quick', id);
-  registerQuickWindow(win);
-  activeQuickChatId = id;
-
-  win.setMenuBarVisibility(true);
-
-  win.on('close', (e) => {
-    try { scheduleSaveWindowState(win, boundsKey); } catch {}
-    if (!isQuitting) {
-      e.preventDefault();
-      win.hide();
-    }
-  });
-
-  win.on('focus', () => onQuickFocus(win));
-  win.on('closed', () => onQuickClosed(win));
-  win.webContents.on('destroyed', () => {
-    try {
-      win.webContents?.removeListener('did-stop-loading', onDidStopLoading);
-      delete win.webContents.__hasDidStopLoadingHandler;
-    } catch {}
-  });
-  win.on('resize', () => scheduleSaveWindowState(win, boundsKey));
-  win.on('move', () => scheduleSaveWindowState(win, boundsKey));
-
-  ensureDidStopLoadingHandler(win.webContents);
-
-  // Allow Electron's internal executeJavaScript() listeners
-  // without triggering false-positive leak warnings
-  win.webContents.setMaxListeners(0);
-  win.loadURL(GEMINI_URL);
-
-  try {
-    win.webContents.once('did-stop-loading', () => {
-      // Next tick ensures Chromium has painted once
-      setTimeout(() => {
-        try { applyMaxLayoutCSS(win); }
-        catch (e) { console.error('applyMaxLayoutCSS (quick deferred) failed:', e); }
-      }, 10);
-    });
-  } catch (e) {
-    console.error('applyMaxLayoutCSS quick defer wiring failed:', e);
-  }
-
-  win.once('ready-to-show', () => {
-    reveal(win);
-//    try { applyDynamicWidth(win); } catch {}
-////    try { attachVWResize(win); } catch {}
-//    try { requestExpandedLayout(win); } catch {}
-  });
-
-  win.webContents.on('did-start-navigation', () => {
-////    try { attachVWResize(win); } catch {}
-  });
-
-
-  // --- Right-click native context menu (same as Main Chat) ---
-  win.webContents.on('context-menu', (_event, params) => {
-    let menu;
-    try {
-      menu = Menu.buildFromTemplate(
-        buildContextMenuTemplate(win, params, {
-          includeQuickChatFeatures: true,
-          includeChatPaneFeatures: true,
-          includeMarkdownExport: true
-        })
-      );
-    } catch (err) {
-      console.error('Context menu template error:', err);
-      const hasSelection = !!params?.selectionText && params.selectionText.length > 0;
-      menu = Menu.buildFromTemplate([{ role: 'copy', enabled: hasSelection }, { role: 'selectAll' }]);
-    }
-
-    try { menu.popup({ window: win }); }
-    catch (err) { console.error('Context menu popup failed:', err); }
-  });
-  // --- end context menu ---
-
-  win.webContents.setWindowOpenHandler(({ url }) => (
-    shell.openExternal(url),
-    { action: 'deny' }
-  ));
-
-  return win;
-}
-
-
-// --- Make the site use the full viewport by injecting CSS (CSP-safe) ---
-const CHAT_SELECTOR = '#mainChat';  // Legacy/fallback root selector for save helpers
-const GEMINI_CHAT_ROOT_SELECTORS = [
-  '#mainChat',
-  'main.chat-app',
-  '[data-test-id="chat-app"]',
-  '[role="main"]',
-  'main'
-];
-const GEMINI_CHAT_MESSAGE_LIST_SELECTORS = [
-  '#mainChat div[id*="messagelist" i]',
-  '.conversation-container',
-  '[class="response-container"]',
-  '[role="article"]',
-  'main.chat-app',
-  '[data-test-id="chat-app"]',
-  '[role="main"]'
-];
-const GEMINI_CHAT_SCOPE_SELECTOR = GEMINI_CHAT_ROOT_SELECTORS.join(', ');
-const GEMINI_CHAT_SCOPE_PSEUDO = `:is(${GEMINI_CHAT_SCOPE_SELECTOR})`;
-const GEMINI_CHAT_MESSAGE_LIST_SELECTOR = GEMINI_CHAT_MESSAGE_LIST_SELECTORS.join(', ');
-const GEMINI_CHAT_MESSAGE_LIST_PSEUDO = `:is(${GEMINI_CHAT_MESSAGE_LIST_SELECTOR})`;
-const GEMINI_EXPORT_ROOT_CLASS = 'gemini-export-root';
-const GEMINI_EXPORT_ROOT_SELECTOR = `.${GEMINI_EXPORT_ROOT_CLASS}`;
-// Parameterized single-message selector
-const messageContentById = (id) => `${GEMINI_CHAT_SCOPE_PSEUDO} #${id}, ${GEMINI_CHAT_MESSAGE_LIST_PSEUDO} #${id}, [id="${id}"]`;
-function buildLocateChatRootScript({ includeHtml = true } = {}) {
-  const selectorsJson = JSON.stringify(GEMINI_CHAT_ROOT_SELECTORS);
-  const includeHtmlLiteral = includeHtml ? 'true' : 'false';
-  return `
-    (function () {
-      const candidates = ${selectorsJson};
-      const transcriptSelectors = [
-        'message-content',
-        '.markdown.markdown-main-panel',
-        '[id^="model-response-message-content"]',
-        'structured-content-container',
-        '.model-response-text',
-        '.response-content',
-        '.response-container-content',
-        '.presented-response-container',
-        '.conversation-container',
-        '[class="response-container"]',
-        '[role="article"]',
-        'article',
-        'section',
-        'main'
-      ];
-      function visible(el) {
-        if (!el) return false;
-        const r = el.getBoundingClientRect?.();
-        return !!r && r.width > 0 && r.height > 0;
-      }
-      function textOf(el) {
-        try { return String(el?.innerText || el?.textContent || ''); } catch { return ''; }
-      }
-      function count(el, sel) {
-        try { return el?.querySelectorAll?.(sel)?.length || 0; } catch { return 0; }
-      }
-      function semanticBonus(el) {
-       try {
-        let bonus = 0;
-        if (el.matches?.('message-content, .markdown.markdown-main-panel, [id^="model-response-message-content"]')) bonus += 1400;
-        if (el.matches?.('structured-content-container, .model-response-text')) bonus += 1000;
-        if (el.matches?.('.response-content, .response-container-content, .presented-response-container')) bonus += 700;
-        if (count(el, 'table, .horizontal-scroll-wrapper, .table-block-component, table-block') > 0) bonus += 180;
-        return bonus;
-       } catch {
-        return 0;
-       }
-      }
-      function chromePenalty(el) {
-       try {
-        let penalty = 0;
-        if (el.matches?.(
-         'user-query,' +
-         'user-query-content,' +
-         '.user-query-container,' +
-         '.query-content,' +
-         '.response-footer,' +
-         '.response-container-footer,' +
-         'message-actions,' +
-         'sources-list,' +
-         'tts-control,' +
-         'bard-avatar,' +
-         '.avatar-gutter'
-        )) penalty += 2200;
-        const cls = String(el.className || '');
-        if (/(user-query|prompt|action|button|toolbar|footer|sources-list|message-actions|thumb-|tts-|avatar-gutter)/i.test(cls)) {
-         penalty += 1200;
-        }
-        return penalty;
-       } catch {
-        return 0;
-       }
-      }
-      function editablePenalty(el) {
-        const selfEditable = !!el?.matches?.('textarea, input, [contenteditable="true"], div[role="textbox"]');
-        if (selfEditable) return 2000;
-        return (count(el, 'textarea, input, [contenteditable="true"], div[role="textbox"]') * 900)
-          + (count(el, 'form') * 300)
-          + (count(el, '[role="button"], button') * 8);
-      }
-      function score(el) {
-        if (!el || !visible(el)) return -1;
-        const text = textOf(el).trim();
-        const len = Math.min(text.length, 5000);
-        const articleCount = count(el, '[role="article"], article');
-        const responseCount = count(el, 'message-content, .markdown, [id^="model-response-message-content"], structured-content-container, .model-response-text, .response-content, .response-container-content, .presented-response-container, .conversation-container, [class="response-container"]');
-        const richCount = count(el, 'table, pre, code, ul, ol, blockquote');
-        const scrollable = (() => {
-          try {
-            const cs = getComputedStyle(el);
-            return (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) ? 1 : 0;
-          } catch {
-            return 0;
-          }
-        })();
-        return 1000
-          + Math.min(len, 1600)
-          + (articleCount * 90)
-          + (responseCount * 60)
-          + (richCount * 25)
-          + (scrollable * 50)
-          + semanticBonus(el)
-          - chromePenalty(el)
-          - editablePenalty(el);
-      }
-      const found = [];
-      for (const sel of candidates) {
-        try {
-          document.querySelectorAll(sel).forEach((root) => {
-            found.push({ sel, el: root });
-            transcriptSelectors.forEach((childSel) => {
-              try { root.querySelectorAll(childSel).forEach((el) => found.push({ sel: childSel, el })); } catch {}
-            });
-          });
-        } catch {}
-      }
-      if (!found.length) return null;
-      const scored = found
-        .map(({ sel, el }) => ({ sel, el, score: score(el), textLength: textOf(el).trim().length }))
-        .filter((entry) => entry.score >= 0)
-        .sort((a, b) => {
-          if (b.score !== a.score) return b.score - a.score;
-          return b.textLength - a.textLength;
-        });
-      const best = scored[0];
-      if (!best || !best.el) return null;
-      return {
-        selector: best.sel,
-        html: ${includeHtmlLiteral} ? best.el.outerHTML : '',
-        textLength: Number(best.textLength || 0),
-        score: Number(best.score || 0)
-      };
-    })();
-  `;
-}
-async function executeInAllFrames(win, source) {
-  if (!win?.webContents) return [];
-  const results = [];
-  try {
-    const top = await win.webContents.executeJavaScript(source, true).catch(() => null);
-    if (top) results.push({ where: 'top', value: top });
-  } catch {}
-  const frames = win.webContents.mainFrame?.framesInSubtree ?? [];
-  for (const frame of frames) {
-    try {
-      const value = await frame.executeJavaScript(source, true).catch(() => null);
-      if (value) results.push({ where: `frame:${frame.routingId}`, value });
-    } catch {}
-  }
-  return results;
-}
-async function findBestChatRoot(win, { includeHtml = true } = {}) {
-  const results = await executeInAllFrames(win, buildLocateChatRootScript({ includeHtml }));
-  if (!results.length) return null;
-  results.sort((a, b) => {
-    const aScore = Number(a?.value?.score || 0);
-    const bScore = Number(b?.value?.score || 0);
-    if (bScore !== aScore) return bScore - aScore;
-    const aLen = Number(a?.value?.textLength || 0);
-    const bLen = Number(b?.value?.textLength || 0);
-    return bLen - aLen;
-  });
-  return results[0];
-}
-async function getChatPaneSnapshot(win) {
-  const best = await findBestChatRoot(win, { includeHtml: true });
-  if (!best?.value) {
-    return { ok: false, html: '', textLength: 0, selector: null };
-  }
-  return {
-    ok: true,
-    html: String(best.value.html || ''),
-    textLength: Number(best.value.textLength || 0),
-    selector: best.value.selector || null
-  };
-}
-
-async function executeInTargetFrame(win, where, source) {
- if (!win?.webContents) return null;
- try {
-  if (!where || where === 'top') {
-   return await win.webContents.executeJavaScript(source, true).catch(() => null);
-  }
-  const m = /^frame:(\d+)$/.exec(String(where || ''));
-  if (!m) return null;
-  const routingId = Number(m[1]);
-  const frames = win.webContents.mainFrame?.framesInSubtree ?? [];
-  const frame = frames.find(f => Number(f?.routingId) === routingId);
-  if (!frame) return null;
-  return await frame.executeJavaScript(source, true).catch(() => null);
- } catch {
-  return null;
- }
-}
-function buildExportChatRootSnapshotScript() {
- const selectorsJson = JSON.stringify(GEMINI_CHAT_ROOT_SELECTORS);
- return `
- (function () {
-  const candidates = ${selectorsJson};
-  const transcriptSelectors = [
-   'message-content',
-   '.markdown.markdown-main-panel',
-   '[id^="model-response-message-content"]',
-   'structured-content-container',
-   '.model-response-text',
-   '.response-content',
-   '.response-container-content',
-   '.presented-response-container',
-   '.conversation-container',
-   '[class="response-container"]',
-   '[role="article"]',
-   'article',
-   'section',
-   'main'
-  ];
-  function visible(el) {
-   if (!el) return false;
-   const r = el.getBoundingClientRect?.();
-   return !!r && r.width > 0 && r.height > 0;
-  }
-  function textOf(el) {
-   try { return String(el?.innerText || el?.textContent || ''); } catch { return ''; }
-  }
-  function count(el, sel) {
-   try { return el?.querySelectorAll?.(sel)?.length || 0; } catch { return 0; }
-  }
-  function semanticBonus(el) {
-   try {
-    let bonus = 0;
-    if (el.matches?.('message-content, .markdown.markdown-main-panel, [id^="model-response-message-content"]')) bonus += 1400;
-    if (el.matches?.('structured-content-container, .model-response-text')) bonus += 1000;
-    if (el.matches?.('.response-content, .response-container-content, .presented-response-container')) bonus += 700;
-    if (count(el, 'table, .horizontal-scroll-wrapper, .table-block-component, table-block') > 0) bonus += 180;
-    return bonus;
-   } catch {
-    return 0;
-   }
-  }
-  function chromePenalty(el) {
-   try {
-    let penalty = 0;
-    if (el.matches?.(
-     'user-query,' +
-     'user-query-content,' +
-     '.user-query-container,' +
-     '.query-content,' +
-     '.response-footer,' +
-     '.response-container-footer,' +
-     'message-actions,' +
-     'sources-list,' +
-     'tts-control,' +
-     'bard-avatar,' +
-     '.avatar-gutter'
-    )) penalty += 2200;
-    const cls = String(el.className || '');
-    if (/(user-query|prompt|action|button|toolbar|footer|sources-list|message-actions|thumb-|tts-|avatar-gutter)/i.test(cls)) {
-     penalty += 1200;
-    }
-    return penalty;
-   } catch {
-    return 0;
-   }
-  }
-  function editablePenalty(el) {
-   const selfEditable = !!el?.matches?.('textarea, input, [contenteditable="true"], div[role="textbox"]');
-   if (selfEditable) return 2000;
-   return (count(el, 'textarea, input, [contenteditable="true"], div[role="textbox"]') * 900)
-    + (count(el, 'form') * 300)
-    + (count(el, '[role="button"], button') * 8);
-  }
-  function score(el) {
-   if (!el || !visible(el)) return -1;
-   const text = textOf(el).trim();
-   const len = Math.min(text.length, 5000);
-   const articleCount = count(el, '[role="article"], article');
-   const responseCount = count(el, 'message-content, .markdown, [id^="model-response-message-content"], structured-content-container, .model-response-text, .response-content, .response-container-content, .presented-response-container, .conversation-container, [class="response-container"]');
-   const richCount = count(el, 'table, [role="table"], [role="grid"], pre, code, ul, ol, blockquote');
-   const scrollable = (() => {
-    try {
-     const cs = getComputedStyle(el);
-     return (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) ? 1 : 0;
-    } catch {
-     return 0;
-    }
-   })();
-   return 1000
-    + Math.min(len, 1600)
-    + (articleCount * 90)
-    + (responseCount * 60)
-    + (richCount * 25)
-    + (scrollable * 50)
-    + semanticBonus(el)
-    - chromePenalty(el)
-    - editablePenalty(el);
-  }
-  function semantifyAriaTables(root) {
-   const tableLikes = Array.from(root.querySelectorAll('[role="table"], [role="grid"]'))
-    .filter(el => !el.closest('table'));
-   for (const node of tableLikes) {
-    try {
-     const rowCandidates = [];
-     try {
-      node.querySelectorAll(':scope > [role="row"]').forEach(r => rowCandidates.push(r));
-     } catch {}
-     try {
-      node.querySelectorAll(':scope > [role="rowgroup"] > [role="row"]').forEach(r => rowCandidates.push(r));
-     } catch {}
-     if (!rowCandidates.length) {
-      node.querySelectorAll('[role="row"]').forEach(r => rowCandidates.push(r));
-     }
-     const rows = Array.from(new Set(rowCandidates));
-     if (!rows.length) continue;
-     const table = document.createElement('table');
-     const tbody = document.createElement('tbody');
-     let produced = 0;
-     for (const row of rows) {
-      const tr = document.createElement('tr');
-      const cellCandidates = [];
-      try {
-       row.querySelectorAll(':scope > [role="columnheader"], :scope > [role="rowheader"], :scope > [role="cell"]').forEach(c => cellCandidates.push(c));
-      } catch {}
-      if (!cellCandidates.length) {
-       row.querySelectorAll('[role="columnheader"], [role="rowheader"], [role="cell"]').forEach(c => cellCandidates.push(c));
-      }
-      const cells = Array.from(new Set(cellCandidates));
-      if (!cells.length) continue;
-      for (const cell of cells) {
-       const isHeader = cell.matches?.('[role="columnheader"], [role="rowheader"]');
-       const out = document.createElement(isHeader ? 'th' : 'td');
-       out.innerHTML = cell.innerHTML;
-       tr.appendChild(out);
-      }
-      tbody.appendChild(tr);
-      produced += 1;
-     }
-     if (!produced) continue;
-     table.appendChild(tbody);
-     node.replaceWith(table);
-    } catch {}
-   }
-  }
-  function describeNode(el) {
-   if (!el) return null;
-   try {
-    const tag = String(el.tagName || '').toLowerCase();
-    const id = String(el.id || '');
-    const className = String(el.className || '');
-    return { tag, id, className };
-   } catch {
-    return null;
-   }
-  }
-  function tableSignalCount(el) {
-   if (!el) return 0;
-   try {
-    return count(el, [
-     'table',
-     '[role="table"]',
-     '[role="grid"]',
-     'table-block',
-     '.table-block',
-     '.table-block-component',
-     '.table-content',
-     '.horizontal-scroll-wrapper'
-    ].join(', '));
-   } catch {
-    return 0;
-   }
-  }
-  function serializedTableSignalCount(el) {
-   if (!el) return 0;
-   try {
-    const html = String(el.outerHTML || '');
-    if (!html) return 0;
-    const matches = html.match(
-     /<table\b|role="table"|role="grid"|<table-block\b|class="[^"]*(?:table-block-component|table-block|table-content|horizontal-scroll-wrapper)[^"]*"/gi
-    );
-    return matches ? matches.length : 0;
-   } catch {
-    return 0;
-   }
-  }
-  function combinedTableSignalCount(el) {
-   try {
-    return Math.max(tableSignalCount(el), serializedTableSignalCount(el));
-   } catch {
-    return 0;
-   }
-  }
-  function shouldStopPromotion(el) {
-   try {
-    if (!el) return true;
-    const tag = String(el.tagName || '').toLowerCase();
-    if (tag === 'body' || tag === 'html') return true;
-    if (el.matches?.('#chat-history, main, [role="main"], body, html')) return true;
-    return false;
-   } catch {
-    return true;
-   }
-  }
-  function isPromotionCandidate(el) {
-   try {
-    if (!el) return false;
-    if (el.matches?.(
-     'message-content,' +
-     'structured-content-container,' +
-     '.response-content,' +
-     '.response-container-content,' +
-     '.presented-response-container,' +
-     '.response-container,' +
-     '.conversation-container,' +
-     '.table-block-component,' +
-     '.horizontal-scroll-wrapper,' +
-     'table-block,' +
-     'infinite-scroller'
-    )) return true;
-    const cls = String(el.className || '');
-    return /(response|conversation|table-block|horizontal-scroll-wrapper|chat-history)/i.test(cls);
-   } catch {
-    return false;
-   }
-  }
-  function promoteExportRoot(el) {
-   if (!el) return el;
-   const original = el;
-   const originalSignals = combinedTableSignalCount(original);
-   if (originalSignals > 0) return original;
-   let cur = original;
-   while (cur && !shouldStopPromotion(cur)) {
-    const parent = cur.parentElement || null;
-    if (!parent) break;
-    const parentSignals = combinedTableSignalCount(parent);
-    if (parentSignals > 0 && isPromotionCandidate(parent)) {
-     return parent;
-    }
-    cur = parent;
-   }
-   return original;
-  }
-  function cloneContainsTableSignals(root) {
-   if (!root) return false;
-   try {
-    return combinedTableSignalCount(root) > 0;
-   } catch {
-    return false;
-   }
-  }
-  function rescuePromotedRoot(initialRoot) {
-   if (!initialRoot) return initialRoot;
-   if (cloneContainsTableSignals(initialRoot)) return initialRoot;
-   let cur = initialRoot;
-   while (cur && !shouldStopPromotion(cur)) {
-    const parent = cur.parentElement || null;
-    if (!parent) break;
-    if (isPromotionCandidate(parent) && cloneContainsTableSignals(parent)) {
-     return parent;
-    }
-    cur = parent;
-   }
-   return initialRoot;
-  }
-  function directElementChildren(el) {
-   try {
-    return Array.from(el.children || []).filter(n => n && n.nodeType === 1);
-   } catch {
-    return [];
-   }
-  }
-  function textLen(el) {
-   try { return String(el?.innerText || el?.textContent || '').trim().length; } catch { return 0; }
-  }
-  function isLikelyUiJunk(el) {
-   try {
-    if (!el) return true;
-    if (el.matches?.('button, label, input, textarea, select, nav, aside, form, [role="button"], [role="textbox"]')) return true;
-    const cls = String(el.className || '');
-    if (/(button|toolbar|composer|prompt|input|editor|footer|header|nav|sidebar)/i.test(cls)) return true;
-    return false;
-   } catch {
-    return true;
-   }
-  }
-  function semantifyPseudoTables(root) {
-   const candidates = Array.from(root.querySelectorAll('div, section, article'))
-    .filter(node => {
-     try {
-      if (!node || node.closest('table, [role="table"], [role="grid"], pre, code, ul, ol, blockquote')) return false;
-      if (isLikelyUiJunk(node)) return false;
-      const rows = directElementChildren(node).filter(r => !isLikelyUiJunk(r));
-      if (rows.length < 2) return false;
-      const rowShapes = rows
-       .map(r => directElementChildren(r).filter(c => !isLikelyUiJunk(c)))
-       .filter(cells => cells.length >= 2);
-      if (rowShapes.length < 2) return false;
-      const counts = rowShapes.map(cells => cells.length);
-      const firstCount = counts[0];
-      if (!firstCount || firstCount < 2) return false;
-      if (!counts.every(n => n === firstCount)) return false;
-      const enoughText = rowShapes.every(cells => cells.some(cell => textLen(cell) > 0));
-      if (!enoughText) return false;
-      return true;
-     } catch {
-      return false;
-     }
-    });
-   for (const node of candidates) {
-    try {
-      const rowNodes = directElementChildren(node).filter(r => !isLikelyUiJunk(r));
-      const rowCells = rowNodes
-       .map(r => directElementChildren(r).filter(c => !isLikelyUiJunk(c)))
-       .filter(cells => cells.length >= 2);
-      if (rowCells.length < 2) continue;
-      const colCount = rowCells[0].length;
-      if (!rowCells.every(cells => cells.length === colCount)) continue;
-      const table = document.createElement('table');
-      const tbody = document.createElement('tbody');
-      for (let r = 0; r < rowCells.length; r += 1) {
-       const tr = document.createElement('tr');
-       const cells = rowCells[r];
-       const looksLikeHeaderRow = (r === 0) && cells.every(cell => {
-        const txt = String(cell.innerText || cell.textContent || '').trim();
-        return txt.length > 0 && txt.length <= 120;
-       });
-       for (const cell of cells) {
-        const out = document.createElement(looksLikeHeaderRow ? 'th' : 'td');
-        out.innerHTML = cell.innerHTML;
-        tr.appendChild(out);
-       }
-       tbody.appendChild(tr);
-      }
-      table.appendChild(tbody);
-      node.replaceWith(table);
-    } catch {}
-   }
-  }
-
-  const found = [];
-  for (const sel of candidates) {
-   try {
-    document.querySelectorAll(sel).forEach((root) => {
-     found.push({ sel, el: root });
-     transcriptSelectors.forEach((childSel) => {
-      try { root.querySelectorAll(childSel).forEach((el) => found.push({ sel: childSel, el })); } catch {}
-     });
-    });
-   } catch {}
-  }
-  const scored = found
-   .map(({ sel, el }) => ({ sel, el, score: score(el), textLength: textOf(el).trim().length }))
-   .filter((entry) => entry.score >= 0)
-   .sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    return b.textLength - a.textLength;
-   });
-  const best = scored[0];
-  if (!best || !best.el) {
-    return {
-      ok: false,
-      html: '',
-      outerContextHtml: '',
-      grandparentContextHtml: '',
-      diagnostics: {
-       selector: null,
-       score: 0,
-       textLength: 0,
-       tables: 0,
-       tableRows: 0,
-       tableCells: 0,
-       ariaTables: 0,
-       codeBlocks: 0,
-       codes: 0,
-       selectedNode: null,
-       exportNode: null,
-       parentNode: null,
-       grandparentNode: null
-      }
-    };
-  }
-  const exportRoot = rescuePromotedRoot(promoteExportRoot(best.el));
-  const parent = exportRoot.parentElement ??
- null;
-  const grandparent = parent?.parentElement ??
- null;
-  function isLikelyUserPromptNode(el) {
-   if (!el) return false;
-   try {
-    if (el.matches?.(
-     'user-query,' +
-     'user-query-content,' +
-     '.user-query-container,' +
-     '.query-content'
-    )) return true;
-    const cls = String(el.className ??
- '');
-    const tag = String(el.tagName ??
- '').toLowerCase();
-    return (
-     /(user-query|query-content)/i.test(cls) ||
-     tag === 'user-query' ||
-     tag === 'user-query-content'
-    );
-   } catch {
-    return false;
-   }
-  }
-  const exportBoundary = grandparent ?? parent ?? exportRoot;
-  function findPreviousContextSibling(startEl) {
-   let cur = startEl ?? null;
-   while (cur) {
-    try {
-     let prev = cur.previousElementSibling ?? null;
-     while (prev) {
-      if (isLikelyUserPromptNode(prev)) return prev;
-      prev = prev.previousElementSibling ?? null;
-     }
-     const parentEl = cur.parentElement ?? null;
-     if (!parentEl) break;
-     const tag = String(parentEl.tagName ?? '').toLowerCase();
-     if (tag === 'body' || tag === 'html') break;
-     cur = parentEl;
-    } catch {
-     break;
-    }
-   }
-   return null;
-  }
-  const previousContextSibling = findPreviousContextSibling(exportBoundary);
-  const clone = exportRoot.cloneNode(true);
-  const preCleanupTableSignals = combinedTableSignalCount(clone);
-  const preCleanupTables = count(clone, 'table');
-  const preCleanupTableRows = count(clone, 'table tr');
-  const preCleanupTableCells = count(clone, 'table th, table td');
-  const preCleanupAriaTables = count(clone, '[role="table"], [role="grid"]');
-  const JUNK_SELECTORS = [
-   '[role="button"]',
-   '[class*="button" i]',
-   '[class*="logo" i]',
-   '[class*="label" i]',
-   '[class*="input" i]',
-   'label',
-   'input',
-   'textarea',
-   '[role="textbox"]'
-  ];
-  clone.querySelectorAll(JUNK_SELECTORS.join(',')).forEach(el => {
-   try { el.remove(); } catch {}
-  });
-  const PRESERVE_SELECTORS = [
-   'pre',
-   'code',
-   'table',
-   '[role="table"]',
-   '[role="grid"]',
-   'ul',
-   'ol',
-   '.horizontal-scroll-wrapper',
-   '.table-block-component',
-   'table-block',
-   '.table-block',
-   '.table-content'
-  ].join(', ');
-  clone.querySelectorAll(PRESERVE_SELECTORS).forEach(el => {
-   try { el.setAttribute('data-preserve', 'true'); } catch {}
-  });
-  clone.querySelectorAll('[data-preserve]').forEach(el => {
-   try {
-    el.querySelectorAll('*').forEach(child => child.setAttribute('data-preserve-descendant', 'true'));
-   } catch {}
-  });
-
-  // TEMP DEBUG: bypass div/span prune entirely.
-  // The latest debug still shows tables present pre-cleanup but gone post-cleanup,
-  // so this disables the prune step to verify whether it is the last destructive stage.
-  // clone.querySelectorAll('div, span').forEach(el => {
-  //  try {
-  //   if (el.closest?.('[data-preserve], [data-preserve-descendant]')) {
-  //    return;
-  //   }
-  //   if (
-  //    !el.textContent.trim() &&
-  //    !el.querySelector('[data-preserve], [data-preserve-descendant]') &&
-  //    !el.querySelector(PRESERVE_SELECTORS)
-  //   ) {
-  //    el.remove();
-  //   }
-  //  } catch {}
-  // });
-
-  // TEMP DEBUG: bypass semantifyAriaTables entirely.
-  // The latest debug still shows tables present pre-cleanup but gone post-cleanup
-  // even with the div/span prune disabled, so this isolates whether aria-table
-  // normalization is the remaining destructive sta
-  // semantifyAriaTables(clone);
-  // Keep pseudo-table synthesis disabled for this pass.
-  // The current debug data already proves semantic <table> nodes exist pre-cleanup,
-  // so disabling this avoids introducing another moving part while isolating cleanup loss.
-  // semantifyPseudoTables(clone);
-  const postCleanupTableSignals = combinedTableSignalCount(clone);
-  const postCleanupTables = count(clone, 'table');
-  const postCleanupTableRows = count(clone, 'table tr');
-  const postCleanupTableCells = count(clone, 'table th, table td');
-  const postCleanupAriaTables = count(clone, '[role="table"], [role="grid"]');
-  const diagnostics = {
-   selector: best.sel || null,
-   score: Number(best.score || 0),
-   textLength: Number(best.textLength || 0),
-   preCleanupTableSignals,
-   preCleanupTables,
-   preCleanupTableRows,
-   preCleanupTableCells,
-   preCleanupAriaTables,
-   postCleanupTableSignals,
-   postCleanupTables,
-   postCleanupTableRows,
-   postCleanupTableCells,
-   postCleanupAriaTables,
-   tables: postCleanupTables,
-   tableRows: postCleanupTableRows,
-   tableCells: postCleanupTableCells,
-   ariaTables: postCleanupAriaTables,
-   codeBlocks: count(clone, 'pre'),
-   codes: count(clone, 'code'),
-   selectedNodeTableSignals: combinedTableSignalCount(best.el),
-   exportNodeTableSignals: combinedTableSignalCount(exportRoot),
-   selectedNode: describeNode(best.el),
-   exportNode: describeNode(exportRoot),
-   parentNode: describeNode(parent),
-   grandparentNode: describeNode(grandparent),
-   exportBoundaryNode: describeNode(exportBoundary),
-   previousContextSiblingNode: describeNode(previousContextSibling)
-  };
-  const exportHtml =
-   String(
-    (previousContextSibling ? (previousContextSibling.outerHTML + '\\n') : '') +
-    (
-     grandparent?.outerHTML ??
-     parent?.outerHTML ??
-     clone.innerHTML ??
-     ''
-    )
-   );
-  return {
-   ok: true,
-   html: exportHtml,
-   outerContextHtml: String(parent?.outerHTML || ''),
-   grandparentContextHtml: String(grandparent?.outerHTML || ''),
-   diagnostics
-  };
- })();
- `;
-}
-async function buildChatPaneExportSnapshot(win) {
- const results = await executeInAllFrames(win, buildExportChatRootSnapshotScript());
- const okResults = results
- .map(r => ({ where: r.where, value: r.value }))
- .filter(r => r?.value?.ok);
- if (okResults.length) {
- okResults.sort((a, b) => {
- const aSignals = Number(a?.value?.diagnostics?.preCleanupTableSignals || 0);
- const bSignals = Number(b?.value?.diagnostics?.preCleanupTableSignals || 0);
- if (bSignals !== aSignals) return bSignals - aSignals;
- const aScore = Number(a?.value?.diagnostics?.score || 0);
- const bScore = Number(b?.value?.diagnostics?.score || 0);
- if (bScore !== aScore) return bScore - aScore;
- const aLen = Number(a?.value?.diagnostics?.textLength || 0);
- const bLen = Number(b?.value?.diagnostics?.textLength || 0);
- return bLen - aLen;
- });
- return okResults[0].value;
- }
- const best = await findBestChatRoot(win, { includeHtml: true });
- return {
- ok: false,
- html: '',
- outerContextHtml: '',
- grandparentContextHtml: '',
- diagnostics: {
- selector: best?.value?.selector || null,
- score: Number(best?.value?.score || 0),
- textLength: Number(best?.value?.textLength || 0),
- locateWhere: best?.where || null,
- reason: 'No export snapshot candidate returned ok=true in any frame'
- }
- };
-}
-
-function getMarkdownDebugDumpPaths(filePath) {
- const parsed = path.parse(String(filePath || 'gemini-chat.md'));
- const base = path.join(parsed.dir, parsed.name);
- return {
-  rawHtmlPath: `${base}.debug-export.raw.html`,
-  normalizedHtmlPath: `${base}.debug-export.normalized.html`,
-  diagnosticsPath: `${base}.debug-export.json`,
-  outerContextHtmlPath: `${base}.debug-export.context.outer.html`,
-  grandparentContextHtmlPath: `${base}.debug-export.context.grandparent.html`
- };
-}
-async function writeMarkdownDebugDump(filePath, payload = {}) {
- const {
-  rawHtml = '',
-  normalizedHtml = '',
-  outerContextHtml = '',
-  grandparentContextHtml = '',
-  diagnostics = null,
-  markdown = ''
- } = payload || {};
- const paths = getMarkdownDebugDumpPaths(filePath);
- const meta = {
-  generatedAt: new Date().toISOString(),
-  files: {
-   rawHtml: path.basename(paths.rawHtmlPath),
-   normalizedHtml: path.basename(paths.normalizedHtmlPath),
-   diagnostics: path.basename(paths.diagnosticsPath),
-   outerContextHtml: path.basename(paths.outerContextHtmlPath),
-   grandparentContextHtml: path.basename(paths.grandparentContextHtmlPath)
-  },
-  lengths: {
-   rawHtml: String(rawHtml || '').length,
-   normalizedHtml: String(normalizedHtml || '').length,
-   outerContextHtml: String(outerContextHtml || '').length,
-   grandparentContextHtml: String(grandparentContextHtml || '').length,
-   markdown: String(markdown || '').length
-  },
-  diagnostics: diagnostics || null
- };
- await fs.promises.writeFile(paths.rawHtmlPath, String(rawHtml || ''), 'utf8');
- await fs.promises.writeFile(paths.normalizedHtmlPath, String(normalizedHtml || ''), 'utf8');
- await fs.promises.writeFile(paths.outerContextHtmlPath, String(outerContextHtml || ''), 'utf8');
- await fs.promises.writeFile(paths.grandparentContextHtmlPath, String(grandparentContextHtml || ''), 'utf8');
- await fs.promises.writeFile(paths.diagnosticsPath, JSON.stringify(meta, null, 2), 'utf8');
- return paths;
-}
-
-function normalizeHtmlForMarkdownShared(html) {
- let out = String(html || '');
- if (!out.trim()) return '';
- out = stripExecutableBlocks(out)
-  .replace(/<!--([\s\S]*?)-->/g, '')
-  .replace(/\r\n?/g, '\n')
-  .replace(/\u00A0/g, ' ');
- // Gemini often renders diff/code lines as adjacent block nodes with no text newlines.
- // Inject line boundaries before Turndown sees the HTML.
- out = out
-  .replace(/<\/(div|p|li|tr|h[1-6]|blockquote|pre|table|ul|ol)>\s*</gi, '</$1>\n<')
-  .replace(/<(br)\s*\/?\s*>/gi, '<$1 />\n');
- return out.trim();
-}
-
-// === Safe 'did-stop-loading' wiring =========================================
-// A named handler so removeListener(...) can reliably detach the same function.
 function onDidStopLoading() {
-  try {
-    // Place your post-load logic here (keep it lightweight or idempotent).
-    // Example: enforceNoHScroll(BrowserWindow.getFocusedWindow() || mainWindow);
-  } catch (err) {
-    console.error('did-stop-loading handler error:', err);
-  }
+    try { /* placeholder for post-load logic */ } catch (err) { console.error('did-stop-loading handler error:', err); }
 }
 
-// Attach the handler exactly once per webContents.
 function ensureDidStopLoadingHandler(webContents) {
- if (!webContents) return;
-
-  // Guard against duplicate attachment across SPA navigations
-  if (webContents.__hasDidStopLoadingHandler) return;
-
-  webContents.__hasDidStopLoadingHandler = true;
-  webContents.on('did-stop-loading', onDidStopLoading);
-}
-
-function applyDynamicWidth(win) {
-  if (!win) return;
-  const script = String.raw`(function(){try{
-    const root = document.documentElement;
-    if (!getComputedStyle(root).getPropertyValue('--gemini-vw')) {
-      root.style.setProperty('--gemini-vw', '${VW_SIZE}vw');
-    }
-    window.__gemini_getTargetVW = function(){
-      try { const v = getComputedStyle(root).getPropertyValue('--gemini-vw').trim();
-        const m = /^(\d+)vw$/.exec(v); return m ? parseInt(m[1],10) : ${VW_SIZE}; } catch { return ${VW_SIZE}; }
-    };
-    window.__gemini_setTargetVW = function(v){
-      try { const c = Math.max(${MIN_VW}, Math.min(${MAX_VW}, Math.round(v))); root.style.setProperty('--gemini-vw', c+'vw'); } catch {}
-    };
-  }catch(e){} })();`;
-  try { win.webContents.executeJavaScript(script).catch(()=>{}); } catch {}
-}
-
-// Responsive VW: keep --gemini-vw tied to window size (95 → 30vw)
-function attachVWResize(win) {
-  if (!win || !win.webContents) return;
-  const wc = win.webContents;
-
-  // Run layout-affecting JS only once per window lifetime
-  if (wc.__geminiVWResizeAttached) return;
-  wc.__geminiVWResizeAttached = true;
-
-  const script = `
-    (function () {
-      try {
-        const MAX = 95;
-        const MIN = 70;
-        const root = document.documentElement;
-        function computeVW() {
-          try {
-            const screenW = (window.screen && window.screen.width) ? window.screen.width : window.innerWidth;
-            const winW = window.innerWidth;
-            let vw = Math.round((winW / screenW) * MAX);
-            vw = Math.max(MIN, Math.min(MAX, vw));
-            root.style.setProperty('--gemini-vw', vw + 'vw');
-            if (window.__gemini_setTargetVW) window.__gemini_setTargetVW(vw);
-          } catch {}
-        }
-        computeVW();
-        window.addEventListener('resize', computeVW, { passive: true });
-        window.addEventListener('orientationchange', computeVW, { passive: true });
-      } catch {}
-    })();
-  `;
-  const run = () => { try { wc.executeJavaScript(script).catch(() => {}); } catch {} };
-  wc.once('dom-ready', run);
-}
-
-// --- Dynamic width constants (added) ---
-const MAX_CHARS = 2048;
-const VW_SIZE = 100;
-const MIN_VW = 70;
-const MAX_VW = 100;
-//let   VW_WIDTH = 83;
-function buildMaxLayoutCSS({ specificMessageId } = {}) {
-  const CONTENT = [
-    specificMessageId ? messageContentById(specificMessageId) : null,
-    '.conversation-container [role="article"]',
-    '.conversation-container article',
-    '.conversation-container [class*="response-content"]',
-    '.conversation-container [class*="markdown"]',
-    '[class="response-container"]',
-    '[class="model-response-text"]'
-  ].join(',\n');
-
-  const TABLE_WRAPPERS = [
-    '.conversation-container [role="article"]:has(table)',
-    '.conversation-container article:has(table)',
-    '.conversation-container div:has(> table)',
-    `${GEMINI_CHAT_SCOPE_PSEUDO} [role="article"]:has(table)`,
-    `${GEMINI_CHAT_SCOPE_PSEUDO} article:has(table)`,
-    `${GEMINI_CHAT_SCOPE_PSEUDO} div:has(> table)`
-  ].join(',\n');
-
-  return String.raw`
-    html { --gemini-vw: ${VW_SIZE}vw; }
-    html, body {
-      height: 100vh !important;
-      width: 100% !important;
-      margin: 0 !important;
-      padding: 0 !important;
-      overflow-x: hidden !important;
-      overflow-y: auto !important;
-      word-break: break-word !important;
-    }
-    @supports (overflow: clip) {
-      html, body { overflow-x: clip !important; }
-    }
-    ${GEMINI_CHAT_SCOPE_PSEUDO},
-    ${GEMINI_CHAT_SCOPE_PSEUDO} * {
-      box-sizing: border-box !important;
-      max-width: 100% !important;
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-    }
-    ${GEMINI_CHAT_SCOPE_PSEUDO} {
-      width: 100% !important;
-      max-width: none !important;
-      min-width: 0 !important;
-      overflow-x: hidden !important;
-      overflow-y: auto !important;
-      scrollbar-gutter: stable both-edges !important;
-    }
-    ${GEMINI_CHAT_MESSAGE_LIST_PSEUDO},
-    .conversation-container,
-    [class="response-container"] {
-      width: 100% !important;
-      max-width: none !important;
-      min-width: 0 !important;
-      margin-left: 0 !important;
-      margin-right: 0 !important;
-      padding-left: 0 !important;
-      padding-right: 0 !important;
-      overflow-x: hidden !important;
-      overflow-y: visible !important;
-    }
-    ${CONTENT} {
-      max-width: min(min(var(--gemini-vw, ${VW_SIZE}vw), 92vw), ${MAX_CHARS}ch) !important;
-      width: 100% !important;
-      margin-left: 0 !important;
-      margin-right: auto !important;
-      padding-left: 20px !important;
-      padding-right: 20px !important;
-    }
-    .input-area-container,
-    .bottom-container,
-    form,
-    [class*="input-area" i],
-    [class*="composer" i],
-    [class*="prompt-box" i],
-    [class*="text-input" i],
-    ${GEMINI_CHAT_SCOPE_PSEUDO} textarea,
-    ${GEMINI_CHAT_SCOPE_PSEUDO} [contenteditable="true"],
-    ${GEMINI_CHAT_SCOPE_PSEUDO} div[role="textbox"] {
-      width: 100% !important;
-      max-width: none !important;
-      min-width: 0 !important;
-      margin-left: 0 !important;
-      margin-right: 0 !important;
-      overflow: visible !important;
-      visibility: visible !important;
-      opacity: 1 !important;
-      flex: 1 1 auto !important;
-    }
-    [class*="user-query"] {
-      max-width: none !important;
-      width: auto !important;
-      margin-left: initial !important;
-      margin-right: initial !important;
-      display: block !important;
-    }
-    ${TABLE_WRAPPERS} {
-      width: 100% !important;
-      max-width: min(min(var(--gemini-vw, ${VW_SIZE}vw), 92vw), ${MAX_CHARS}ch) !important;
-      margin-left: 0 !important;
-      margin-right: auto !important;
-      padding-left: 0 !important;
-      padding-right: 0 !important;
-    }
-    .conversation-container table,
-    ${GEMINI_CHAT_SCOPE_PSEUDO} table {
-      table-layout: fixed !important;
-      width: 100% !important;
-      min-width: 100% !important;
-      max-width: min(min(var(--gemini-vw, ${VW_SIZE}vw), 92vw), ${MAX_CHARS}ch) !important;
-      border-collapse: collapse !important;
-      display: table !important;
-    }
-    .conversation-container th,
-    .conversation-container td,
-    ${GEMINI_CHAT_SCOPE_PSEUDO} th,
-    ${GEMINI_CHAT_SCOPE_PSEUDO} td {
-      white-space: normal !important;
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-      vertical-align: top !important;
-      max-width: none !important;
-    }
-    .conversation-container pre,
-    .conversation-container code,
-    ${GEMINI_CHAT_SCOPE_PSEUDO} pre,
-    ${GEMINI_CHAT_SCOPE_PSEUDO} code {
-      white-space: pre-wrap !important;
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
-      max-width: 92vw !important;
-    }
-    .conversation-container pre,
-    ${GEMINI_CHAT_SCOPE_PSEUDO} pre {
-      width: 100% !important;
-      overflow-x: hidden !important;
-      box-sizing: border-box !important;
-    }
-  `;
-}
-function applyMaxLayoutCSS(win, { specificMessageId } = {}) {
-  if (!win) return;
-  const cacheKey = specificMessageId || 'default';
-  let css = maxLayoutCssCache.get(cacheKey);
-  if (!css) {
-    css = buildMaxLayoutCSS({ specificMessageId });
-    maxLayoutCssCache.set(cacheKey, css);
-  }
-  if (win.___geminiRole === 'quick' || win.__geminiRole === 'quick') {
-    injectCSSIntoAllFrames(win, css);
-    return;
-  }
-  if (!win.__maxLayoutKeyHolder) {
-    win.__maxLayoutKeyHolder = { key: null, css: '', __wired: false };
-  }
-  injectCSSOnLoad(win, css, win.__maxLayoutKeyHolder);
+    if (!webContents) return;
+    if (webContents.__hasDidStopLoadingHandler) return;
+    webContents.__hasDidStopLoadingHandler = true;
+    webContents.on('did-stop-loading', onDidStopLoading);
 }
 
 // ============================================================================
-// Max-layout CSS caching + injection bookkeeping (framesInSubtree variant)
+// CSS & layout attachment helper
 // ============================================================================
-const maxLayoutCssCache = new Map();              // cacheKey -> css string
-const injectedFrameIdsByWC = new WeakMap();       // webContents -> Set<routingId>
-const insertedMainCssKeyByWC = new WeakMap();     // webContents -> insertedCSS key (main frame)
-const cssApplyDebounceByWC = new WeakMap();       // webContents -> timeoutId
-
-// CSP-safe injection with re-inject on SPA navigations (and cleanup)
-function injectCSSOnLoad(win, css, keyHolder) {
- if (!win || !win.webContents) return;
- const wc = win.webContents;
- if (!keyHolder) return;
- // Allow callers to update CSS without re-wiring listeners.
- keyHolder.css = String(css ?? keyHolder.css ?? '');
-
- const inject = () => {
-  try {
-   const currentCss = String(keyHolder.css ?? '');
-   if (!currentCss) return;
-   if (keyHolder.key) {
-    try { wc.removeInsertedCSS(keyHolder.key); } catch {}
-    keyHolder.key = null;
-   }
-   wc.insertCSS(currentCss)
-    .then(k => { keyHolder.key = k; })
-    .catch(() => {});
-  } catch (err) {
-   console.error('insertCSS failed:', err);
-  }
- };
-
- // Wire reinjection hooks exactly once per keyHolder.
- if (!keyHolder.__wired) {
-  keyHolder.__wired = true;
-  wc.on('dom-ready', inject);
-  wc.on('did-finish-load', inject);
-//  wc.on('did-navigate-in-page', inject);
-  wc.on('did-start-navigation', inject);
- }
- inject();
-}
-
-// Inject CSS into all frames (main + iframes), and re-inject on frame loads.
-function injectCSSIntoAllFrames(win, css) {
-  if (!win || !win.webContents) return;
-  const wc = win.webContents;
-  const apply = () => {
+function attachCSSAndLayoutHandlers(win) {
+    if (!win) return;
     try {
-     // Debounce reinjection bursts from multiple navigation/frame events.
-     const prev = cssApplyDebounceByWC.get(wc);
-     if (prev) clearTimeout(prev);
-     const t = setTimeout(() => {
-      try {
-       // Track per-frame injections so the same frame isn't hit repeatedly.
-       let injected = injectedFrameIdsByWC.get(wc);
-       if (!injected) {
-        injected = new Set();
-        injectedFrameIdsByWC.set(wc, injected);
-       }
+        win.webContents.once('did-stop-loading', () => {
+            setTimeout(() => {
+                try { applyMaxLayoutCSS(win); }
+                catch (e) { console.error('applyMaxLayoutCSS (deferred) failed:', e); }
+            }, 10);
+        });
+    } catch (e) { console.error('applyMaxLayoutCSS defer wiring failed:', e); }
+}
 
-       // Iterate over the whole frame subtree (Electron 20+)
-       const frames = wc.mainFrame?.framesInSubtree ?? wc.mainFrame?.frames ?? [];
-       for (const f of frames) {
-        try {
-         const rid = (typeof f?.routingId === 'number') ? f.routingId : null;
-         if (rid !== null && injected.has(rid)) continue;
-         // Only mark as injected after success.
-         f.insertCSS(css).then(() => { if (rid !== null) injected.add(rid); }).catch(() => {});
-        } catch {}
-       }
+// ============================================================================
+// Find-result forwarding helper
+// ============================================================================
+function attachFindResultForwarding(win) {
+    if (!win?.webContents) return;
+    if (win.webContents.__findResultForwardingAttached) return;
+    win.webContents.__findResultForwardingAttached = true;
+    win.webContents.on('found-in-page', (_event, result) => { /* log or forward */ });
+}
 
-       // Main frame injection with key tracking to avoid accumulating duplicates.
-       const prevKey = insertedMainCssKeyByWC.get(wc);
-       if (prevKey) {
-        try { wc.removeInsertedCSS(prevKey); } catch {}
-       }
-       try {
-        wc.insertCSS(css).then((k) => { insertedMainCssKeyByWC.set(wc, k); }).catch(() => {});
-       } catch {}
-      } catch {}
-     }, 150);
-     cssApplyDebounceByWC.set(wc, t);
+// ============================================================================
+// Session helpers
+// ============================================================================
+
+const sessionHelpers = createSessionHelpers({
+    app, dialog, shell, session, clipboard, nativeImage, fs, path,
+    BrowserWindow,
+    appLabel: APP_LABEL,
+    getAppConfig,
+    getAppPartition: () => GEMINI_PARTITION,
+    getAppUrl: () => GEMINI_URL,
+    getMainWindow: () => mainWindow,
+    getAppIconImage: () => appIconImage,
+    safeShowError,
+    refreshTrayMenu,
+    refreshQuickChatMenu: () => { try { initQuickChat().refreshQuickChatMenu(); } catch {} },
+});
+const {
+    getRuntimeInfo, showAboutDialog, showApplicationHelp,
+    reloadApp, clearAppCache, clearCookiesAndSignOut,
+    copyCurrentUrl, openCurrentUrlExternal,
+    getAppSession, openLogsFolder, openConfigFile,
+    toggleActiveWindowAlwaysOnTop,
+} = sessionHelpers;
+
+// ============================================================================
+// Utility — executeInAllFrames
+// ============================================================================
+async function executeInAllFrames(win, script) {
+    if (!win?.webContents) return [];
+    const wc = win.webContents;
+    const results = [];
+    // Main frame
+    try {
+        const value = await wc.executeJavaScript(script);
+        results.push({ frameId: 0, value });
     } catch {}
-  };
-  // Hook all relevant events (document + frame loads + in-page SPA nav)
-  wc.on('dom-ready', apply);
-  wc.on('did-frame-finish-load', apply);
-  wc.on('did-navigate-in-page', apply);
-  wc.on('did-frame-navigate', apply);
-  apply();
-}
-
-function requestExpandedLayout(win) {
-  if (!win) return;
-  const script = `
-    (function() {
-      try {
-        // Send a message to the page requesting expanded/full-bleed layout
-        window.postMessage({
-          type: 'host:setLayoutMode',
-          payload: { mode: 'expanded' }
-        }, '*');
-      } catch (e) {
-        console.error('PostMessage layout request failed:', e);
-      }
-    })();
-  `;
-  const run = () => {
-    try { win.webContents.executeJavaScript(script).catch(() => {}); }
-    catch (err) { console.error('requestExpandedLayout failed:', err); }
-  };
-  // Initial load
-  win.webContents.on('did-finish-load', run);
-  // Client-side route changes (SPA)
-  win.webContents.on('did-navigate-in-page', run);
-}
-
-// === Window state persistence (size/position) ===
-function getWindowStateFile(key) {
-  const safe = String(key || 'main')
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  return path.join(app.getPath('userData'), `window-state-${safe}.json`);
-}
-
-const windowStateCache = new Map(); // key -> {x,y,width,height}
-const saveStateDebounceByKey = new Map(); // key -> timeoutId
-const SAVE_STATE_DEBOUNCE_MS = 500;
-
-function loadWindowState(key = 'main') {
-  try {
-    const file = getWindowStateFile(key);
-    const raw = fs.readFileSync(file, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object') return null;
-    windowStateCache.set(key, parsed);
-    return parsed;
-  } catch {
-    return null;
-  }
-}
-
-function isBoundsOnAnyDisplay(bounds) {
-  try {
-    const rect = { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height };
-    const disp = screen.getDisplayMatching(rect);
-    if (!disp) return false;
-    const wa = disp.workArea;
-    const intersects =
-      rect.x < (wa.x + wa.width) &&
-      (rect.x + rect.width) > wa.x &&
-      rect.y < (wa.y + wa.height) &&
-      (rect.y + rect.height) > wa.y;
-    return intersects;
-  } catch {
-    return true;
-  }
-}
-
-function getInitialWindowBounds(key = 'main') {
-  const persisted = windowStateCache.get(key) || loadWindowState(key);
-  if (persisted && persisted.width && persisted.height) {
-    if (isBoundsOnAnyDisplay(persisted)) {
-      return {
-        width: Math.max(600, persisted.width),
-        height: Math.max(400, persisted.height),
-        x: typeof persisted.x === 'number' ? persisted.x : undefined,
-        y: typeof persisted.y === 'number' ? persisted.y : undefined
-      };
-    }
-    return {
-      width: Math.max(600, persisted.width),
-      height: Math.max(400, persisted.height)
-    };
-  }
-  return { width: 1200, height: 800 };
-}
-
-function scheduleSaveWindowState(win, key = 'main') {
-  const prev = saveStateDebounceByKey.get(key);
-  if (prev) clearTimeout(prev);
- const t = setTimeout(async () => {
+    // Sub-frames
     try {
-      if (!win || win.isDestroyed()) return;
-      const bounds = win.getBounds();
-      const state = { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height };
-      const file = getWindowStateFile(key);
-      await fs.promises.mkdir(path.dirname(file), { recursive: true });
-      await fs.promises.writeFile(file, JSON.stringify(state), 'utf8');
-      windowStateCache.set(key, state);
-    } catch (err) {
-      console.error('Failed to persist window state:', err);
+        const frames = wc.mainFrame?.framesInSubtree ?? wc.mainFrame?.frames ?? [];
+        for (const frame of frames) {
+            if (frame === wc.mainFrame) continue;
+            try {
+                const value = await frame.executeJavaScript(script);
+                results.push({ frameId: frame.routingId ?? -1, value });
+            } catch {}
+        }
+    } catch {}
+    return results;
+}
+
+// ============================================================================
+// Utility — normalizeExportFormat
+// ============================================================================
+function normalizeExportFormat(fmt, fallback = 'md') {
+    const normalized = String(fmt ?? fallback ?? 'md').trim().toLowerCase();
+    const map = { markdown: 'md', md: 'md', html: 'html', mhtml: 'mhtml', txt: 'txt', pdf: 'pdf', text: 'txt' };
+    return map[normalized] ?? normalized;
+}
+
+// ============================================================================
+// Exporters
+// ============================================================================
+const exporters = createExporters({
+    app, fs, path, dialog, clipboard, shell,
+    BrowserWindow,
+    safeShowError,
+    getMainWindow: () => mainWindow,
+    getAppConfig,
+    DEFAULT_APP_CONFIG,
+    CHAT_ROOT_SELECTORS, CHAT_MESSAGE_LIST_SELECTORS,
+    CHAT_SCOPE_SELECTOR, CHAT_SCOPE_PSEUDO,
+    CHAT_MESSAGE_LIST_SELECTOR, CHAT_MESSAGE_LIST_PSEUDO,
+    EXPORT_ROOT_CLASS, EXPORT_ROOT_SELECTOR,
+    CODE_PREVIEW_IFRAME_SELECTOR,
+    DOM_CLEANUP_SELECTORS, cleanupDOMFragmentScript,
+    buildLocateChatRootScript,
+    buildChatPaneDetectionScript,
+    executeInAllFrames,
+    normalizeExportFormat,
+    appSlug: APP_SLUG,
+    appLabel: APP_LABEL,
+});
+const {
+    getSelectionFragment, htmlToMarkdown,
+    buildSelectionMarkdownForExport,
+    selectChatPane, promptSaveChatPane, saveSelectionAsMarkdown,
+    saveSelectionAsText,
+    buildExportProfileMenuTemplate, promptExportWithProfile,
+} = exporters;
+
+// ============================================================================
+// Context menu
+// ============================================================================
+const contextMenuModule = createContextMenu({
+    Menu, MenuItem, dialog, shell, clipboard,
+    BrowserWindow,
+    getMainWindow: () => mainWindow,
+    getAppConfig,
+    SEND_MODE,
+    EXPORT_SCOPES,
+    reveal, safeShowError,
+    // From exporters
+    selectChatPane, promptSaveChatPane,
+    getSelectionFragment, htmlToMarkdown,
+    buildSelectionMarkdownForExport,
+    saveSelectionAsMarkdown, saveSelectionAsText,
+    promptExportWithProfile, buildExportProfileMenuTemplate,
+    // Quick Chat (lazy)
+    buildSendToQuickSubmenu: (...args) => initQuickChat().buildSendToQuickSubmenu(...args),
+    createQuickChatWindow: (...args) => initQuickChat().createQuickChatWindow(...args),
+    // Find
+    openFindModal: (...args) => findInPage.openFindModal(...args),
+});
+const { buildContextMenuTemplate } = contextMenuModule;
+
+// ============================================================================
+// Quick Chat manager
+// ============================================================================
+let quickChatManager = null;
+function initQuickChat() {
+    if (quickChatManager) return quickChatManager;
+    quickChatManager = createQuickChatManager({
+        app, BrowserWindow, Menu, MenuItem, ipcMain, dialog, shell, clipboard, path,
+        dirname: __dirname,
+        getMainWindow: () => mainWindow,
+        getAppIconImage: () => appIconImage,
+        getAppConfig,
+        DEFAULT_APP_CONFIG,
+        appSlug: APP_SLUG,
+        getAppUrl: () => GEMINI_URL,
+        getAppPartition: () => GEMINI_PARTITION,
+        SEND_MODE, IPC, reveal, safeShowError,
+        getInitialWindowBounds,
+        attachWindowStatePersistence,
+        attachCSSAndLayoutHandlers,
+        attachFindResultForwarding,
+        ensureDidStopLoadingHandler,
+        onDidStopLoading,
+        buildContextMenuTemplate,
+        getSelectionFragment, htmlToMarkdown,
+        refreshTrayMenu,
+        appLabel: APP_LABEL,
+    });
+    quickChatManager.registerIpcHandlers();
+    return quickChatManager;
+}
+
+// ============================================================================
+// Find-in-page
+// ============================================================================
+const findInPage = createFindInPage({
+    BrowserWindow, Menu, ipcMain, screen,
+    getMainWindow: () => mainWindow,
+    getAppConfig, enableFindContentVisibility,
+    disableFindContentVisibility,
+});
+
+// direct-open initialization
+const directOpen = createDirectOpen({
+    session, shell, fs, path, app, ipcMain,
+    getAppConfig,
+    getAppPartition: () => GEMINI_PARTITION,
+    appSlug: APP_SLUG,
+    safeShowError,
+});
+
+// ============================================================================
+// Utility — ensureSaveState
+// ============================================================================
+function ensureSaveState(win) {
+    if (!win) return;
+    if (win.__saveStateInitialized) return;
+    win.__saveStateInitialized = true;
+}
+
+// ============================================================================
+// App menu
+// ============================================================================
+const appMenu = createAppMenu({
+    app, Menu, MenuItem, dialog, shell, BrowserWindow, ipcMain, clipboard,
+    getMainWindow: () => mainWindow,
+    getAppConfig,
+    DEFAULT_APP_CONFIG,
+    appLabel: APP_LABEL,
+    reveal, safeShowError,
+    // From session helpers
+    getRuntimeInfo, showAboutDialog, showApplicationHelp,
+    reloadApp, clearAppCache, clearCookiesAndSignOut,
+    copyCurrentUrl, openCurrentUrlExternal,
+    // From exporters
+    selectChatPane, promptSaveChatPane, saveSelectionAsMarkdown,
+    buildExportProfileMenuTemplate, promptExportWithProfile,
+    EXPORT_SCOPES,
+    // Find
+    openFindModal: (...args) => findInPage.openFindModal(...args),
+    initFindInPage: () => findInPage,
+    // Quick Chat (lazy — initQuickChat returns the manager)
+    buildQuickChatManagerMenuTemplate: (...args) => initQuickChat().buildQuickChatManagerMenuTemplate(...args),
+    installQuickChatMenu: (...args) => initQuickChat().installQuickChatMenu(...args),
+    refreshQuickChatMenu: (...args) => initQuickChat().refreshQuickChatMenu(...args),
+    createQuickChatWindow: (...args) => initQuickChat().createQuickChatWindow(...args),
+    buildSendToQuickSubmenu: (...args) => initQuickChat().buildSendToQuickSubmenu(...args),
+    // Other
+    buildContextMenuTemplate,
+    getAppIconImage: () => appIconImage,
+    SEND_MODE,
+    ensureSaveState, 
+    openLogsFolder, openConfigFile,
+    toggleActiveWindowAlwaysOnTop,
+    initQuickChat,
+});
+
+// ============================================================
+// Tray menu (rebuilt when Quick Chat windows change)
+// ============================================================
+function refreshTrayMenu() {
+    if (!tray) return;
+    const items = [
+        { label: 'Show', click: () => { if (mainWindow) reveal(mainWindow); } },
+        { label: 'Hide', click: () => { if (mainWindow) mainWindow.hide(); } },
+        { type: 'separator' },
+    ];
+    // Quick Chat windows
+    try {
+        const qm = initQuickChat();
+        const ids = qm.listQuickIds();
+        if (ids.length) {
+            for (const id of ids) {
+                items.push({
+                    label: `Quick Chat ${id}`,
+                    click: () => { const w = qm.getQuickById(id); if (w) reveal(w); },
+                });
+            }
+            items.push({ type: 'separator' });
+        }
+    } catch {}
+    items.push(
+        { label: 'About', click: () => showAboutDialog({ icon: appIconImage }) },
+        { type: 'separator' },
+        { label: 'Quit', click: () => { isQuitting = true; app.quit(); } }
+    );
+    tray.setContextMenu(Menu.buildFromTemplate(items));
+}
+
+// ============================================================
+// Icon helper
+// ============================================================
+function getIconPath(filename) {
+    const basePath = app.getAppPath();
+    const iconPath = path.join(basePath, 'assets', filename);
+    if (app.isPackaged) {
+        const asarPath = path.join(process.resourcesPath, 'app.asar.unpacked', 'assets', filename);
+        if (fs.existsSync(asarPath)) return asarPath;
     }
-  }, SAVE_STATE_DEBOUNCE_MS);
-  saveStateDebounceByKey.set(key, t);
+    return iconPath;
 }
 
-// === Helper: runtime info for About dialog ===
-function getRuntimeInfo() {
-  const name = app.getName?.() || 'Application';
-  const appVersion = app.getVersion?.() || '0.0.0';
-  const nodeVersion = process.versions?.node || 'unknown';
-  const electronVersion = process.versions?.electron || 'unknown';
-  const chromeVersion = process.versions?.chrome || 'unknown';
-  const v8Version = process.versions?.v8 || 'unknown';
+// ============================================================
+// createWindow
+// ============================================================
+function createWindow() {
+    if (mainWindow) return;
 
-  return {
-    name,
-    appVersion,
-    nodeVersion,
-    electronVersion,
-    chromeVersion,
-    v8Version,
-    detail:
-      `Version: ${appVersion}\n` +
-      `Node: ${nodeVersion}\n` +
-      `V8: ${v8Version}\n` +
-      `Electron: ${electronVersion}\n` +
-      `Chromium: ${chromeVersion}\n`
-  };
+    const taIcon = nativeImage.createFromPath(getIconPath('gemini-for-linux.png'));
+    if (!appIconImage || appIconImage.isEmpty()) appIconImage = taIcon;
+    if (!trayImage24 || trayImage24.isEmpty?.()) {
+        try { trayImage24 = taIcon.resize({ width: 24, height: 24 }); } catch {}
+    }
+
+    const boundsKey = 'main';
+    const initialBounds = getInitialWindowBounds(boundsKey);
+
+    mainWindow = new BrowserWindow({
+        skipTaskbar: false,
+        title: `${APP_LABEL} Main Chat`,
+        width: initialBounds.width,
+        height: initialBounds.height,
+        x: typeof initialBounds.x === 'number' ? initialBounds.x : undefined,
+        y: typeof initialBounds.y === 'number' ? initialBounds.y : undefined,
+        show: false,
+        icon: appIconImage || taIcon,
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            preload: path.join(__dirname, 'preload.js'),
+            partition: GEMINI_PARTITION,
+            devTools: true,
+            backgroundThrottling: true,
+            spellcheck: false,
+        },
+        type: 'normal',
+        autoHideMenuBar: false,
+    });
+
+    mainWindow.setMenuBarVisibility(true);
+
+    mainWindow.once('ready-to-show', () => {
+        reveal(mainWindow);
+        try { mainWindow.__appRole = 'main'; } catch {}
+        try { mainWindow.__boundsKey = boundsKey; } catch {}
+        appMenu.augmentApplicationMenu(mainWindow);
+    });
+
+    mainWindow.setSkipTaskbar(false);
+    ensureDidStopLoadingHandler(mainWindow.webContents);
+    mainWindow.webContents.setMaxListeners(0);
+    mainWindow.loadURL(GEMINI_URL);
+
+    attachCSSAndLayoutHandlers(mainWindow);
+    attachWindowStatePersistence(mainWindow, boundsKey);
+    attachFindResultForwarding(mainWindow);
+
+    // Context menu
+    mainWindow.webContents.on('context-menu', (_event, params) => {
+        let menu;
+        try {
+            menu = Menu.buildFromTemplate(
+                buildContextMenuTemplate(mainWindow, params, {
+                    includeQuickChatFeatures: true,
+                    includeChatPaneFeatures: true,
+                    includeMarkdownExport: true,
+                })
+            );
+        } catch (err) {
+            console.error('Context menu template error:', err);
+            const hasSelection = !!params?.selectionText && params.selectionText.length > 0;
+            menu = Menu.buildFromTemplate([{ role: 'copy', enabled: hasSelection }, { role: 'selectAll' }]);
+        }
+        try { menu.popup({ window: mainWindow }); }
+        catch (err) { console.error('Context menu popup failed:', err); }
+    });
+
+    // External links
+    mainWindow.webContents.setWindowOpenHandler(({ url }) => (
+        shell.openExternal(url), { action: 'deny' }
+    ));
+
+    // Escape to clear find
+    mainWindow.webContents.on('before-input-event', (event, input) => {
+        if (input.type === 'keyDown' && input.key === 'Escape') {
+            const wc = mainWindow.webContents;
+            if (wc) wc.stopFindInPage('clearSelection');
+        }
+    });
+
+    mainWindow.on('close', (e) => {
+        if (!isQuitting) { e.preventDefault(); mainWindow.hide(); }
+    });
+
+    mainWindow.on('closed', () => { mainWindow = null; });
 }
 
-app.setName('gemini-for-linux');  // Shows as WMClass "yourapp" or "YourApp"
+// ============================================================
+// createTray
+// ============================================================
+function createTray() {
+    const iconPath = getIconPath('gemini-for-linux.png');
+    const trayImage = trayImage24 || nativeImage.createFromPath(iconPath);
+    const smallImage = trayImage.isEmpty ? null : trayImage.resize({ width: 24, height: 24 });
+
+    tray = new Tray(smallImage || appIconImage || nativeImage.createFromPath(
+        path.join(__dirname, 'assets', 'gemini-for-linux.png')
+    ));
+    tray.setToolTip(`${APP_LABEL} for Linux`);
+    refreshTrayMenu();
+
+    tray.on('click', () => {
+        if (!mainWindow) return;
+        if (mainWindow.isVisible()) mainWindow.hide();
+        else reveal(mainWindow);
+    });
+}
+
+// ============================================================
+// App lifecycle
+// ============================================================
+app.setName('gemini-for-linux');
 app.setAppUserModelId('your.company.gemini');
 
-// === Parent-aware helpers for find-in-page ===
-// Prefer the parent window's webContents when the focused window is a modal.
-function getWCFromEventSender(sender) {
-  const modalWin = BrowserWindow.fromWebContents(sender);
-  const targetWin = modalWin?.getParentWindow() || mainWindow;
-  return targetWin?.webContents || null;
-}
-
-function getWC() {
-  const focused = BrowserWindow.getFocusedWindow();
-  const target = focused?.getParentWindow() || focused || mainWindow;
-  return target?.webContents || null;
-}
-
-// Optional: utility to safely enable "whole word-ish" behavior.
-// Chromium's flags are heuristic; enable if desired.
-function applyWordStartOptions(opts) {
-  return {
-    ...opts,
-    // Enable these if you want word-start behavior, useful for token-like terms.
-    wordStart: opts.wordStart ?? true,
-    medialCapitalAsWordStart: opts.medialCapitalAsWordStart ?? true,
-  };
-}
-
-function openFindModal(parent) {
-  if (findModal && !findModal.isDestroyed()) {
-    findModal.show(); findModal.focus(); return;
-  }
-  findModal = new BrowserWindow({
-    parent, modal: true, width: 380, height: 160, resizable: false,
-    minimizable: false, maximizable: false, show: false,
-    title: 'Find in Page', autoHideMenuBar: true,
-    // Enable Node only in the modal; main window remains sandboxed
-    webPreferences: { nodeIntegration: true, contextIsolation: false }
-  });
-
-  // --- Position the find window relative to the parent window (Cinnamon-friendly) ---
-  try {
-    // Prefer the *restored* bounds if parent is maximized/fullscreen
-    const pb = (parent && typeof parent.getNormalBounds === 'function')
-      ? parent.getNormalBounds()
-      : parent.getBounds();
-
-    const modalW = 380;
-    const modalH = 160;
-
-    // Center over parent
-    let x = Math.round(pb.x + (pb.width - modalW) / 2);
-    let y = Math.round(pb.y + (pb.height - modalH) / 2);
-
-    // Clamp to nearest display workArea so it doesn't end up off-screen
-    const display = screen.getDisplayMatching({ x: pb.x, y: pb.y, width: pb.width, height: pb.height });
-    const wa = display?.workArea || { x: 0, y: 0, width: 1920, height: 1080 };
-
-    x = Math.max(wa.x, Math.min(x, wa.x + wa.width - modalW));
-    y = Math.max(wa.y, Math.min(y, wa.y + wa.height - modalH));
-
-    findModal.setBounds({ x, y, width: modalW, height: modalH });
-  } catch (e) {
-    // If anything goes wrong, let the WM decide placement
-  }
-
-  // Build plain HTML, then encode only the payload for the data URL
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8">
-<style>
-  body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:12px}
-  .row{display:flex;gap:8px;align-items:center}
-  input[type=text]{flex:1;padding:6px 8px}
-  .actions{margin-top:10px;display:flex;gap:8px;justify-content:flex-end}
-  label{font-size:12px;color:#444}
-</style></head><body>
-  <div class="row">
-    <input id="term" type="text" placeholder="Find in page..." autofocus />
-    <label><input id="match" type="checkbox"> Match case</label>
-  </div>
-  <div class="actions">
-    <button id="prev">Previous</button>
-    <button id="next">Next</button>
-    <button id="clear">Clear</button>
-    <button id="close">Close</button>
-  </div>
-  <script>
-    const { ipcRenderer } = require('electron');
-    const termEl = document.getElementById('term');
-    const matchEl = document.getElementById('match');
-    const send = (kind) => ipcRenderer.send('find-modal-submit', {
-      kind, term: termEl.value || '', matchCase: !!matchEl.checked
-    });
-    document.getElementById('next').onclick = () => send('next');
-    document.getElementById('prev').onclick = () => send('prev');
-    document.getElementById('clear').onclick = () => ipcRenderer.send('find-modal-clear');
-    document.getElementById('close').onclick = () => ipcRenderer.send('find-modal-close');
-    termEl.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') send('next');
-      if (e.key === 'Escape') {
-        ipcRenderer.send('find-modal-clear');
-        ipcRenderer.send('find-modal-close');
-      }
-    });
-  </script>
-</body></html>`;
-  // Keep the modal clean; no menu bar
-  findModal.removeMenu();
-  // Encode only the HTML part, not the "data:" URL header
-  findModal.loadURL('data:text/html;charset=UTF-8,' + encodeURIComponent(html));
-  // Show when ready and log any load failures
-  findModal.once('ready-to-show', () => {
-    try { findModal.show(); findModal.focus(); } catch {}
-  });
-  findModal.webContents.on('did-fail-load', (_e, code, desc, url) => {
-    console.error('Find modal failed to load:', code, desc, url);
-  });
-}
-
-// === Find-in-page state ===
-let lastFindTerm = '';
-let lastFindOpts = { forward: true, matchCase: false, medialCapitalAsWordStart: true, wordStart: true, findNext: false };
-let findDebounce;
-const FIND_DEBOUNCE_MS = 20;
-
-// Build Edit menu as a reusable factory
-function appendEditItems(editSubmenu) {
-  const template = [
-//    { role: 'undo' }, { role: 'redo' }, { type: 'separator' },
-//    { role: 'cut' }, { role: 'copy' }, { role: 'paste' },
-//    { role: 'selectAll' }, { type: 'separator' },
-    {
-      label: 'Find',
-      accelerator: 'Ctrl+F',
-      click: () => {
-        const w = BrowserWindow.getFocusedWindow() || mainWindow;
-        if (w) openFindModal(w);
-      }
-    },
-    {
-      label: 'Find Next',
-      accelerator: 'F3',
-      click: () => {
-        const wc = getWC(); if (!wc || !lastFindTerm) return;
-        lastFindOpts = applyWordStartOptions({ ...lastFindOpts, forward: true, findNext: true });
-        wc.findInPage(lastFindTerm, lastFindOpts);
-      }
-    },
-    {
-      label: 'Find Previous',
-      accelerator: 'Shift+F3',
-      click: () => {
-        const wc = getWC(); if (!wc || !lastFindTerm) return;
-        lastFindOpts = applyWordStartOptions({ ...lastFindOpts, forward: false, findNext: true });
-        wc.findInPage(lastFindTerm, lastFindOpts);
-      }
-    },
-    {
-      label: 'Clear Highlights',
-      accelerator: 'Esc',
-      click: () => { const wc = getWC(); if (!wc) return; wc.stopFindInPage('clearSelection'); }
-    },
-    { type: 'separator' },
- {
-  label: 'New Quick Chat Window',
-  accelerator: 'Ctrl+Alt+N',
-  click: () => { try { reveal(createQuickChatWindow()); } catch (e) { console.error('New Quick Chat failed:', e); } }
- },
- {
-  label: 'Show Active Quick Chat',
-  accelerator: 'Ctrl+Alt+2',
-  click: () => { try { const w = getActiveQuickChatWindow({ createIfMissing: true }); if (w) reveal(w); } catch (e) { console.error('Show Quick Chat failed:', e); } }
- },
- { type: 'separator' },
- {
-  label: 'Send Selection to Active Quick Chat',
-  accelerator: 'Ctrl+Alt+Q',
-  click: async () => { const src = BrowserWindow.getFocusedWindow() || mainWindow; await sendSelectionToQuick(src, { mode: SEND_MODE.PLAIN, autoSubmit: false, targetQuickId: null }); }
- },
- {
-  label: 'Send Selection as Quote (Active Quick)',
-  accelerator: 'Ctrl+Alt+Shift+Q',
-  click: async () => { const src = BrowserWindow.getFocusedWindow() || mainWindow; await sendSelectionToQuick(src, { mode: SEND_MODE.QUOTE, autoSubmit: false, targetQuickId: null }); }
- },
- {
-  label: 'Send Selection & Auto‑Submit (Active Quick)',
-  accelerator: 'Ctrl+Alt+Enter',
-  click: async () => { const src = BrowserWindow.getFocusedWindow() || mainWindow; await sendSelectionToQuick(src, { mode: SEND_MODE.PLAIN, autoSubmit: true, targetQuickId: null }); }
- },
- {
-  label: 'Send Selection to Specific Quick Chat',
-  accelerator: 'Ctrl+Alt+W',
-  click: async () => { const src = BrowserWindow.getFocusedWindow() || mainWindow; await sendSelectionToSpecificQuickViaDialog(src, { mode: SEND_MODE.PLAIN, autoSubmit: false }); }
- },
- { type: 'separator' },
- {
-  label: 'Select Chat Pane',
-      accelerator: 'Ctrl+Shift+A',
-      click: async () => {
-        const w = BrowserWindow.getFocusedWindow() || mainWindow;
-        if (!w) return;
-        try {
-          const res = await selectChatPane(w);
-          if (!res?.ok) {
-            try { dialog.showErrorBox('Select Chat Pane', 'Could not select the chat pane.'); } catch {}
-          }
-        } catch (err) {
-          console.error('Select Chat Pane failed:', err);
-          try { dialog.showErrorBox('Select Chat Pane failed', String(err?.message || err)); } catch {}
-        }
-      }
-    },
-  ];
-  // Merge our items into the existing Edit menu
-  Menu.buildFromTemplate(template).items.forEach(i => editSubmenu.append(i));
-}
-
-// --- Help menu: add About screen (under the menu bar) ----------------------
-function appendHelpItems(helpSubmenu) {
-  const template = [
-    new MenuItem({
-      label: 'About',
-      // Optional: make F1 open About; change/remove if you already use F1 elsewhere
-      accelerator: 'F1',
-      click: async () => {
-        try {
-          const info = getRuntimeInfo();
-          await dialog.showMessageBox({
-            type: 'info',
-            buttons: ['OK'],
-            defaultId: 0,
-            title: `About ${info.name}`,
-            message: `${info.name}`,
-            detail: info.detail,
-            noLink: true,
-            icon: appIconImage
-          });
-        } catch (err) {
-          console.error('Help→About dialog failed:', err);
-        }
-      }
-    }),
-    new MenuItem({ type: 'separator' }),
-    // (Optional) quick links; uncomment/adjust as needed:
-    // new MenuItem({
-    //   label: 'Documentation',
-    //   click: () => shell.openExternal('https://your.docs.url/')
-    // }),
-    // new MenuItem({
-    //   label: 'Report Issue',
-    //   click: () => shell.openExternal('https://your.issues.url/')
-    // }),
-  ];
-  template.forEach(i => helpSubmenu.append(i));
-}
-
-
-// Augment (mutate) the existing app menu rather than replacing it
-function augmentApplicationMenu(win) {
-  // Start from the current application menu.
-  // NOTE: On Windows/Linux this may be null until first set; handle that.
-  const appMenu = Menu.getApplicationMenu() ?? new Menu();
-
-  // Ensure "File" submenu exists, then append our items
-  let fileSubmenu = appMenu.items.find(i => i.label === 'File')?.submenu;
-  if (!fileSubmenu) {
-    fileSubmenu = new Menu();
-    appMenu.insert(0, new MenuItem({ label: 'File', submenu: fileSubmenu }));
-  }
-  appendFileItems(fileSubmenu, win);
-
-  // Ensure "Edit" submenu exists, then append our items
-  let editSubmenu = appMenu.items.find(i => i.label === 'Edit')?.submenu;
-  if (!editSubmenu) {
-    editSubmenu = new Menu();
-    appMenu.insert(1, new MenuItem({ label: 'Edit', submenu: editSubmenu }));
-  }
-  appendEditItems(editSubmenu);
-
-  // Ensure "Help" submenu exists, then append our items
-  let helpSubmenu = appMenu.items.find(i => i.label === 'Help')?.submenu;
-  if (!helpSubmenu) {
-    helpSubmenu = new Menu();
-    // Place Help at the end for Windows/Linux conventions
-    appMenu.append(new MenuItem({ label: 'Help', submenu: helpSubmenu }));
-  }
-  appendHelpItems(helpSubmenu);
-
-  // Re-apply the mutated menu so the OS picks up changes
-  Menu.setApplicationMenu(appMenu);
-}
-
-function ensureSaveState(win) {
-  if (win && typeof win.__lastSavePath === 'undefined') win.__lastSavePath = null;
-}
-
-function buildContextMenuTemplate(win, params, options = {}) {
-  const {
-    includeQuickChatFeatures = true,
-    includeChatPaneFeatures = true,
-    includeMarkdownExport = true
-  } = options;
-
-  const isEditable = !!params?.isEditable;
-  const hasSelection = !!params?.selectionText && params.selectionText.length > 0;
-
-  const inspectItem = {
-    label: 'Inspect Element',
-    accelerator: 'Ctrl+Shift+C',
-    click: () => {
-      try {
-        win.webContents.inspectElement(params.x, params.y);
-        if (!win.webContents.isDevToolsOpened()) {
-          win.webContents.openDevTools({ mode: 'right' });
-        }
-      } catch (err) {
-        console.error('Inspect failed:', err);
-      }
-    }
-  };
-
-  const template = [
-    { role: 'cut', accelerator: 'Ctrl+X', enabled: isEditable },
-    { role: 'copy', accelerator: 'Ctrl+C', enabled: (hasSelection || isEditable) },
-    { role: 'paste', accelerator: 'Ctrl+V', enabled: isEditable },
-    { type: 'separator' },
-    { role: 'selectAll', accelerator: 'Ctrl+A', enabled: true }
-  ];
-
-  if (includeQuickChatFeatures) {
-    template.push(
-      { type: 'separator' },
-      {
-        label: 'Send to Quick Chat',
-        submenu: buildSendToQuickSubmenu(win, { mode: SEND_MODE.PLAIN, autoSubmit: false })
-      },
-      {
-        label: 'Send as Quote to Quick Chat',
-        submenu: buildSendToQuickSubmenu(win, { mode: SEND_MODE.QUOTE, autoSubmit: false })
-      },
-      {
-        label: 'Send & Auto-Submit to Quick Chat',
-        submenu: buildSendToQuickSubmenu(win, { mode: SEND_MODE.PLAIN, autoSubmit: true })
-      }
-    );
-  }
-
-  if (includeChatPaneFeatures) {
-    template.push(
-      { type: 'separator' },
-      {
-        label: 'Select Chat Pane',
-        accelerator: 'Ctrl+Shift+A',
-        enabled: true,
-        click: async () => {
-          try {
-            const res = await selectChatPane(win);
-            if (!res?.ok) {
-              safeShowError('Select Chat Pane', 'Could not select the chat pane.');
-            }
-          } catch (err) {
-            console.error('Select Chat Pane failed:', err);
-            safeShowError('Select Chat Pane failed', String(err?.message ?? err));
-          }
-        }
-      },
-      {
-        label: 'Save Chat Pane',
-        click: async () => {
-          await promptSaveChatPane(win);
-        }
-      }
-    );
-  }
-
-  if (includeMarkdownExport) {
-    template.push(
-      { type: 'separator' },
-      {
-        label: 'Copy Selection as Markdown',
-        accelerator: 'Ctrl+Shift+M',
-        enabled: hasSelection,
-        click: async () => {
-          try {
-            const result = await buildSelectionMarkdownForExport(win);
-            if (!result?.ok) return;
-            clipboard.writeText(String(result.markdown ?? ''));
-          } catch (err) {
-            console.error('Copy Selection as Markdown failed:', err);
-          }
-        }
-      },
-      {
-        label: 'Save Selection as Markdown',
-        enabled: hasSelection,
-        click: async () => {
-          await saveSelectionAsMarkdown(win);
-        }
-      },
-      {
-        label: 'Save Selection as Plain Text',
-        enabled: hasSelection,
-        click: async () => {
-          await saveSelectionAsPlainText(win);
-        }
-      }
-    );
-  }
-
-  template.push({ type: 'separator' }, inspectItem);
-  return template;
-}
-
-// ---------- Chat pane selection helper ----------
-// Select the entire chat pane content in the renderer and return selection stats
-async function selectChatPane(win) {
-  const js = `
-    (function () {
-      const candidates = ${JSON.stringify(GEMINI_CHAT_ROOT_SELECTORS)};
-      const transcriptSelectors = [
-        'message-content',
-        '.markdown.markdown-main-panel',
-        '[id^="model-response-message-content"]',
-        'structured-content-container',
-        '.model-response-text',
-        '.response-content',
-        '.response-container-content',
-        '.presented-response-container',
-        '.conversation-container',
-        '[class="response-container"]',
-        '[role="article"]',
-        'article',
-        'section',
-        'main'
-      ];
-      function visible(el) {
-        if (!el) return false;
-        const r = el.getBoundingClientRect?.();
-        return !!r && r.width > 0 && r.height > 0;
-      }
-      function textOf(el) {
-        try { return String(el?.innerText || el?.textContent || ''); } catch { return ''; }
-      }
-      function count(el, sel) {
-        try { return el?.querySelectorAll?.(sel)?.length || 0; } catch { return 0; }
-      }
-      function semanticBonus(el) {
-       try {
-        let bonus = 0;
-        if (el.matches?.('message-content, .markdown.markdown-main-panel, [id^="model-response-message-content"]')) bonus += 1400;
-        if (el.matches?.('structured-content-container, .model-response-text')) bonus += 1000;
-        if (el.matches?.('.response-content, .response-container-content, .presented-response-container')) bonus += 700;
-        if (count(el, 'table, .horizontal-scroll-wrapper, .table-block-component, table-block') > 0) bonus += 180;
-        return bonus;
-       } catch {
-        return 0;
-       }
-      }
-      function chromePenalty(el) {
-       try {
-        let penalty = 0;
-        if (el.matches?.(
-         'user-query,' +
-         'user-query-content,' +
-         '.user-query-container,' +
-         '.query-content,' +
-         '.response-footer,' +
-         '.response-container-footer,' +
-         'message-actions,' +
-         'sources-list,' +
-         'tts-control,' +
-         'bard-avatar,' +
-         '.avatar-gutter'
-        )) penalty += 2200;
-        const cls = String(el.className || '');
-        if (/(user-query|prompt|action|button|toolbar|footer|sources-list|message-actions|thumb-|tts-|avatar-gutter)/i.test(cls)) {
-         penalty += 1200;
-        }
-        return penalty;
-       } catch {
-        return 0;
-       }
-      }
-      function editablePenalty(el) {
-        const selfEditable = !!el?.matches?.('textarea, input, [contenteditable="true"], div[role="textbox"]');
-        if (selfEditable) return 2000;
-        return (count(el, 'textarea, input, [contenteditable="true"], div[role="textbox"]') * 900)
-          + (count(el, 'form') * 300)
-          + (count(el, '[role="button"], button') * 8);
-      }
-      function score(el) {
-        if (!el || !visible(el)) return -1;
-        const text = textOf(el).trim();
-        const len = Math.min(text.length, 5000);
-        const articleCount = count(el, '[role="article"], article');
-        const responseCount = count(el, 'message-content, .markdown, [id^="model-response-message-content"], structured-content-container, .model-response-text, .response-content, .response-container-content, .presented-response-container, .conversation-container, [class="response-container"]');
-        const richCount = count(el, 'table, pre, code, ul, ol, blockquote');
-        const scrollable = (() => {
-          try {
-            const cs = getComputedStyle(el);
-            return (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) ? 1 : 0;
-          } catch {
-            return 0;
-          }
-        })();
-        return 1000
-          + Math.min(len, 1600)
-          + (articleCount * 90)
-          + (responseCount * 60)
-          + (richCount * 25)
-          + (scrollable * 50)
-          + semanticBonus(el)
-          - chromePenalty(el)
-          - editablePenalty(el);
-      }
-      const found = [];
-      for (const sel of candidates) {
-        try {
-          document.querySelectorAll(sel).forEach((root) => {
-            found.push(root);
-            transcriptSelectors.forEach((childSel) => {
-              try { root.querySelectorAll(childSel).forEach((el) => found.push(el)); } catch {}
-            });
-          });
-        } catch {}
-      }
-      let best = null;
-      let bestScore = -1;
-      for (const el of found) {
-        const s = score(el);
-        if (s > bestScore) {
-          best = el;
-          bestScore = s;
-        }
-      }
-      if (!best) return { ok: false, selectedTextLength: 0 };
-      try { best.scrollIntoView({ block: 'start', inline: 'nearest' }); } catch {}
-      const sel = window.getSelection?.();
-      if (!sel) return { ok: false, selectedTextLength: 0 };
-      sel.removeAllRanges();
-      const range = document.createRange();
-      range.selectNodeContents(best);
-      sel.addRange(range);
-      const txt = String(sel.toString() || '');
-      return { ok: !!txt.length, selectedTextLength: txt.length };
-    })();
-  `;
-  const results = await executeInAllFrames(win, js);
-  const success = results
-    .map(r => r.value)
-    .filter(v => v?.ok)
-    .sort((a, b) => Number(b.selectedTextLength || 0) - Number(a.selectedTextLength || 0))[0];
-  return success || { ok: false, selectedTextLength: 0 };
-}
-// ---------- Selection → Markdown helpers ----------
-// ---------- Selection → Markdown helpers ----------
-// Extract the current selection from the renderer as HTML fragment and text.
-async function getSelectionFragment(win) {
-
- const result = await win.webContents.executeJavaScript(`
- (function() {
-  const sel = window.getSelection && window.getSelection();
-  if (!sel || sel.rangeCount === 0) {
-   return { hasSelection: false, html: "", text: "" };
-  }
-
-  // Clone selected contents so we never mutate the live DOM
-  const range = sel.getRangeAt(0);
-  const container = document.createElement('div');
-  container.appendChild(range.cloneContents());
-
-  // -------------------------------
-  // DOM CLEANUP (Gemini-specific)
-  // -------------------------------
-
-  // Known non-content UI affordances:
-  // copy buttons, feedback icons, toolbars, hover menus, references
-  const JUNK_SELECTORS = [
-   '[role="button"]',
-   '[class*="button" i]',
-   '[class*="logo" i]',
-   '[class*="label" i]',
-   '[class*="input" i]',
-   'label',
-   'input',
-   'textarea',
-   '[role="textbox"]'
-  ];
-
-  container.querySelectorAll(JUNK_SELECTORS.join(',')).forEach(el => {
-   try { el.remove(); } catch {}
-  });
-
-  // Preserve semantic blocks explicitly (never strip their parents)
-  container.querySelectorAll('pre, code, table, ul, ol').forEach(el => {
-   try { el.setAttribute('data-preserve', 'true'); } catch {}
-  });
-
-  // Remove empty wrapper nodes that add no content,
-  // but do NOT touch semantic structures
-  container.querySelectorAll('div, span').forEach(el => {
-   try {
-    if (
-     !el.textContent.trim() &&
-     !el.querySelector('[data-preserve]') &&
-     !el.querySelector('pre, code, table, ul, ol')
-    ) {
-     el.remove();
-    }
-   } catch {}
-  });
-
-  const html = container.innerHTML;
-  const text = String(sel.toString() || '');
-
-  return { hasSelection: true, html, text };
- })();
- `).catch(() => ({ hasSelection: false, html: "", text: "" }));
-  return result;
-}
-
-// ============================================================================
-// Structured selection -> envelope -> quick chat inject (active OR specific #N)
-// ============================================================================
-async function buildSelectionEnvelope(sourceWin, opts) {
-  const { mode, autoSubmit } = normalizeSendOptions(opts);
-  const src = sourceWin || mainWindow;
-  if (!src || src.isDestroyed()) return null;
-  const { hasSelection, html, text } = await getSelectionFragment(src);
-  if (!hasSelection) return null;
-
-  let content = '';
-  try {
-    content = html ? htmlToMarkdown(html) : String(text || '');
-  } catch {
-    content = String(text || '');
-  }
-
-  if (mode === SEND_MODE.QUOTE) content = quoteify(content);
-
-  const role = src.__geminiRole || (src === mainWindow ? 'main' : 'unknown');
-  const quickId = (typeof src.__quickId === 'number') ? src.__quickId : undefined;
-
-  return {
-    kind: 'inject',
-    mode,
-    content,
-    autoSubmit: !!autoSubmit,
-    meta: {
-      source: 'selection',
-      sourceRole: role,
-      sourceQuickId: quickId,
-      timestamp: Date.now(),
-      format: 'markdown'
-    }
-  };
-}
-
-async function sendSelectionToQuick(sourceWin, opts) {
-  const { targetQuickId } = normalizeSendOptions(opts);
-  const quick = getTargetQuickWindow(targetQuickId, { createIfMissing: true });
-  if (!quick || quick.isDestroyed()) return;
-
-  const envelope = await buildSelectionEnvelope(sourceWin, opts);
-  if (!envelope) return;
-
-  // Clipboard-based path (iframe-safe):
-  // 1) Copy selection content to clipboard
-  // 2) Reveal/focus Quick Chat window
-  // 3) Wait 3 seconds
-  // 4) Paste (Ctrl/Cmd+V)
-  // 5) Optional Enter if autoSubmit
-  try {
-    clipboard.writeText(String(envelope.content || ''));
-  } catch (e) {
-    console.error('clipboard.writeText failed:', e);
-  }
-
-  reveal(quick);
-
-  const wc = quick.webContents;
-  try {
-  if (wc && wc.isLoading && wc.isLoading()) {
-    wc.once('did-finish-load', () => {
-      // Dynamic wait + paste after load completes
-      scheduleQuickPaste(wc, { autoSubmit: !!envelope.autoSubmit }).catch(() => {});
-    });
-    } else {
-    // Dynamic wait + paste immediately if already ready
-    scheduleQuickPaste(wc, { autoSubmit: !!envelope.autoSubmit }).catch(() => {});
-    }
-  } catch {
-    scheduleQuickPaste(wc, { autoSubmit: !!envelope.autoSubmit }).catch(() => {});
-  }
-}
-
-async function sendSelectionToSpecificQuickViaDialog(sourceWin, opts) {
-  const parent = BrowserWindow.getFocusedWindow() || mainWindow;
-  const target = await chooseQuickChatTargetDialog(parent);
-  if (!target) return;
-  const forced = { ...(opts || {}), targetQuickId: target.__quickId };
-  await sendSelectionToQuick(sourceWin, forced);
-}
-
-function buildSendToQuickSubmenu(sourceWin, optsBase) {
-  const ids = listQuickIds();
-  const items = [];
-
-  items.push({
-    label: 'Active Quick Chat',
-    click: async () => sendSelectionToQuick(sourceWin, { ...optsBase, targetQuickId: null })
-  });
-
-  if (ids.length) {
-    items.push({ type: 'separator' });
-    for (const id of ids) {
-      items.push({
-        label: `Quick Chat ${id}`,
-        click: async () => sendSelectionToQuick(sourceWin, { ...optsBase, targetQuickId: id })
-      });
-    }
-  }
-
-  items.push({ type: 'separator' });
-  items.push({ label: 'Choose', click: async () => sendSelectionToSpecificQuickViaDialog(sourceWin, optsBase) });
-  items.push({
-    label: 'New Quick Chat Window',
-    click: async () => {
-      const w = createQuickChatWindow();
-      // Ensure we target the freshly created window so sendSelectionToQuick()
-      // performs clipboard write + reveal + paste scheduling.
-      await sendSelectionToQuick(sourceWin, { ...optsBase, targetQuickId: w?.__quickId ?? null });
-    }
-  });
-  return items;
-}
-
-ipcMain.on(IPC.SEND_SELECTION, async (event, opts) => {
-  const sender = BrowserWindow.fromWebContents(event.sender);
-  const source = (sender && sender.__geminiRole === 'main') ? sender : mainWindow;
-  try { await sendSelectionToQuick(source, opts); }
-  catch (e) { console.error('IPC send selection failed:', e); }
-});
-
-ipcMain.on(IPC.QUICK_NEW, () => {
-  try { reveal(createQuickChatWindow()); }
-  catch (e) { console.error('IPC quick new failed:', e); }
-});
-
-// Turndown-backed HTML → Markdown converter.
-// Regex is only used here for targeted preprocessing/post-processing around Turndown.
-function htmlToMarkdown(html) {
-const turndownService = createTurndownService();
-
-function createTurndownService() {
-  const service = new TurndownService({
-    headingStyle: 'atx',
-    codeBlockStyle: 'indented',
-    fence: '```',
-    bulletListMarker: '-',
-    emDelimiter: '*',
-    strongDelimiter: '**',
-    linkStyle: 'inlined',
-    linkReferenceStyle: 'full',
-    preformattedCode: true,
-  });
-
-  try {
-    const { gfm, tables } = turndownPluginGfm;
-    // Be explicit that tables must go through the GFM table path.
-    if (tables) service.use(tables);
-    if (gfm) service.use(gfm)
-  } catch (err) {
-    console.error('turndown-plugin-gfm setup failed:', err);
-  }
-
-  // Remove obvious non-content / executable elements if any survive renderer cleanup.
-  try {
-    service.remove([
-      'script', 'style', 'noscript', 'template',
-      'button', 'input', 'select', 'textarea',
-      'svg', 'canvas', 'iframe'
-    ]);
-  } catch (err) {
-    console.error('Turndown remove() setup failed:', err);
-  }
-
-  // Emit code blocks as plain text instead of fenced or indented markdown.
-  service.addRule('plainTextCodeBlocks', {
-    filter: 'pre',
-    replacement: function (_content, node) {
-      const codeNode =
-        node.firstElementChild && node.firstElementChild.nodeName === 'CODE'
-          ? node.firstElementChild
-          : node;
-      const raw = String(codeNode.textContent || '')
-        .replace(/\u00A0/g, ' ')
-        .replace(/\r\n?/g, '\n');
-      const body = raw.replace(/^\n+|\n+$/g, '');
-      return `\n\n${body}\n\n`;
-    }
-  });
-
-  // Convert <br> to hard line breaks consistently.
-  service.addRule('hardLineBreak', {
-    filter: 'br',
-    replacement: function () {
-      return '  \n';
-    }
-  });
-
-  // Treat HR explicitly so separators survive cleanup.
-  service.addRule('thematicBreak', {
-    filter: 'hr',
-    replacement: function () {
-      return '\n\n---\n\n';
-    }
-  });
-
-  return service;
-}
-
-function splitMarkdownTableRow(line) {
-  const trimmed = String(line || '').trim();
-  const core = trimmed.replace(/^\|/, '').replace(/\|$/, '');
-  return core.split('|').map(cell => cell.trim());
-}
-
-function isMarkdownTableSeparatorLine(line) {
-  const cells = splitMarkdownTableRow(line);
-  if (!cells.length) return false;
-  return cells.every(cell => /^:?-{3,}:?$/.test(cell));
-}
-
-function isLikelyMarkdownTableBlock(lines) {
-  if (!Array.isArray(lines) || lines.length < 2) return false;
-  const nonEmpty = lines.filter(Boolean);
-  if (nonEmpty.length < 2) return false;
-  if (!nonEmpty[0].includes('|')) return false;
-  if (!isMarkdownTableSeparatorLine(nonEmpty[1])) return false;
-  return nonEmpty.every(line => !line || line.includes('|'));
-}
-
-function formatMarkdownTableBlock(block) {
-  const rawLines = String(block || '')
-    .split('\n')
-    .map(line => line.trim())
-    .filter(Boolean);
-
-  if (!isLikelyMarkdownTableBlock(rawLines)) return block;
-
-  const rows = rawLines.map(splitMarkdownTableRow);
-  const columnCount = Math.max(...rows.map(r => r.length));
-
-  for (const row of rows) {
-    while (row.length < columnCount) row.push('');
-  }
-
-  const widths = new Array(columnCount).fill(3);
-  for (let r = 0; r < rows.length; r += 1) {
-    if (r === 1) continue; // separator row rebuilt below
-    for (let c = 0; c < columnCount; c += 1) {
-      widths[c] = Math.max(widths[c], rows[r][c].length, 3);
-    }
-  }
-
-  const separatorSource = rows[1];
-  const separator = separatorSource.map((cell, idx) => {
-    const left = cell.startsWith(':');
-    const right = cell.endsWith(':');
-    const dashes = '-'.repeat(Math.max(widths[idx], 3));
-    if (left && right) return `:${dashes}:`;
-    if (left) return `:${dashes}`;
-    if (right) return `${dashes}:`;
-    return dashes;
-  });
-
-  const formatted = rows.map((row, rowIdx) => {
-    const cells = (rowIdx === 1 ? separator : row).map((cell, idx) => {
-      const value = rowIdx === 1 ? cell : cell.padEnd(widths[idx], ' ');
-      return ` ${value} `;
-    });
-    return `|${cells.join('|')}|`;
-  });
-
-  return formatted.join('\n');
-}
-
-function normalizeMarkdownTables(md) {
-  const blocks = String(md || '').split(/\n{2,}/);
-  const normalized = blocks.map(block => {
-    const lines = block.split('\n').map(line => line.trimRight());
-    return isLikelyMarkdownTableBlock(lines.filter(Boolean))
-      ? formatMarkdownTableBlock(lines.join('\n'))
-      : block;
-  });
-  return normalized.join('\n\n');
-}
-
-function postProcessMarkdown(md) {
-  return normalizeMarkdownTables(
-    String(md || '')
-    .replace(/\r\n?/g, '\n')
-    .replace(/[ \t]+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .replace(/([^\n])\n(#{1,6}\s)/g, '$1\n\n$2')
-    .replace(/([^\n])\n([-*]\s)/g, '$1\n\n$2')
-    .trim()
-  );
-}
-
-  const preparedHtml = normalizeHtmlForMarkdownShared(html);
-  if (!preparedHtml) return '';
-
-  try {
-    return postProcessMarkdown(turndownService.turndown(preparedHtml));
-  } catch (err) {
-    console.error('Turndown conversion failed; falling back to plain text extraction:', err);
-    const safeHtml = stripExecutableBlocks(decodeEntities(preparedHtml));
-    return postProcessMarkdown(stripTags(safeHtml));
-  }
-}
-
-function stripTags(s) {
-  // Remove any remaining HTML tags; entity decoding is handled earlier
-  return String(s || '')
-    .replace(/<[^>]+>/g, '')
-    .replace(/\u00A0/g, ' '); // non-breaking space → regular space
-}
-
-// --- Centralized sanitizers ---
-function decodeEntities(s) {
-  // Remove any remaining HTML tags; entity decoding is handled earlier when needed.
-  return String(s || '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
-}
-
-function stripExecutableBlocks(input) {
-  if (typeof input !== 'string') return input;
-  // Real <script>/<style>
-  const reScriptTags = /<script[\s\S]*?<\/script>/gi;
-  const reStyleTags  = /<style[\s\S]*?<\/style>/gi;
-
-  // Entity-encoded &lt;script&gt;/&lt;style&gt; (in case source was pre-escaped)
-  const reEscScript  = /&lt;script[\s\S]*?&lt;\/script&gt;/gi;
-  const reEscStyle   = /&lt;style[\s\S]*?&lt;\/style&gt;/gi;
-
-  let out = input.replace(reScriptTags, '')
-                 .replace(reStyleTags, '')
-                 .replace(reEscScript, '')
-                 .replace(reEscStyle, '');
-
-  // Optional: strip inline event handlers like onclick="...", onload='...'
-  out = out.replace(/\son\w+=(?:"[^"]*"|'[^']*')/gi, '');
-  return out;
-}
-async function buildSelectionMarkdownForExport(win) {
- try {
-  if (!win) return { ok: false, markdown: '', reason: 'no-window' };
-  let html = '';
-  let text = '';
-  let hasSelection = false;
-  try {
-   const sel = await getSelectionFragment(win);
-   hasSelection = !!sel?.hasSelection;
-   html = String(sel?.html ?? '');
-   text = String(sel?.text ?? '');
-  } catch {}
-  if (!hasSelection) {
-   return { ok: false, markdown: '', reason: 'no-selection' };
-  }
-  // If the current selection is effectively the whole chat pane, prefer the
-  // widened snapshot export path used by Save Chat Pane.
-  let exportHtml = html;
-  try {
-   const selectedLen = String(text ?? '').trim().length;
-   const pane = await buildChatPaneExportSnapshot(win);
-   const paneTextLen = Number(pane?.diagnostics?.textLength ?? 0);
-   if (pane?.ok && paneTextLen > 0 && selectedLen > 0) {
-    const ratio = selectedLen / paneTextLen;
-    if (ratio >= 0.80) {
-     exportHtml = String(pane?.html ?? html ?? '');
-    }
-   }
-  } catch {}
-  return {
-   ok: true,
-   markdown: htmlToMarkdown(exportHtml || text),
-   reason: 'ok'
-  };
- } catch (err) {
-  console.error('buildSelectionMarkdownForExport failed:', err);
-  return { ok: false, markdown: '', reason: String(err?.message ?? err) };
- }
-}
-
-// --- Save selection as Plain Text helper ---
-async function saveSelectionAsPlainText(win) {
-  try {
-    if (!win) return;
-    const { hasSelection: ok, html, text } = await getSelectionFragment(win);
-    if (!ok) {
-      safeShowError('Save Selection as Text', 'No selection found.');
-      return;
-    }
-    const safeHtml = stripExecutableBlocks(decodeEntities(html || text));
-    let plain = stripTags(safeHtml)
-      .replace(/[ \t]+\n/g, '\n')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-    const { filePath, canceled } = await dialog.showSaveDialog(win, {
-      title: 'Save Selection as Plain Text',
-      defaultPath: 'selection.txt',
-      filters: [{ name: 'Plain Text', extensions: ['txt'] }]
-    });
-    if (canceled || !filePath) return;
-    await fs.promises.writeFile(filePath, plain, 'utf8');
-  } catch (err) {
-    console.error('Save Selection as Plain Text failed:', err);
-    safeShowError('Save failed', String(err?.message ?? err));
-  }
-}
-
-// --- Save selection as Markdown helper ---
-async function saveSelectionAsMarkdown(win) {
-  try {
-    if (!win) return;
-    const result = await buildSelectionMarkdownForExport(win);
-    if (!result?.ok) {
-     try { dialog.showErrorBox('Save Selection as Markdown', 'No selection found.'); } catch {}
-     return;
-    }
-    const md = String(result.markdown ?? '');
-    const { filePath, canceled } = await dialog.showSaveDialog(win, {
-      title: 'Save Selection as Markdown',
-      defaultPath: 'selection.md',
-      filters: [{ name: 'Markdown', extensions: ['md'] }]
-    });
-    if (canceled || !filePath) return;
-    await fs.promises.writeFile(filePath, md, 'utf8');
-  } catch (err) {
-    console.error('Save Selection as Markdown failed:', err);
-    try { dialog.showErrorBox('Save failed', String(err?.message || err)); } catch {}
-  }
-}
-
-// ---------- Chat pane save helpers ----------
-// A) Hide everything except the chat pane, then savePage (HTMLOnly/MHTML)
-async function saveOnlyPaneWithSavePage(win, filePath, format /* 'HTMLOnly' | 'MHTML' */) {
-  // Make everything except the chat invisible but still laid out.
-  // Using opacity/pointer-events instead of display:none helps virtualized lists keep measurements,
-  // reducing "white page" issues when saving.
-  const css = `
-    html, body {
-      overflow: auto !important;
-      background: #ffffff !important;
-    }
-    *:not(${CHAT_SELECTOR}):not(${CHAT_SELECTOR} *) {
-      opacity: 0 !important;
-      pointer-events: none !important;
-    }
-    ${CHAT_SELECTOR} {
-      opacity: 1 !important;
-      pointer-events: auto !important;
-      width: 100% !important;
-      max-width: 100% !important;
-    }
-  `;
-
-  let key = null;
-  try {
-    key = await win.webContents.insertCSS(css);
-  } catch (_) {}
-  try {
-    // Give the style a tick to apply before saving
-    await new Promise(r => setTimeout(r, 150));
-    await win.webContents.savePage(filePath, format);
-  } finally {
-    if (key) {
-      try { await win.webContents.removeInsertedCSS(key); } catch {}
-    }
-  }
-}
-
-// B) Extract chat pane HTML and write a standalone file
-async function savePaneAsStandaloneHTML(win, filePath) {
-  const url = win.webContents.getURL();
-  let origin = '';
-  try { origin = new URL(url).origin; } catch {}
-  const result = await win.webContents.executeJavaScript(`
-    (function() {
-      const el = document.querySelector('${CHAT_SELECTOR}');
-      if (!el) return { ok:false, html:'', title: document.title };
-      return { ok:true, html: el.outerHTML, title: document.title };
-    })();
-  `);
-  const htmlDoc = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${(result && result.title) ? result.title : 'Gemini Chat'}</title>
-  <style>
-    html, body { margin: 0; padding: 0; }
-    ${CHAT_SELECTOR} { width: 100%; max-width: 100%; }
-  </style>
-</head>
-<body>
-${(result && result.html) ? result.html : '<p>Chat pane not found.</p>'}
-</body>
-</html>`;
-  await fs.promises.writeFile(filePath, htmlDoc, 'utf8');
-}
-
-// B2) Clean HTML export: strip noisy classes/styles and add minimal readable CSS
-async function savePaneAsCleanHTML(win, filePath) {
-  const result = await win.webContents.executeJavaScript(`
-    (function() {
-      const root = document.querySelector('${CHAT_SELECTOR}');
-      if (!root) return { ok:false, title: document.title, html:'' };
-      // clone and sanitize
-      const clone = root.cloneNode(true);
-      // remove hashed classes & inline styles (keeps text content)
-      clone.querySelectorAll('[class]').forEach(n => n.removeAttribute('class'));
-      clone.querySelectorAll('[style]').forEach(n => n.removeAttribute('style'));
-      // remove noisy attributes
-      clone.querySelectorAll('*').forEach(n => {
-        // drop data-* and aria-* and role, tabindex
-        [...n.attributes].forEach(a => {
-          const name = a.name.toLowerCase();
-          if (name.startsWith('data-') || name.startsWith('aria-') || name === 'role' || name === 'tabindex') {
-            n.removeAttribute(a.name);
-          }
-          // drop ephemeral ids except the root
-          if (name === 'id' && n !== clone) n.removeAttribute('id');
-        });
-      })
-      // remove empty containers to reduce noise
-      clone.querySelectorAll('div').forEach(n => { if (!n.textContent.trim()) n.remove(); });
-      // attempt to keep message semantics if present
-      // (optional heuristics can be added here)
-      return { ok:true, title: document.title, html: clone.innerHTML };
-    })();
-  `);
-  const htmlDoc = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${result.title || 'Gemini Chat'}</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 20px; line-height: 1.5; color: #222; }
-    h1,h2,h3,h4,h5 { margin: 0.6em 0 0.3em; }
-    p { margin: 0.4em 0; }
-    .message { margin-bottom: 12px; }
-    .user { font-weight: 600; color: #333; }
-    .gemini { color: #004b9a; }
-    /* Generic content spacing */
-    ul,ol { margin: 0.4em 0 0.4em 1.2em; }
-    pre, code {
-      font-family: Consolas, Menlo, monospace;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      word-break: break-word;
-      max-width: 100%;
-    }
-    pre {
-      background: #f5f7fa;
-      border: 1px solid #e3e7ee;
-      padding: 10px;
-      border-radius: 6px;
-      overflow-x: hidden;
-      width: 100%;
-      box-sizing: border-box;
-    }
-    blockquote { border-left: 3px solid #cbd5e1; margin: 0.4em 0; padding: 0.2em 0.8em; color: #555; }
-    table { border-collapse: collapse; width: 100%; table-layout: fixed; }
-    td, th {
-      border: 1px solid #e5e7eb;
-      padding: 6px 8px;
-      white-space: normal;
-      overflow-wrap: anywhere;
-      word-break: break-word;
-      vertical-align: top;
-    }
-    /* Make top-level container stretch full width */
-    ${CHAT_SELECTOR} { width: 100%; max-width: 100%; }
-  </style>
-  <!-- NOTE: This cleaned export removes hashed classes/inline styles for readability. -->
-</head>
-<body>
-${result.html || '<p>No chat content found.</p>'}
-</body>
-</html>`;
-  await fs.promises.writeFile(filePath, htmlDoc, 'utf8');
-}
-
-// Unified chooser by extension
-async function saveChatPaneByExtension(win, filePath) {
-  const lower = String(filePath).toLowerCase();
-  if (lower.endsWith('.html')) {
-    // Use cleaned fragment (B2)
-    await savePaneAsCleanHTML(win, filePath);
-  } else if (lower.endsWith('.mhtml')) {
-    // Use savePage with hide-CSS (A)
-    await saveOnlyPaneWithSavePage(win, filePath, 'MHTML');
-   } else if (lower.endsWith('.md') || lower.endsWith('.markdown')) {
-     // New: export whole chat pane to Markdown
-     await saveChatPaneAsMarkdown(win, filePath);
-  } else if (lower.endsWith('.txt')) {
-    // New: export whole chat pane to Plain Text
-    await saveChatPaneAsText(win, filePath);
-  } else {
-    // Default: cleaned fragment HTML
-    await savePaneAsCleanHTML(win, filePath);
-  }
-}
-
-// --- Shared helper: prompt to Save Chat Pane (HTML or MHTML) ---
-async function promptSaveChatPane(win) {
-  if (!win) return;
-  try {
-    const { filePath, canceled } = await dialog.showSaveDialog(win, {
-      title: 'Save Chat Pane As',
-      defaultPath: 'gemini-chat.md',  // Default to Markdown file name
-      // Put Markdown first so it's the preselected filter
-      filters: [
-        { name: 'Markdown', extensions: ['md', 'markdown'] },
-        { name: 'Web Page, HTML (clean)', extensions: ['html'] },
-        { name: 'Web Archive (MHTML)', extensions: ['mhtml'] },
-        { name: 'Plain Text', extensions: ['txt'] }
-      ],
-    });
-    if (canceled || !filePath) return;
-    await saveChatPaneByExtension(win, filePath);
-    // Optionally remember for plain "Save"
-    win.__lastSavePath = filePath;
-  } catch (err) {
-    console.error('Save Chat Pane failed:', err);
-    try { dialog.showErrorBox('Save failed', String(err?.message || err)); } catch {}
-  }
-}
-
-// --- New helper: save whole chat pane as Markdown ---
-async function saveChatPaneAsMarkdown(win, filePath) {
-  if (!win) return;
-  try {
-    const snapshot = await buildChatPaneExportSnapshot(win);
-    if (!snapshot?.ok) {
-      try { dialog.showErrorBox('Save Chat Pane as Markdown', 'Chat pane not found.'); } catch {}
-      return;
-    }
-
-    // Convert cleaned semantic HTML → Markdown
-    // (No entity decoding; structure already preserved)
-    const paneHtml = String(snapshot.html || '');
-
-    // IMPORTANT:
-    // Gemini renders diff lines as separate block elements (div/span)
-    // with NO newline text nodes. Inject newlines between blocks so
-    // diffs and code retain line structure.
-    const withLineBreaks = paneHtml.replace(/></g, '>\n<');
-    const safeHtml = stripExecutableBlocks(withLineBreaks);
-    const normalizedHtml = normalizeHtmlForMarkdownShared(safeHtml);
-    const md = htmlToMarkdown(safeHtml);
-    await fs.promises.writeFile(filePath, md, 'utf8');
-    } catch (err) {
-      console.error('Save Chat Pane as Markdown failed:', err);
-    try { dialog.showErrorBox('Save failed', String(err?.message || err)); } catch {}
-  }
-}
-
-async function saveChatPaneAsText(win, filePath) {
-  if (!win) return;
-  try {
-    const result = await win.webContents.executeJavaScript(`
-      (function() {
-        const el = (function(){ try { return document.querySelector('main.chat-app') || document.querySelector('[data-test-id="chat-app"]') || document.querySelector('${CHAT_SELECTOR}') || document.body; } catch { return document.body; } })();
-        if (!el) return { ok:false, html:'', title: document.title };
-        return { ok:true, html: el.innerHTML, title: document.title };
-      })();
-    `);
-    if (!result?.ok) {
-      try { dialog.showErrorBox('Save Chat Pane as Text', 'Chat pane not found.'); } catch {}
-      return;
-    }
-    // Convert pane HTML → Plain Text: decode → sanitize → strip tags → normalize
-    const paneHtml = String(result.html || '');
-    const safeHtml = stripExecutableBlocks(decodeEntities(paneHtml));
-    let text = stripTags(safeHtml);
-    // normalize whitespace: collapse >2 newlines, trim trailing spaces
-    text = text
-      .replace(/[ \t]+\n/g, '\n')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-    await fs.promises.writeFile(filePath, text, 'utf8');
-  } catch (err) {
-    console.error('Save Chat Pane as Text failed:', err);
-    try { dialog.showErrorBox('Save failed', String(err?.message || err)); } catch {}
-  }
-}
-
-async function saveChatAsPDF(win, filePath) {
-  const pdf = await win.webContents.printToPDF({ printBackground: true, marginsType: 1 });
-  await fs.promises.writeFile(filePath, pdf);
-}
-
-// ---------- File menu (Save / Save As) ----------
-function appendFileItems(fileSubmenu, win) {
-  ensureSaveState(win);
-  const items = [
-    new MenuItem({ type: 'separator' }),
-    new MenuItem({
-      label: 'Save Chat Pane',
-      accelerator: 'Ctrl+S',
-      click: async () => {
-        try { await promptSaveChatPane(win); }
-        catch (err) {
-          console.error('File→Save Chat Pane failed:', err);
-          try { dialog.showErrorBox('Save failed', String(err?.message || err)); } catch {}
-        }
-      }
-    }),
-    new MenuItem({
-      label: 'Save Selection as Markdown',
-      accelerator: 'Ctrl+Shift+M',
-      click: async () => {
-        try { await saveSelectionAsMarkdown(win); }
-        catch (err) {
-          console.error('File→Save Selection as Markdown failed:', err);
-          try { dialog.showErrorBox('Save failed', String(err?.message || err)); } catch {}
-        }
-      }
-    }),
-    new MenuItem({
-      label: 'Toggle DevTools',
-      accelerator: 'Ctrl+Shift+I',
-      click: () => {
-        try { if (mainWindow) mainWindow.webContents.toggleDevTools(); }
-        catch (err) { console.error('Toggle DevTools failed:', err); }
-      }
-    }),
-//    new MenuItem({ type: 'separator' }),
-    // Use role for native Quit (macOS label/shortcut handled automatically)
-//    new MenuItem({ role: 'quit' }),
-  ];
-  items.forEach(i => fileSubmenu.append(i));
-}
-
-async function saveAsDialog(win) {
-  const { filePath, canceled } = await dialog.showSaveDialog(win, {
-    title: 'Save Page As',
-    defaultPath: 'gemini.html',
-    filters: [
-      { name: 'Web Page, HTML only', extensions: ['html'] },
-      { name: 'Web Archive (MHTML)', extensions: ['mhtml'] },
-    ],
-  });
-
-  if (canceled || !filePath) return;
-
-  const format = filePath.toLowerCase().endsWith('.mhtml') ? 'MHTML' : 'HTMLOnly';
-  await win.webContents.savePage(filePath, format);
-
-  // Remember for plain "Save"
-  win.__lastSavePath = filePath;
-}
-// ---------- end File menu ----------
-
-function createWindow() {
-  // Clean up any existing window first
-  if (mainWindow) return; // do not destroy/recreate unless needed
-
- const taIcon = nativeImage.createFromPath(getIconPath('gemini-for-linux.png'));
- /*     console.log('Native path resolved:', taIcon); // Echo to terminal
- if (taIcon.isEmpty()) {
-  console.error('ICON FAILED TO LOAD path is wrong or file corrupted');
- } else {
-  console.log('ICON LOADED SUCCESSFULLY');
-  console.log('Size:', taIcon.getSize());           // → { width: 512, height: 512 }
-  console.log('Has alpha channel:', taIcon.hasAlpha?.() ?? true);
- }
-*/
-  // Cache app icon & tray sizes once
-  if (!appIconImage || appIconImage.isEmpty()) {
-    appIconImage = taIcon;
-  }
-  if (!trayImage24 || trayImage24.isEmpty?.()) {
-    try { trayImage24 = taIcon.resize({ width: 24, height: 24 }); } catch {}
-  }
-
-  // Compute initial bounds from persisted state (if any)
-  const boundsKey = 'main';
-  // Compute initial bounds from persisted state (if any)
-  const initialBounds = getInitialWindowBounds(boundsKey);
-  // Assign to the outer-scoped variable (do NOT redeclare with const here)
-  mainWindow = new BrowserWindow({
-  skipTaskbar: false,
-  title: 'Gemini Main Chat',
-    width: initialBounds.width,
-    height: initialBounds.height,
-    x: typeof initialBounds.x === 'number' ? initialBounds.x : undefined,
-    y: typeof initialBounds.y === 'number' ? initialBounds.y : undefined,
-    show: false, // start hidden; control via tray
-//    icon: path.join(__dirname, 'assets', 'gemini-for-linux.png'), // used for window/taskbar on Linux
-    icon: appIconImage || taIcon, // cached if available
-    webPreferences: {
-      nodeIntegration: false,      // renderer cannot use Node APIs
-      contextIsolation: true,      // safer: isolates preload from page
-      preload: path.join(__dirname, 'preload.js'), // optional: expose safe APIs
-      partition: GEMINI_PARTITION,
-      devTools: true,
-      backgroundThrottling: true,   // reduce CPU when hidden
-      spellcheck: false            // disable if not required
-    },
-    // Linux-specific: ensure proper window identification
-    type: 'normal',
-    // Help with focus stealing prevention
-    autoHideMenuBar: false
-
-  });
-
-  // Ensure menu bar is visible so users can access Edit → Find
-  mainWindow.setMenuBarVisibility(true);
-
-  // --- Right-click native context menu with Cut/Copy/Paste/SelectAll ---
-  const baseContextMenu = Menu.buildFromTemplate([
-    { role: 'cut',        accelerator: 'Ctrl+X', enabled: false },
-    { role: 'copy',       accelerator: 'Ctrl+C', enabled: false },
-    { role: 'paste',      accelerator: 'Ctrl+V', enabled: false },
-    { type: 'separator' },
-    { role: 'selectAll',  accelerator: 'Ctrl+A', enabled: true  },
-  ]);
-
-  function popupContext(win, params) {
-    const menu = Menu.buildFromTemplate(
-      buildContextMenuTemplate(
-        win,
-        {
-          ...params,
-          selectionText: params?.selectionText ?? (params?.hasSelection ? 'x' : '')
-        },
-        {
-          includeQuickChatFeatures: false,
-          includeChatPaneFeatures: false,
-          includeMarkdownExport: false
-        }
-      )
-    );
-    menu.popup({ window: win });
-  }
-
-  // Guard against duplicate registrations
-  if (!ipcMain.listenerCount('show-context-menu')) {
-    ipcMain.on('show-context-menu', (event, params) => {
-    const win = BrowserWindow.fromWebContents(event.sender);
-    if (!win) return;
-    popupContext(win, params);
-    });
-  }   
-  // --- end context menu ---
-
-  mainWindow.setIcon(appIconImage || taIcon);
-
-  // If you initially create hidden:
-  mainWindow.once('ready-to-show', () => {
-  reveal(mainWindow);
-  try { mainWindow.__geminiRole = 'main'; } catch {}
-  try { mainWindow.__boundsKey = boundsKey; } catch {}
-  setRoleTitle(mainWindow, 'main');
-  augmentApplicationMenu(mainWindow);  // Augment the existing app menu with our File/Edit items
-  });
-  // Safety in case it was toggled elsewhere:
-  mainWindow.setSkipTaskbar(false);
-
-  // Attach 'did-stop-loading' exactly once for this webContents.
-  ensureDidStopLoadingHandler(mainWindow.webContents);
-
-  // Electron internally attaches temporary did-stop-loading listeners
-  // during executeJavaScript(); this is expected for SPA apps.
-  mainWindow.webContents.setMaxListeners(0);
-  // OPTIONAL: uncomment this to trace *where* extra listeners are being added:
-  // const _origOn = mainWindow.webContents.on.bind(mainWindow.webContents);
-  // mainWindow.webContents.on = (evt, fn) => { if (evt === 'did-stop-loading') console.trace('[TRACE] did-stop-loading on()'); return _origOn(evt, fn); };
-
-  mainWindow.loadURL(GEMINI_URL); // Load your app
-
-  try {
-    mainWindow.webContents.once('did-stop-loading', () => {
-      // Next tick ensures Chromium has painted once
-      setTimeout(() => {
-        try { applyMaxLayoutCSS(mainWindow); }
-        catch (e) { console.error('applyMaxLayoutCSS (deferred) failed:', e); }
-      }, 0);
-    });
-  } catch (e) {
-    console.error('applyMaxLayoutCSS quick defer wiring failed:', e);
-  }
-
-
-//  try { applyDynamicWidth(mainWindow); } catch (e) { console.error('applyDynamicWidth failed:', e); }
-////  try { attachVWResize(mainWindow); } catch (e) { console.error('attachVWResize failed:', e); }
-//  try { requestExpandedLayout(mainWindow); } catch (e) { console.error('requestExpandedLayout (outer) failed:', e); }
-
-  // Build native context menu purely from main, based on Chromium's params
-
-  // Keep the 'did-stop-loading' handler singular when SPA navigations occur.
-  mainWindow.webContents.on('did-start-navigation', () => {
-////    try { attachVWResize(mainWindow); } catch {}
-  });
-  mainWindow.webContents.on('destroyed', () => {
-    try { mainWindow?.webContents?.removeListener('did-stop-loading', onDidStopLoading);
-      if (mainWindow?.webContents) {
-        delete mainWindow.webContents.__hasDidStopLoadingHandler;
-      }
-    } catch {}
-  });
-
-  mainWindow.webContents.on('context-menu', (_event, params) => {
-    let menu;
-    try { 
-      menu = Menu.buildFromTemplate(
-        buildContextMenuTemplate(mainWindow, params, {
-          includeQuickChatFeatures: true,
-          includeChatPaneFeatures: true,
-          includeMarkdownExport: true
-        })
-      );
-    }
-    catch (err) {
-      console.error('Context menu template error:', err);
-      const hasSelection = !!params?.selectionText && params.selectionText.length > 0;
-      menu = Menu.buildFromTemplate([{ role: 'copy', enabled: hasSelection }, { role: 'selectAll' }]);
-    }
-    try { menu.popup({ window: mainWindow }); }
-    catch (err) { console.error('Context menu popup failed:', err); }
-  });
-
-  // Control external links safely
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => (
-    shell.openExternal(url), // open in default browser
-    { action: 'deny' }       // block new Electron window
-  ));
-
-  // Optional: monitor find results (count, active match); useful for logging or future UI
-  mainWindow.webContents.on('found-in-page', (event, result) => {
-    // result = { requestId, activeMatchOrdinal, matches, selectionArea, finalUpdate }
-    // You can log or use this info to show status in a future overlay.
-    // console.log('find:', result);
-  });
-
-  // Handle Find modal events (parent-aware)
-  if (!ipcMain.listenerCount('find-modal-submit')) {
-    ipcMain.on('find-modal-submit', (event, payload) => {
-    const wc = getWCFromEventSender(event.sender); if (!wc) return;
-    const term = String(payload?.term || '').trim();
-    const matchCase = !!payload?.matchCase;
-    if (!term) return;
-    const isNewTerm = term !== lastFindTerm;
-    lastFindTerm = term;
-
-    // Clear old highlights when starting a new term
-    if (isNewTerm) {
-      wc.stopFindInPage('clearSelection');
-    }
-
-    lastFindOpts = applyWordStartOptions({
-      ...lastFindOpts,
-      matchCase,
-      // IMPORTANT: seed new search with findNext: false, continue with true
-      findNext: isNewTerm ? false : true,
-      forward: (payload?.kind !== 'prev')
-    });
-    clearTimeout(findDebounce);
-    findDebounce = setTimeout(() => {
-      try {
-        wc.findInPage(lastFindTerm, lastFindOpts);
-      } catch (_) {
-        // ignore
-      }
-    }, FIND_DEBOUNCE_MS);
-    });
-  }
-
-  ipcMain.on('find-modal-clear', (event) => {
-    const wc = getWCFromEventSender(event.sender); if (!wc) return;
-    wc.stopFindInPage('clearSelection');
-  });
-
-  ipcMain.on('find-modal-close', () => {
-    if (findModal && !findModal.isDestroyed()) { findModal.close(); }
-    findModal = null;
-  });
-
-  // Quick keyboard passthrough for Esc to clear highlights even without menu activation
-  
-  mainWindow.webContents.on('before-input-event', (event, input) => {
-    if (input.type === 'keyDown' && input.control && input.alt) {
-      if (input.key === '=' || input.key === '+') {
-        event.preventDefault();
-        try { mainWindow.webContents.executeJavaScript('(function(){const cur=window.__gemini_getTargetVW?.() ?? ${VW_SIZE}; window.__gemini_setTargetVW?.(cur+5);})()'); } catch {}
-      }
-      if (input.key === '-') {
-        event.preventDefault();
-        try { mainWindow.webContents.executeJavaScript('(function(){const cur=window.__gemini_getTargetVW?.() ?? ${VW_SIZE}; window.__gemini_setTargetVW?.(cur-5);})()'); } catch {}
-      }
-    }
-    if (input.type === 'keyDown' && input.key === 'Escape') {
-      const wc = mainWindow.webContents;
-      if (wc) wc.stopFindInPage('clearSelection');
-    }
-  });
-
-  // Persist window state on move/resize; debounce to avoid churn
-  mainWindow.on('resize', () => scheduleSaveWindowState(mainWindow, boundsKey));
-  mainWindow.on('move', () => scheduleSaveWindowState(mainWindow, boundsKey));
-  // Also persist just before quit or close (in case of no recent move/resize)
-  mainWindow.on('close', () => scheduleSaveWindowState(mainWindow, boundsKey));
-
-  // Optional: hide instead of close when user closes window
-  mainWindow.on('close', (e) => {
-    if (!isQuitting) {
-      e.preventDefault();
-      mainWindow.hide();
-    }
-  });
-
-
-  // Defensive: recreate window if it gets destroyed unexpectedly
-  mainWindow.on('closed', () => {
-    mainWindow = null;
-  });
-}
-
-function getIconPath(filename) {
-  // Handle both development and packaged environments
-//  const basePath = __dirname;
-  const basePath = app.getAppPath(); 
-  const iconPath = path.join(basePath, 'assets', filename);
-  
-  // For packaged apps, try the asar-unpacked path first
-  if (app.isPackaged) {
-    const asarPath = path.join(process.resourcesPath, 'app.asar.unpacked', 'assets', filename);
-    if (require('fs').existsSync(asarPath)) {
-
-//      console.log('Icon path resolved:', asarPath); // Echo to terminal
-
-      return asarPath;
-    }
-  }
-
-//      console.log('Icon path resolved:', iconPath); // Echo to terminal  
-  return iconPath;
-}
-
-function createTray() {
-  // Use a 24x24 or 32x32 PNG for Cinnamon panel
-  const iconPath = getIconPath('gemini-for-linux.png');
-
-  // Validate path during development (optional)
- //  console.log('Tray icon exists?', require('fs').existsSync(iconPath));
-
-
-  const trayImage = trayImage24 || nativeImage.createFromPath(iconPath);
-  const smallImage = trayImage.isEmpty ? null : trayImage.resize({ width: 24, height: 24 });
-
-  // Fall back to app icon if tray image is missing
-  tray = new Tray(smallImage || appIconImage || nativeImage.createFromPath(path.join(__dirname, 'assets', 'gemini-for-linux.png')));
-
-  tray.setToolTip('Gemini for Linux');
-
-  const contextMenu = Menu.buildFromTemplate([
-    {
-      label: 'Show',
-      click: () => { if (mainWindow) reveal(mainWindow); }
-    },
-    {
-      label: 'Hide',
-      click: () => { if (mainWindow) mainWindow.hide(); }
-    },
-    { type: 'separator' },
-
-    // ---- NEW: About item ----
-    {
-      label: 'About',
-      click: async () => {
-        const info = getRuntimeInfo();
-        try {
-          await dialog.showMessageBox({
-            type: 'info',
-            buttons: ['OK'],
-            defaultId: 0,
-            title: `About ${info.name}`,
-            message: `${info.name}`,
-            detail: info.detail,
-            noLink: true,
-            icon: appIconImage
-          });
-        } catch (err) {
-          console.error('About dialog failed:', err);
-        }
-      }
-    },
-
-    { type: 'separator' },
-    {
-      label: 'Quit',
-      click: () => {
-        isQuitting = true; // so close handler doesn’t re-hide
-        app.quit();
-      }
-    }
-  ]);
-
-  tray.setContextMenu(contextMenu);
-
-  // Left-click toggles window visibility
-  tray.on('click', () => {
-    if (!mainWindow) return;
-    if (mainWindow.isVisible()) {
-      mainWindow.hide();
-    } else {
-      reveal(mainWindow);
-    }
-  });
-}
-
 app.whenReady().then(() => {
-  createWindow();
-  createTray();
-//  createAppMenu();
-
-  // macOS re-activation guard (harmless on Linux)
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
-    else if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
-
-  });
+    createWindow();
+    createTray();
+    directOpen.registerDirectOpenDownloadHandler();
+    directOpen.registerDirectOpenIpcHandler(IPC);
+    app.on('activate', () => {
+        if (BrowserWindow.getAllWindows().length === 0) createWindow();
+        else if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
+    });
 });
 
-// Keep the app running in the tray when all windows are closed
-app.on('window-all-closed', () => {
-  // Do not quit on Linux; keep tray resident
-  // If you want to quit on non-Linux:
-  // if (process.platform !== 'linux') app.quit();
-});
+app.on('window-all-closed', () => { /* keep tray resident */ });
 
 app.on('before-quit', () => {
-  isQuitting = true;
-  try {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.executeJavaScript(`(function(){
-        try {
-          if (window.__gemini_layoutObserver) {
-            window.__gemini_layoutObserver.disconnect();
-            window.__gemini_layoutObserver = null;
-          }
-        } catch {}
-      })();`).catch(() => {});
-    }
-  
-  // Best-effort: close quick windows on quit
-  try {
-    for (const w of quickChatWindows) {
-      try { if (w && !w.isDestroyed()) w.destroy(); } catch {}
-    }
-  } catch {}
-} catch {}
+    isQuitting = true;
+    try {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.executeJavaScript(`(function(){
+                try {
+                    if (window.__gemini_layoutObserver) {
+                        window.__gemini_layoutObserver.disconnect();
+                        window.__gemini_layoutObserver = null;
+                    }
+                } catch {}
+            })();`).catch(() => {});
+        }
+        try { initQuickChat().closeAllQuickChatWindows(); } catch {}
+    } catch {}
 });
-
