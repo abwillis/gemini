@@ -4,6 +4,7 @@
 const { app, BrowserWindow, Menu, MenuItem, Tray, nativeImage, shell, ipcMain, dialog, screen, clipboard, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const util = require('util');
 
 const { createIPC } = require('./lib/ipc');
 // === App-specific modules ===
@@ -42,16 +43,14 @@ const { createExporters, EXPORT_SCOPES } = require('./lib/exporters');
 const APP_LABEL = 'Gemini';
 const APP_SLUG  = 'gemini';
 
-let GEMINI_URL       = 'https://gemini.google.com';
-let GEMINI_PARTITION = String(process.env.GEMINI_PARTITION ?? 'persist:gemini-for-linux').trim();
-
 const IPC = createIPC(APP_SLUG);
 
 const SEND_MODE = Object.freeze({ PLAIN: 'plain', QUOTE: 'quote' });
+const LAYOUT_OBSERVER_GLOBAL = '__gemini_layoutObserver';
 
 const DEFAULT_APP_CONFIG = Object.freeze({
-    appUrl: GEMINI_URL,
-    partition: GEMINI_PARTITION,
+    appUrl: 'https://gemini.google.com',
+    partition: String(process.env.GEMINI_PARTITION ?? 'persist:gemini-for-linux').trim(),
     enableLayoutCss: true,
     enableDirectOpen: true,
     enableQuickChat: true,
@@ -66,11 +65,32 @@ const DEFAULT_APP_CONFIG = Object.freeze({
     logFileName: 'gemini-for-linux.log',
 });
 
+let GEMINI_URL = DEFAULT_APP_CONFIG.appUrl;
+let GEMINI_PARTITION = DEFAULT_APP_CONFIG.partition;
+
 let APP_CONFIG = { ...DEFAULT_APP_CONFIG };
+const ORIGINAL_CONSOLE = Object.freeze({
+    log: console.log.bind(console),
+    info: console.info.bind(console),
+    debug: console.debug.bind(console),
+    warn: console.warn.bind(console),
+    error: console.error.bind(console),
+});
+let consoleLoggingEnabled = true;
+let fileLoggingEnabled = false;
+let activeLogFilePath = null;
+let isWritingLogFile = false;
 
 // ============================================================================
-// Config file — auto-create, load, merge with defaults
+// Config/logging normalization
 // ============================================================================
+function sanitizeLogFileName(name) {
+    return String(name || DEFAULT_APP_CONFIG.logFileName)
+        .trim()
+        .replace(/[^a-zA-Z0-9._-]/g, '-')
+        || DEFAULT_APP_CONFIG.logFileName;
+}
+
 function getConfigFilePath() {
     return path.join(app.getPath('userData'), 'config.json');
 }
@@ -78,110 +98,146 @@ function getConfigFilePath() {
 function getLogFilePath() {
     const logsDir = path.join(app.getPath('userData'), 'logs');
     try { fs.mkdirSync(logsDir, { recursive: true }); } catch {}
-    return path.join(logsDir, APP_CONFIG.logFileName || DEFAULT_APP_CONFIG.logFileName);
+    return path.join(logsDir, sanitizeLogFileName(APP_CONFIG.logFileName));
 }
 
-function ensureConfigFile() {
-    const cfgPath = getConfigFilePath();
-    let existing = {};
+function formatConsoleArg(value) {
+    if (typeof value === 'string') return value;
     try {
-        const raw = fs.readFileSync(cfgPath, 'utf8');
-        existing = JSON.parse(raw);
-        if (!existing || typeof existing !== 'object') existing = {};
+        return util.inspect(value, { depth: 6, colors: false, breakLength: 160 });
     } catch {
-        // File missing or corrupt — will be (re)created below
+        try { return JSON.stringify(value); } catch {}
     }
-    // Merge: existing keys win, new defaults are added
-    const merged = { ...DEFAULT_APP_CONFIG, ...existing };
-    // Validate / coerce types
+    return String(value);
+}
+
+function appendConsoleLogToFile(level, args) {
+    if (!fileLoggingEnabled || !activeLogFilePath || isWritingLogFile) return;
+    isWritingLogFile = true;
+    try {
+        const timestamp = new Date().toISOString();
+        const rendered = Array.from(args).map(formatConsoleArg).join(' ');
+        fs.appendFileSync(activeLogFilePath, `[${timestamp}] [${level}] ${rendered}\n`, 'utf8');
+    } catch {
+        // Avoid recursive console logging from logging itself.
+    } finally {
+        isWritingLogFile = false;
+    }
+}
+
+function makeConsoleMethod(level) {
+    const original = ORIGINAL_CONSOLE[level.toLowerCase()] || ORIGINAL_CONSOLE.log;
+    return (...args) => {
+        if (consoleLoggingEnabled) original(...args);
+        appendConsoleLogToFile(level, args);
+    };
+}
+
+function applyConsoleLoggingConfig() {
+    consoleLoggingEnabled = APP_CONFIG.enableConsoleLogging !== false;
+    fileLoggingEnabled = APP_CONFIG.enableFileLogging === true;
+    activeLogFilePath = fileLoggingEnabled ? getLogFilePath() : null;
+
+    console.log = makeConsoleMethod('LOG');
+    console.info = makeConsoleMethod('INFO');
+    console.debug = makeConsoleMethod('DEBUG');
+    console.warn = makeConsoleMethod('WARN');
+    console.error = makeConsoleMethod('ERROR');
+}
+
+function normalizeBooleanConfig(value, fallback) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+        const lowered = value.trim().toLowerCase();
+        if (['true', '1', 'yes', 'on'].includes(lowered)) return true;
+        if (['false', '0', 'no', 'off'].includes(lowered)) return false;
+    }
+    return fallback;
+}
+
+function normalizePositiveIntegerConfig(value, fallback) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n >= 0) return Math.round(n);
+    return fallback;
+}
+
+function normalizeExportFormat(value, fallback) {
+    const fmt = String(value ?? fallback).trim().toLowerCase().replace(/^\./, '');
+    return ['md', 'markdown', 'pdf', 'html', 'mhtml', 'txt'].includes(fmt) ? fmt : fallback;
+}
+
+function normalizeExportProfile(value, fallback) {
+    const profile = String(value ?? fallback).trim();
+    return ['cleanMarkdown', 'rawMarkdown', 'markdownWithMetadata', 'html', 'htmlArchive', 'plainText', 'pdf'].includes(profile)
+        ? profile
+        : fallback;
+}
+
+function normalizeAppConfig(raw = {}) {
+    const source = (raw && typeof raw === 'object') ? raw : {};
+    const merged = { ...DEFAULT_APP_CONFIG, ...source };
+
     merged.appUrl = String(merged.appUrl || DEFAULT_APP_CONFIG.appUrl).trim();
     merged.partition = String(
-        process.env.GEMINI_PARTITION ?? merged.partition ?? DEFAULT_APP_CONFIG.partition
+        process.env.GEMINI_PARTITION ??
+        merged.partition ??
+        DEFAULT_APP_CONFIG.partition
     ).trim();
-    if (typeof merged.enableLayoutCss !== 'boolean')             merged.enableLayoutCss = DEFAULT_APP_CONFIG.enableLayoutCss;
-    if (typeof merged.enableDirectOpen !== 'boolean')            merged.enableDirectOpen = DEFAULT_APP_CONFIG.enableDirectOpen;
-    if (typeof merged.enableQuickChat !== 'boolean')             merged.enableQuickChat = DEFAULT_APP_CONFIG.enableQuickChat;
-    if (typeof merged.findContentVisibilityOverride !== 'boolean') merged.findContentVisibilityOverride = DEFAULT_APP_CONFIG.findContentVisibilityOverride;
-    if (typeof merged.devToolsEnabled !== 'boolean')             merged.devToolsEnabled = DEFAULT_APP_CONFIG.devToolsEnabled;
-    if (typeof merged.enableConsoleLogging !== 'boolean')        merged.enableConsoleLogging = DEFAULT_APP_CONFIG.enableConsoleLogging;
-    if (typeof merged.enableFileLogging !== 'boolean')           merged.enableFileLogging = DEFAULT_APP_CONFIG.enableFileLogging;
-    if (typeof merged.quickPasteDelayMs !== 'number')            merged.quickPasteDelayMs = DEFAULT_APP_CONFIG.quickPasteDelayMs;
+    merged.enableLayoutCss = normalizeBooleanConfig(merged.enableLayoutCss, DEFAULT_APP_CONFIG.enableLayoutCss);
+    merged.enableDirectOpen = normalizeBooleanConfig(merged.enableDirectOpen, DEFAULT_APP_CONFIG.enableDirectOpen);
+    merged.enableQuickChat = normalizeBooleanConfig(merged.enableQuickChat, DEFAULT_APP_CONFIG.enableQuickChat);
+    merged.defaultExportFormat = normalizeExportFormat(merged.defaultExportFormat, DEFAULT_APP_CONFIG.defaultExportFormat);
+    merged.defaultPaneExportProfile = normalizeExportProfile(merged.defaultPaneExportProfile, DEFAULT_APP_CONFIG.defaultPaneExportProfile);
+    merged.defaultSelectionExportProfile = normalizeExportProfile(merged.defaultSelectionExportProfile, DEFAULT_APP_CONFIG.defaultSelectionExportProfile);
+    merged.quickPasteDelayMs = normalizePositiveIntegerConfig(merged.quickPasteDelayMs, DEFAULT_APP_CONFIG.quickPasteDelayMs);
+    merged.findContentVisibilityOverride = normalizeBooleanConfig(merged.findContentVisibilityOverride, DEFAULT_APP_CONFIG.findContentVisibilityOverride);
+    merged.devToolsEnabled = normalizeBooleanConfig(merged.devToolsEnabled, DEFAULT_APP_CONFIG.devToolsEnabled);
+    merged.enableConsoleLogging = normalizeBooleanConfig(merged.enableConsoleLogging, DEFAULT_APP_CONFIG.enableConsoleLogging);
+    merged.enableFileLogging = normalizeBooleanConfig(merged.enableFileLogging, DEFAULT_APP_CONFIG.enableFileLogging);
+    merged.logFileName = sanitizeLogFileName(merged.logFileName || DEFAULT_APP_CONFIG.logFileName);
+
     if (!merged.appUrl) merged.appUrl = DEFAULT_APP_CONFIG.appUrl;
-    merged.logFileName = String(merged.logFileName || DEFAULT_APP_CONFIG.logFileName)
-        .replace(/[^a-zA-Z0-9._-]/g, '-');
-    // Write back (adds any new keys introduced in this version)
-    try {
-        fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
-        fs.writeFileSync(cfgPath, JSON.stringify(merged, null, 2), 'utf8');
-    } catch (err) {
-        console.error('Failed to write config file:', err);
-    }
+    if (!merged.partition) merged.partition = DEFAULT_APP_CONFIG.partition;
+
     return merged;
 }
 
+function writeConfigFile(configPath, config) {
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+}
+
 function loadAppConfig() {
-    const merged = ensureConfigFile();
-    APP_CONFIG = merged;
-    // Let config override the compile-time URL and partition
+    const configPath = getConfigFilePath();
+    let parsed = null;
+
+    try {
+        if (fs.existsSync(configPath)) {
+            parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        }
+    } catch (err) {
+        console.error('Failed to read config.json; using defaults:', err);
+    }
+    APP_CONFIG = normalizeAppConfig(parsed ?? DEFAULT_APP_CONFIG);
     GEMINI_URL = APP_CONFIG.appUrl || GEMINI_URL;
     GEMINI_PARTITION = APP_CONFIG.partition || GEMINI_PARTITION;
+    applyConsoleLoggingConfig();
+
+    try {
+        writeConfigFile(configPath, APP_CONFIG);
+    } catch (err) {
+        console.error('Failed to write config file:', err);
+    }
+
     return APP_CONFIG;
 }
 
-// ============================================================================
-// Dual-channel logging — console + file
-// ============================================================================
-function setupLogging() {
-    const config = APP_CONFIG;
-    const origLog   = console.log.bind(console);
-    const origInfo  = console.info.bind(console);
-    const origDebug = console.debug.bind(console);
-    const origWarn  = console.warn.bind(console);
-    const origError = console.error.bind(console);
-
-    // Suppress console output if disabled (but keep originals for file logging)
-    const noop = () => {};
-    const cLog   = config.enableConsoleLogging ? origLog   : noop;
-    const cInfo  = config.enableConsoleLogging ? origInfo  : noop;
-    const cDebug = config.enableConsoleLogging ? origDebug : noop;
-    const cWarn  = config.enableConsoleLogging ? origWarn  : noop;
-    const cError = config.enableConsoleLogging ? origError : noop;
-
-    if (!config.enableFileLogging) {
-        // No file logging — just apply console suppression if needed
-        console.log = cLog; console.info = cInfo; console.debug = cDebug;
-        console.warn = cWarn; console.error = cError;
-        return;
-    }
-
-    // File logging enabled
-    const logPath = getLogFilePath();
-
-    function formatArgs(args) {
-        return args.map(a => {
-            if (typeof a === 'string') return a;
-            try { return JSON.stringify(a); } catch { return String(a); }
-        }).join(' ');
-    }
-
-    function appendToLog(level, args) {
-        try {
-            const timestamp = new Date().toISOString();
-            const line = `[${timestamp}] [${level}] ${formatArgs(args)}\n`;
-            fs.appendFileSync(logPath, line, 'utf8');
-        } catch {}
-    }
-
-    console.log   = (...args) => { cLog(...args);   appendToLog('LOG',   args); };
-    console.info  = (...args) => { cInfo(...args);  appendToLog('INFO',  args); };
-    console.debug = (...args) => { cDebug(...args); appendToLog('DEBUG', args); };
-    console.warn  = (...args) => { cWarn(...args);  appendToLog('WARN',  args); };
-    console.error = (...args) => { cError(...args); appendToLog('ERROR', args); };
+function ensureConfigFile() {
+    return loadAppConfig();
 }
 
 // --- Initialize config + logging before anything else ---
 try { loadAppConfig(); } catch (err) { console.error('Config load failed:', err); }
-try { setupLogging(); } catch (err) { console.error('Logging setup failed:', err); }
 
 function getAppConfig() { return APP_CONFIG; }
 
@@ -591,7 +647,7 @@ function createWindow() {
             sandbox: false,
             preload: path.join(__dirname, 'preload.js'),
             partition: GEMINI_PARTITION,
-            devTools: true,
+            devTools: !!APP_CONFIG.devToolsEnabled,
             backgroundThrottling: true,
             spellcheck: false,
         },
@@ -623,7 +679,7 @@ function createWindow() {
         try {
             menu = Menu.buildFromTemplate(
                 buildContextMenuTemplate(mainWindow, params, {
-                    includeQuickChatFeatures: true,
+                    includeQuickChatFeatures: !!APP_CONFIG.enableQuickChat,
                     includeChatPaneFeatures: true,
                     includeMarkdownExport: true,
                 })
@@ -675,6 +731,7 @@ function createTray() {
         if (!mainWindow) return;
         if (mainWindow.isVisible()) mainWindow.hide();
         else reveal(mainWindow);
+        refreshTrayMenu();
     });
 }
 
@@ -685,10 +742,15 @@ app.setName('gemini-for-linux');
 app.setAppUserModelId('your.company.gemini');
 
 app.whenReady().then(() => {
+    loadAppConfig();
+
+    if (APP_CONFIG.enableDirectOpen) {
+        directOpen.registerDirectOpenIpcHandler(IPC);
+        directOpen.registerDirectOpenDownloadHandler();
+    }
+
     createWindow();
     createTray();
-    directOpen.registerDirectOpenDownloadHandler();
-    directOpen.registerDirectOpenIpcHandler(IPC);
     app.on('activate', () => {
         if (BrowserWindow.getAllWindows().length === 0) createWindow();
         else if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
@@ -701,14 +763,14 @@ app.on('before-quit', () => {
     isQuitting = true;
     try {
         if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.executeJavaScript(`(function(){
+            mainWindow.webContents.executeJavaScript(`(function(observerName){
                 try {
-                    if (window.__gemini_layoutObserver) {
-                        window.__gemini_layoutObserver.disconnect();
-                        window.__gemini_layoutObserver = null;
+                    if (window[observerName]) {
+                        window[observerName].disconnect();
+                        window[observerName] = null;
                     }
                 } catch {}
-            })();`).catch(() => {});
+            })(${JSON.stringify(LAYOUT_OBSERVER_GLOBAL)});`).catch(() => {});
         }
         try { initQuickChat().closeAllQuickChatWindows(); } catch {}
     } catch {}
