@@ -5,6 +5,7 @@ const { app, BrowserWindow, Menu, MenuItem, Tray, nativeImage, shell, ipcMain, d
 const path = require('path');
 const fs = require('fs');
 
+const { createIPC } = require('./lib/ipc');
 // === App-specific modules ===
 const {
     CHAT_ROOT_SELECTORS, CHAT_MESSAGE_LIST_SELECTORS,
@@ -44,12 +45,7 @@ const APP_SLUG  = 'gemini';
 let GEMINI_URL       = 'https://gemini.google.com';
 let GEMINI_PARTITION = String(process.env.GEMINI_PARTITION ?? 'persist:gemini-for-linux').trim();
 
-const IPC = Object.freeze({
-    SEND_SELECTION:  'gemini:send-selection',
-    QUICK_NEW:       'gemini:quick-new',
-    DIRECT_OPEN_LINK:'gemini:direct-open-link',
-    PRELOAD_PING:    'gemini:preload-ping',
-});
+const IPC = createIPC(APP_SLUG);
 
 const SEND_MODE = Object.freeze({ PLAIN: 'plain', QUOTE: 'quote' });
 
@@ -592,6 +588,7 @@ function createWindow() {
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
+            sandbox: false,
             preload: path.join(__dirname, 'preload.js'),
             partition: GEMINI_PARTITION,
             devTools: true,

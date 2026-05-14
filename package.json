@@ -1,6 +1,6 @@
 {
   "name": "gemini-for-linux",
-  "version": "1.06.04",
+  "version": "1.06.07",
   "description": "Gemini for Linux",
   "main": "main.js",
   "scripts": {
@@ -18,6 +18,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "preload-core.js",
       "package.json",
       "assets/**",
       "lib/**"
