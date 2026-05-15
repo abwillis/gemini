@@ -490,13 +490,13 @@ function appendFileItems(...args) { return initAppMenu().appendFileItems(...args
 // ============================================================
 // Tray menu (rebuilt when Quick Chat windows change)
 // ============================================================
-function refreshTrayMenu() {
-    if (!tray) return;
+function buildTrayMenuTemplate() {
     const items = [
         { label: 'Show', click: () => { if (mainWindow) reveal(mainWindow); } },
         { label: 'Hide', click: () => { if (mainWindow) mainWindow.hide(); } },
         { type: 'separator' },
     ];
+
     // Quick Chat windows
     try {
         const qm = initQuickChat();
@@ -516,12 +516,14 @@ function refreshTrayMenu() {
             items.push({ type: 'separator' });
         }
     } catch {}
+
     // Save Chat Pane
     items.push({
         label: 'Save Chat Pane',
         click: () => { if (mainWindow) promptSaveChatPane(mainWindow); }
     });
     items.push({ type: 'separator' });
+
     // Session management
     items.push({
         label: 'Reload',
@@ -539,6 +541,7 @@ function refreshTrayMenu() {
         ]
     });
     items.push({ type: 'separator' });
+
     // Config & Logs
     items.push({
         label: 'Open Logs Folder',
@@ -549,12 +552,18 @@ function refreshTrayMenu() {
         click: () => openConfigFile()
     });
     items.push({ type: 'separator' });
+
     // About & Quit
     items.push({ label: 'About', click: () => showAboutDialog() });
     items.push({ type: 'separator' });
     items.push({ label: 'Quit', click: () => { isQuitting = true; app.quit(); } });
 
-    tray.setContextMenu(Menu.buildFromTemplate(items));
+    return items;
+}
+
+function refreshTrayMenu() {
+    if (!tray) return;
+    tray.setContextMenu(Menu.buildFromTemplate(buildTrayMenuTemplate()));
 }
 
 // ============================================================
