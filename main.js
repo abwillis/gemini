@@ -200,6 +200,46 @@ function openConfigFile(...args) { return initSessionHelpers().openConfigFile(..
 function toggleActiveWindowAlwaysOnTop(...args) { return initSessionHelpers().toggleActiveWindowAlwaysOnTop(...args); }
 
 // ============================================================================
+
+// Find-in-page
+// ============================================================================
+let findInPageInstance = null;
+function initFindInPage() {
+    if (findInPageInstance) return findInPageInstance;
+    findInPageInstance = createFindInPage({
+        BrowserWindow, Menu, ipcMain, screen,
+        getMainWindow: () => mainWindow,
+        getAppConfig,
+        enableFindContentVisibility,
+        disableFindContentVisibility,
+    });
+    return findInPageInstance;
+}
+
+function openFindModal(...args) { return initFindInPage().openFindModal(...args); }
+function attachFindResultForwarding(...args) { return initFindInPage().attachFindResultForwarding(...args); }
+function resetFindModalResults(...args) { return initFindInPage().resetFindModalResults(...args); }
+function sendFindModalResults(...args) { return initFindInPage().sendFindModalResults(...args); }
+function getWCFromEventSender(...args) { return initFindInPage().getWCFromEventSender(...args); }
+function getWC(...args) { return initFindInPage().getWC(...args); }
+function applyWordStartOptions(...args) { return initFindInPage().applyWordStartOptions(...args); }
+
+// direct-open initialization
+let directOpenInstance = null;
+function initDirectOpen() {
+    if (directOpenInstance) return directOpenInstance;
+    directOpenInstance = createDirectOpen({
+        session, shell, fs, path, app, ipcMain,
+        getAppConfig,
+        getAppPartition: () => APP_PARTITION,
+        appSlug: APP_SLUG,
+        safeShowError,
+    });
+    return directOpenInstance;
+}
+
+function registerDirectOpenDownloadHandler() { return initDirectOpen().registerDirectOpenDownloadHandler(); }
+
 // Utility — executeInAllFrames
 // ============================================================================
 async function executeInAllFrames(win, script) {
@@ -351,44 +391,6 @@ function initQuickChat() {
 }
 
 // ============================================================================
-// Find-in-page
-// ============================================================================
-let findInPageInstance = null;
-function initFindInPage() {
-    if (findInPageInstance) return findInPageInstance;
-    findInPageInstance = createFindInPage({
-        BrowserWindow, Menu, ipcMain, screen,
-        getMainWindow: () => mainWindow,
-        getAppConfig,
-        enableFindContentVisibility,
-        disableFindContentVisibility,
-    });
-    return findInPageInstance;
-}
-
-function openFindModal(...args) { return initFindInPage().openFindModal(...args); }
-function attachFindResultForwarding(...args) { return initFindInPage().attachFindResultForwarding(...args); }
-function resetFindModalResults(...args) { return initFindInPage().resetFindModalResults(...args); }
-function sendFindModalResults(...args) { return initFindInPage().sendFindModalResults(...args); }
-function getWCFromEventSender(...args) { return initFindInPage().getWCFromEventSender(...args); }
-function getWC(...args) { return initFindInPage().getWC(...args); }
-function applyWordStartOptions(...args) { return initFindInPage().applyWordStartOptions(...args); }
-
-// direct-open initialization
-let directOpenInstance = null;
-function initDirectOpen() {
-    if (directOpenInstance) return directOpenInstance;
-    directOpenInstance = createDirectOpen({
-        session, shell, fs, path, app, ipcMain,
-        getAppConfig,
-        getAppPartition: () => APP_PARTITION,
-        appSlug: APP_SLUG,
-        safeShowError,
-    });
-    return directOpenInstance;
-}
-
-function registerDirectOpenDownloadHandler() { return initDirectOpen().registerDirectOpenDownloadHandler(); }
 
 // ============================================================================
 // Utility — ensureSaveState
