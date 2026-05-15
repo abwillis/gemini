@@ -197,9 +197,11 @@ function attachCSSAndLayoutHandlers(win, { role = 'window', revealOnReady = true
 let sessionHelpersInstance = null;
 function initSessionHelpers() {
     if (sessionHelpersInstance) return sessionHelpersInstance;
+
     sessionHelpersInstance = createSessionHelpers({
-        app, BrowserWindow,dialog, shell, session, clipboard, nativeImage,
+        app, BrowserWindow, dialog, shell, session, clipboard, nativeImage,
         fs, path, getAppConfig,
+        partition: APP_PARTITION,
         appLabel: APP_LABEL,
         getAppPartition: () => APP_PARTITION,
         getAppUrl: () => APP_URL,
@@ -210,8 +212,9 @@ function initSessionHelpers() {
         getAppIconImage: () => appIconImage,
         safeShowError,
         refreshTrayMenu,
-        refreshQuickChatMenu: () => { try { refreshQuickChatMenu(); } catch {} },
+        refreshQuickChatMenu,
     });
+
     return sessionHelpersInstance;
 }
 function getRuntimeInfo(...args) { return initSessionHelpers().getRuntimeInfo(...args); }
@@ -237,7 +240,9 @@ let findInPageInstance = null;
 function initFindInPage() {
     if (findInPageInstance) return findInPageInstance;
     findInPageInstance = createFindInPage({
-        BrowserWindow, Menu, ipcMain, screen,
+        BrowserWindow,
+        ipcMain,
+        screen,
         getMainWindow: () => mainWindow,
         getAppConfig,
         enableFindContentVisibility,
@@ -304,24 +309,24 @@ let exportersInstance = null;
 function initExporters() {
     if (exportersInstance) return exportersInstance;
     exportersInstance = createExporters({
-        app, fs, path, dialog, clipboard, shell,
+        app,
         BrowserWindow,
+        dialog,
         safeShowError,
-        getMainWindow: () => mainWindow,
+        executeInAllFrames,
+        getAppPartition: () => APP_PARTITION,
+        buildLocateChatRootScript,
+        appSlug: APP_SLUG,
+        buildChatPaneDetectionScript,
+        cleanupDOMFragmentScript,
+        CHAT_SCOPE_PSEUDO,
+        EXPORT_ROOT_CLASS,
+        EXPORT_ROOT_SELECTOR,
         getAppConfig,
         DEFAULT_APP_CONFIG,
-        CHAT_ROOT_SELECTORS, CHAT_MESSAGE_LIST_SELECTORS,
-        CHAT_SCOPE_SELECTOR, CHAT_SCOPE_PSEUDO,
-        CHAT_MESSAGE_LIST_SELECTOR, CHAT_MESSAGE_LIST_PSEUDO,
-        EXPORT_ROOT_CLASS, EXPORT_ROOT_SELECTOR,
-        CODE_PREVIEW_IFRAME_SELECTOR,
-        DOM_CLEANUP_SELECTORS, cleanupDOMFragmentScript,
-        buildLocateChatRootScript,
-        buildChatPaneDetectionScript,
-        executeInAllFrames,
         normalizeExportFormat,
-        appSlug: APP_SLUG,
         appLabel: APP_LABEL,
+        appSlug: APP_SLUG,
     });
     return exportersInstance;
 }
@@ -366,21 +371,12 @@ let contextMenuInstance = null;
 function initContextMenu() {
     if (contextMenuInstance) return contextMenuInstance;
     contextMenuInstance = createContextMenu({
-        Menu, MenuItem, dialog, shell, clipboard,
-        BrowserWindow, ipcMain,
-        getMainWindow: () => mainWindow,
-        getAppConfig,
-        SEND_MODE,
-        EXPORT_SCOPES,
-        reveal, safeShowError,
-        selectChatPane, promptSaveChatPane,
-        getSelectionFragment, htmlToMarkdown,
-        buildSelectionMarkdownForExport,
-        saveSelectionAsMarkdown, saveSelectionAsText,
+        Menu, MenuItem, clipboard, shell, BrowserWindow, dialog, ipcMain,
+        getAppConfig, SEND_MODE, EXPORT_SCOPES,
+        selectChatPane, promptSaveChatPane, getSelectionFragment,
+        htmlToMarkdown, buildSendToQuickSubmenu, createQuickChatWindow,
         promptExportWithProfile, buildExportProfileMenuTemplate,
-        buildSendToQuickSubmenu,
-        createQuickChatWindow,
-        openFindModal: (...args) => initFindInPage().openFindModal(...args),
+        openFindModal, reveal, safeShowError, saveSelectionAsMarkdown,
     });
     return contextMenuInstance;
 }
@@ -399,16 +395,28 @@ let quickChatManager = null;
 function initQuickChat() {
     if (quickChatManager) return quickChatManager;
     quickChatManager = createQuickChatManager({
-        app, BrowserWindow, Menu, MenuItem, ipcMain, dialog, shell, clipboard, path,
+        app,
+        BrowserWindow,
+        Menu,
+        MenuItem,
+        ipcMain,
+        dialog,
+        shell,
+        clipboard,
+        path,
         dirname: __dirname,
         getMainWindow: () => mainWindow,
         getAppIconImage: () => appIconImage,
         getAppConfig,
         DEFAULT_APP_CONFIG,
-        appSlug: APP_SLUG,
         getAppUrl: () => APP_URL,
+        appLabel: APP_LABEL,
+        appSlug: APP_SLUG,
         getAppPartition: () => APP_PARTITION,
-        SEND_MODE, IPC, reveal, safeShowError,
+        SEND_MODE,
+        IPC,
+        reveal,
+        safeShowError,
         getInitialWindowBounds,
         attachWindowStatePersistence,
         attachCSSAndLayoutHandlers,
@@ -416,9 +424,9 @@ function initQuickChat() {
         ensureDidStopLoadingHandler,
         onDidStopLoading,
         buildContextMenuTemplate,
-        getSelectionFragment, htmlToMarkdown,
+        getSelectionFragment,
+        htmlToMarkdown,
         refreshTrayMenu,
-        appLabel: APP_LABEL,
     });
     quickChatManager.registerIpcHandlers();
     return quickChatManager;
@@ -459,34 +467,21 @@ let appMenuInstance = null;
 function initAppMenu() {
     if (appMenuInstance) return appMenuInstance;
     appMenuInstance = createAppMenu({
-        app, Menu, MenuItem, dialog, shell, BrowserWindow, ipcMain, clipboard,
-        getMainWindow: () => mainWindow,
-        getAppConfig,
-        DEFAULT_APP_CONFIG,
+        Menu, MenuItem, BrowserWindow, dialog, shell,
+        getAppConfig, getMainWindow: () => mainWindow,
         appLabel: APP_LABEL,
-        reveal, safeShowError,
-        getRuntimeInfo, showAboutDialog, showApplicationHelp,
+        openFindModal, initFindInPage,
         reloadApp, clearAppCache, clearCookiesAndSignOut,
-        copyCurrentUrl, openCurrentUrlExternal,
-        selectChatPane, promptSaveChatPane, saveSelectionAsMarkdown,
+        copyCurrentUrl, openCurrentUrlExternal, openLogsFolder, openConfigFile,
+        toggleActiveWindowAlwaysOnTop, showAboutDialog, showApplicationHelp,
+        getRuntimeInfo, appIconImage,
         buildExportProfileMenuTemplate, promptExportWithProfile,
-        EXPORT_SCOPES,
-        openFindModal,
-        initFindInPage,
-        buildQuickChatManagerMenuTemplate,
-        installQuickChatMenu,
-        refreshQuickChatMenu,
-        createQuickChatWindow,
-        buildSendToQuickSubmenu,
-        buildContextMenuTemplate,
-        getAppIconImage: () => appIconImage,
-        SEND_MODE,
+        selectChatPane, promptSaveChatPane, saveSelectionAsMarkdown, EXPORT_SCOPES,
+        buildQuickChatManagerMenuTemplate, installQuickChatMenu, refreshQuickChatMenu,
+        createQuickChatWindow, buildSendToQuickSubmenu, SEND_MODE,
         ensureSaveState,
-        openLogsFolder,
-        openConfigFile,
-        toggleActiveWindowAlwaysOnTop,
-        initQuickChat,
     });
+
     return appMenuInstance;
 }
 function appendEditItems(...args) { return initAppMenu().appendEditItems(...args); }
