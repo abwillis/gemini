@@ -1,4 +1,4 @@
-// main.js — Gemini for Linux (refactored orchestrator)
+// main.js
 'use strict';
 
 const { app, BrowserWindow, Menu, MenuItem, Tray, nativeImage, shell, ipcMain, dialog, screen, clipboard, session } = require('electron');
@@ -7,6 +7,7 @@ const fs = require('fs');
 
 const { createIPC } = require('./lib/ipc');
 const { createRuntimeConfig } = require('./lib/runtime-config');
+const appConfig = require('./app.config');
 
 // === App-specific modules ===
 const {
@@ -41,33 +42,21 @@ const { createExporters, EXPORT_SCOPES } = require('./lib/exporters');
 // ============================================================================
 // App identity & constants
 // ============================================================================
-const APP_LABEL = 'Gemini';
-const APP_SLUG  = 'gemini';
+const APP_LABEL = appConfig.appLabel;
+const APP_SLUG  = appConfig.appSlug;
 
 const IPC = createIPC(APP_SLUG);
 
-const SEND_MODE = Object.freeze({ PLAIN: 'plain', QUOTE: 'quote' });
-const LAYOUT_OBSERVER_GLOBAL = '__gemini_layoutObserver';
-
-const DEFAULT_APP_CONFIG = Object.freeze({
-    appUrl: 'https://gemini.google.com',
-    partition: String(process.env.GEMINI_PARTITION ?? 'persist:gemini-for-linux').trim(),
-    enableLayoutCss: true,
-    enableDirectOpen: true,
-    enableQuickChat: true,
-    defaultExportFormat: 'md',
-    defaultPaneExportProfile: 'cleanMarkdown',
-    defaultSelectionExportProfile: 'cleanMarkdown',
-    quickPasteDelayMs: 3000,
-    findContentVisibilityOverride: false,
-    devToolsEnabled: true,
-    enableConsoleLogging: true,
-    enableFileLogging: false,
-    logFileName: 'gemini-for-linux.log',
+const SEND_MODE = Object.freeze({
+  PLAIN: 'plain',
+  QUOTE: 'quote',
 });
+const LAYOUT_OBSERVER_GLOBAL = appConfig.layoutObserverGlobal;
 
-let GEMINI_URL = DEFAULT_APP_CONFIG.appUrl;
-let GEMINI_PARTITION = DEFAULT_APP_CONFIG.partition;
+const DEFAULT_APP_CONFIG = Object.freeze({ ...appConfig.defaultAppConfig });
+
+let APP_URL = DEFAULT_APP_CONFIG.appUrl;
+let APP_PARTITION = DEFAULT_APP_CONFIG.partition;
 
 let APP_CONFIG = { ...DEFAULT_APP_CONFIG };
 
@@ -79,11 +68,11 @@ const runtimeConfig = createRuntimeConfig({
     fs,
     path,
     defaultAppConfig: DEFAULT_APP_CONFIG,
-    partitionEnvVar: 'GEMINI_PARTITION',
+    partitionEnvVar: appConfig.partitionEnvVar,
     onConfigLoaded(config) {
         APP_CONFIG = config;
-        GEMINI_URL = config.appUrl;
-        GEMINI_PARTITION = config.partition;
+        APP_URL = config.appUrl;
+        APP_PARTITION = config.partition;
     },
 });
 
@@ -183,8 +172,8 @@ function initSessionHelpers() {
         BrowserWindow,
         appLabel: APP_LABEL,
         getAppConfig,
-        getAppPartition: () => GEMINI_PARTITION,
-        getAppUrl: () => GEMINI_URL,
+        getAppPartition: () => APP_PARTITION,
+        getAppUrl: () => APP_URL,
         getConfigFilePath,
         getLogFilePath,
         ensureConfigFile,
@@ -343,8 +332,8 @@ function initQuickChat() {
         getAppConfig,
         DEFAULT_APP_CONFIG,
         appSlug: APP_SLUG,
-        getAppUrl: () => GEMINI_URL,
-        getAppPartition: () => GEMINI_PARTITION,
+        getAppUrl: () => APP_URL,
+        getAppPartition: () => APP_PARTITION,
         SEND_MODE, IPC, reveal, safeShowError,
         getInitialWindowBounds,
         attachWindowStatePersistence,
@@ -392,7 +381,7 @@ function initDirectOpen() {
     directOpenInstance = createDirectOpen({
         session, shell, fs, path, app, ipcMain,
         getAppConfig,
-        getAppPartition: () => GEMINI_PARTITION,
+        getAppPartition: () => APP_PARTITION,
         appSlug: APP_SLUG,
         safeShowError,
     });
@@ -537,7 +526,7 @@ function getIconPath(filename) {
 function createWindow() {
     if (mainWindow) return;
 
-    const taIcon = nativeImage.createFromPath(getIconPath('gemini-for-linux.png'));
+    const taIcon = nativeImage.createFromPath(getIconPath(appConfig.iconFileName));
     if (!appIconImage || appIconImage.isEmpty()) appIconImage = taIcon;
     console.log('ICON DEBUG:', 'empty:', appIconImage.isEmpty(), 'size:', appIconImage.getSize());
     if (!trayImage24 || trayImage24.isEmpty?.()) {
@@ -561,7 +550,7 @@ function createWindow() {
             contextIsolation: true,
             sandbox: false,
             preload: path.join(__dirname, 'preload.js'),
-            partition: GEMINI_PARTITION,
+            partition: APP_PARTITION,
             devTools: !!APP_CONFIG.devToolsEnabled,
             backgroundThrottling: true,
             spellcheck: false,
@@ -583,7 +572,7 @@ function createWindow() {
     mainWindow.setSkipTaskbar(false);
     ensureDidStopLoadingHandler(mainWindow.webContents);
     mainWindow.webContents.setMaxListeners(0);
-    mainWindow.loadURL(GEMINI_URL);
+    mainWindow.loadURL(APP_URL);
 
     attachCSSAndLayoutHandlers(mainWindow);
     attachWindowStatePersistence(mainWindow, boundsKey);
@@ -633,14 +622,14 @@ function createWindow() {
 // createTray
 // ============================================================
 function createTray() {
-    const iconPath = getIconPath('gemini-for-linux.png');
+    const iconPath = getIconPath(appConfig.iconFileName);
     const trayImage = trayImage24 || nativeImage.createFromPath(iconPath);
     const smallImage = trayImage.isEmpty ? null : trayImage.resize({ width: 24, height: 24 });
 
     tray = new Tray(smallImage || appIconImage || nativeImage.createFromPath(
-        path.join(__dirname, 'assets', 'gemini-for-linux.png')
+        path.join(__dirname, 'assets', appConfig.iconFileName)
     ));
-    tray.setToolTip(`${APP_LABEL} for Linux`);
+    tray.setToolTip(appConfig.trayToolTip || `${APP_LABEL} for Linux`);
     refreshTrayMenu();
 
     tray.on('click', () => {
@@ -654,8 +643,8 @@ function createTray() {
 // ============================================================
 // App lifecycle
 // ============================================================
-app.setName('gemini-for-linux');
-app.setAppUserModelId('your.company.gemini');
+app.setName(appConfig.appName);
+app.setAppUserModelId(appConfig.appUserModelId);
 
 app.whenReady().then(() => {
     loadAppConfig();

@@ -1,6 +1,6 @@
 {
   "name": "gemini-for-linux",
-  "version": "1.06.10",
+  "version": "1.06.11",
   "description": "Gemini for Linux",
   "main": "main.js",
   "scripts": {
@@ -104,7 +104,7 @@
   },
   "license": "BSD 3-Clause License",
   "devDependencies": {
-    "electron": "^41.3.0",
+    "electron": "^42.1.0",
     "electron-builder": "^26.4.0"
   },
   "dependencies": {
