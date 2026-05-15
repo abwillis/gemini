@@ -4,9 +4,10 @@
 const { app, BrowserWindow, Menu, MenuItem, Tray, nativeImage, shell, ipcMain, dialog, screen, clipboard, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const util = require('util');
 
 const { createIPC } = require('./lib/ipc');
+const { createRuntimeConfig } = require('./lib/runtime-config');
+
 // === App-specific modules ===
 const {
     CHAT_ROOT_SELECTORS, CHAT_MESSAGE_LIST_SELECTORS,
@@ -69,178 +70,41 @@ let GEMINI_URL = DEFAULT_APP_CONFIG.appUrl;
 let GEMINI_PARTITION = DEFAULT_APP_CONFIG.partition;
 
 let APP_CONFIG = { ...DEFAULT_APP_CONFIG };
-const ORIGINAL_CONSOLE = Object.freeze({
-    log: console.log.bind(console),
-    info: console.info.bind(console),
-    debug: console.debug.bind(console),
-    warn: console.warn.bind(console),
-    error: console.error.bind(console),
+
+// ============================================================================
+// Runtime config/logging
+// ============================================================================
+const runtimeConfig = createRuntimeConfig({
+    app,
+    fs,
+    path,
+    defaultAppConfig: DEFAULT_APP_CONFIG,
+    partitionEnvVar: 'GEMINI_PARTITION',
+    onConfigLoaded(config) {
+        APP_CONFIG = config;
+        GEMINI_URL = config.appUrl;
+        GEMINI_PARTITION = config.partition;
+    },
 });
-let consoleLoggingEnabled = true;
-let fileLoggingEnabled = false;
-let activeLogFilePath = null;
-let isWritingLogFile = false;
 
-// ============================================================================
-// Config/logging normalization
-// ============================================================================
-function sanitizeLogFileName(name) {
-    return String(name || DEFAULT_APP_CONFIG.logFileName)
-        .trim()
-        .replace(/[^a-zA-Z0-9._-]/g, '-')
-        || DEFAULT_APP_CONFIG.logFileName;
-}
-
-function getConfigFilePath() {
-    return path.join(app.getPath('userData'), 'config.json');
-}
-
-function getLogFilePath() {
-    const logsDir = path.join(app.getPath('userData'), 'logs');
-    try { fs.mkdirSync(logsDir, { recursive: true }); } catch {}
-    return path.join(logsDir, sanitizeLogFileName(APP_CONFIG.logFileName));
-}
-
-function formatConsoleArg(value) {
-    if (typeof value === 'string') return value;
-    try {
-        return util.inspect(value, { depth: 6, colors: false, breakLength: 160 });
-    } catch {
-        try { return JSON.stringify(value); } catch {}
-    }
-    return String(value);
-}
-
-function appendConsoleLogToFile(level, args) {
-    if (!fileLoggingEnabled || !activeLogFilePath || isWritingLogFile) return;
-    isWritingLogFile = true;
-    try {
-        const timestamp = new Date().toISOString();
-        const rendered = Array.from(args).map(formatConsoleArg).join(' ');
-        fs.appendFileSync(activeLogFilePath, `[${timestamp}] [${level}] ${rendered}\n`, 'utf8');
-    } catch {
-        // Avoid recursive console logging from logging itself.
-    } finally {
-        isWritingLogFile = false;
-    }
-}
-
-function makeConsoleMethod(level) {
-    const original = ORIGINAL_CONSOLE[level.toLowerCase()] || ORIGINAL_CONSOLE.log;
-    return (...args) => {
-        if (consoleLoggingEnabled) original(...args);
-        appendConsoleLogToFile(level, args);
-    };
-}
-
-function applyConsoleLoggingConfig() {
-    consoleLoggingEnabled = APP_CONFIG.enableConsoleLogging !== false;
-    fileLoggingEnabled = APP_CONFIG.enableFileLogging === true;
-    activeLogFilePath = fileLoggingEnabled ? getLogFilePath() : null;
-
-    console.log = makeConsoleMethod('LOG');
-    console.info = makeConsoleMethod('INFO');
-    console.debug = makeConsoleMethod('DEBUG');
-    console.warn = makeConsoleMethod('WARN');
-    console.error = makeConsoleMethod('ERROR');
-}
-
-function normalizeBooleanConfig(value, fallback) {
-    if (typeof value === 'boolean') return value;
-    if (typeof value === 'string') {
-        const lowered = value.trim().toLowerCase();
-        if (['true', '1', 'yes', 'on'].includes(lowered)) return true;
-        if (['false', '0', 'no', 'off'].includes(lowered)) return false;
-    }
-    return fallback;
-}
-
-function normalizePositiveIntegerConfig(value, fallback) {
-    const n = Number(value);
-    if (Number.isFinite(n) && n >= 0) return Math.round(n);
-    return fallback;
-}
-
-function normalizeExportFormat(value, fallback) {
-    const fmt = String(value ?? fallback).trim().toLowerCase().replace(/^\./, '');
-    return ['md', 'markdown', 'pdf', 'html', 'mhtml', 'txt'].includes(fmt) ? fmt : fallback;
-}
-
-function normalizeExportProfile(value, fallback) {
-    const profile = String(value ?? fallback).trim();
-    return ['cleanMarkdown', 'rawMarkdown', 'markdownWithMetadata', 'html', 'htmlArchive', 'plainText', 'pdf'].includes(profile)
-        ? profile
-        : fallback;
-}
-
-function normalizeAppConfig(raw = {}) {
-    const source = (raw && typeof raw === 'object') ? raw : {};
-    const merged = { ...DEFAULT_APP_CONFIG, ...source };
-
-    merged.appUrl = String(merged.appUrl || DEFAULT_APP_CONFIG.appUrl).trim();
-    merged.partition = String(
-        process.env.GEMINI_PARTITION ??
-        merged.partition ??
-        DEFAULT_APP_CONFIG.partition
-    ).trim();
-    merged.enableLayoutCss = normalizeBooleanConfig(merged.enableLayoutCss, DEFAULT_APP_CONFIG.enableLayoutCss);
-    merged.enableDirectOpen = normalizeBooleanConfig(merged.enableDirectOpen, DEFAULT_APP_CONFIG.enableDirectOpen);
-    merged.enableQuickChat = normalizeBooleanConfig(merged.enableQuickChat, DEFAULT_APP_CONFIG.enableQuickChat);
-    merged.defaultExportFormat = normalizeExportFormat(merged.defaultExportFormat, DEFAULT_APP_CONFIG.defaultExportFormat);
-    merged.defaultPaneExportProfile = normalizeExportProfile(merged.defaultPaneExportProfile, DEFAULT_APP_CONFIG.defaultPaneExportProfile);
-    merged.defaultSelectionExportProfile = normalizeExportProfile(merged.defaultSelectionExportProfile, DEFAULT_APP_CONFIG.defaultSelectionExportProfile);
-    merged.quickPasteDelayMs = normalizePositiveIntegerConfig(merged.quickPasteDelayMs, DEFAULT_APP_CONFIG.quickPasteDelayMs);
-    merged.findContentVisibilityOverride = normalizeBooleanConfig(merged.findContentVisibilityOverride, DEFAULT_APP_CONFIG.findContentVisibilityOverride);
-    merged.devToolsEnabled = normalizeBooleanConfig(merged.devToolsEnabled, DEFAULT_APP_CONFIG.devToolsEnabled);
-    merged.enableConsoleLogging = normalizeBooleanConfig(merged.enableConsoleLogging, DEFAULT_APP_CONFIG.enableConsoleLogging);
-    merged.enableFileLogging = normalizeBooleanConfig(merged.enableFileLogging, DEFAULT_APP_CONFIG.enableFileLogging);
-    merged.logFileName = sanitizeLogFileName(merged.logFileName || DEFAULT_APP_CONFIG.logFileName);
-
-    if (!merged.appUrl) merged.appUrl = DEFAULT_APP_CONFIG.appUrl;
-    if (!merged.partition) merged.partition = DEFAULT_APP_CONFIG.partition;
-
-    return merged;
-}
-
-function writeConfigFile(configPath, config) {
-    fs.mkdirSync(path.dirname(configPath), { recursive: true });
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
-}
-
-function loadAppConfig() {
-    const configPath = getConfigFilePath();
-    let parsed = null;
-
-    try {
-        if (fs.existsSync(configPath)) {
-            parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-        }
-    } catch (err) {
-        console.error('Failed to read config.json; using defaults:', err);
-    }
-    APP_CONFIG = normalizeAppConfig(parsed ?? DEFAULT_APP_CONFIG);
-    GEMINI_URL = APP_CONFIG.appUrl || GEMINI_URL;
-    GEMINI_PARTITION = APP_CONFIG.partition || GEMINI_PARTITION;
-    applyConsoleLoggingConfig();
-
-    try {
-        writeConfigFile(configPath, APP_CONFIG);
-    } catch (err) {
-        console.error('Failed to write config file:', err);
-    }
-
-    return APP_CONFIG;
-}
-
-function ensureConfigFile() {
-  loadAppConfig();
-  return getConfigFilePath();
-}
-
-// --- Initialize config + logging before anything else ---
-try { loadAppConfig(); } catch (err) { console.error('Config load failed:', err); }
-
-function getAppConfig() { return APP_CONFIG; }
+const {
+    sanitizeLogFileName,
+    getConfigFilePath,
+    getLogFilePath,
+    formatConsoleArg,
+    appendConsoleLogToFile,
+    makeConsoleMethod,
+    applyConsoleLoggingConfig,
+    normalizeBooleanConfig,
+    normalizePositiveIntegerConfig,
+    normalizeExportFormat,
+    normalizeExportProfile,
+    normalizeAppConfig,
+    writeConfigFile,
+    loadAppConfig,
+    ensureConfigFile,
+    getAppConfig,
+} = runtimeConfig;
 
 // ============================================================================
 // State
@@ -370,15 +234,6 @@ async function executeInAllFrames(win, script) {
         }
     } catch {}
     return results;
-}
-
-// ============================================================================
-// Utility — normalizeExportFormat
-// ============================================================================
-function normalizeExportFormat(fmt, fallback = 'md') {
-    const normalized = String(fmt ?? fallback ?? 'md').trim().toLowerCase();
-    const map = { markdown: 'md', md: 'md', html: 'html', mhtml: 'mhtml', txt: 'txt', pdf: 'pdf', text: 'txt' };
-    return map[normalized] ?? normalized;
 }
 
 // ============================================================================
