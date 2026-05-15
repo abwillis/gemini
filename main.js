@@ -616,25 +616,38 @@ function createWindow() {
     });
 
     mainWindow.setMenuBarVisibility(true);
+    try { mainWindow.setIcon(appIconImage || taIcon); } catch {}
 
     mainWindow.once('ready-to-show', () => {
         reveal(mainWindow);
         try { mainWindow.__appRole = 'main'; } catch {}
         try { mainWindow.__boundsKey = boundsKey; } catch {}
+        try { setRoleTitle(mainWindow, 'main'); } catch {}
         augmentApplicationMenu(mainWindow);
-
     });
 
     mainWindow.setSkipTaskbar(false);
     ensureDidStopLoadingHandler(mainWindow.webContents);
     mainWindow.webContents.setMaxListeners(0);
+
     mainWindow.loadURL(APP_URL);
 
     attachCSSAndLayoutHandlers(mainWindow, { role: 'main', revealOnReady: false });
-    attachWindowStatePersistence(mainWindow, boundsKey);
-    initFindInPage().attachFindResultForwarding(mainWindow);
+    attachWindowStatePersistence(mainWindow, boundsKey, { hideOnClose: true });
+    attachFindResultForwarding(mainWindow);
 
-    // Context menu
+    mainWindow.webContents.on('did-start-navigation', () => {
+        // Keep the did-stop-loading handler singular across SPA navigations.
+    });
+    mainWindow.webContents.on('destroyed', () => {
+        try {
+            mainWindow?.webContents?.removeListener('did-stop-loading', onDidStopLoading);
+            if (mainWindow?.webContents) {
+                delete mainWindow.webContents.__hasDidStopLoadingHandler;
+            }
+        } catch {}
+    });
+
     mainWindow.webContents.on('context-menu', (_event, params) => {
         let menu;
         try {
@@ -654,29 +667,20 @@ function createWindow() {
         catch (err) { console.error('Context menu popup failed:', err); }
     });
 
-    // External links
     mainWindow.webContents.setWindowOpenHandler(({ url }) => (
         shell.openExternal(url), { action: 'deny' }
     ));
 
-    // Escape to clear find
+    initFindInPage().registerFindIpcHandlers();
+
     mainWindow.webContents.on('before-input-event', (event, input) => {
         if (input.type === 'keyDown' && input.key === 'Escape') {
-            const wc = mainWindow.webContents;
-            if (wc) wc.stopFindInPage('clearSelection');
+            initFindInPage().handleEscapeStopFind(mainWindow);
         }
-    });
-
-    mainWindow.on('close', (e) => {
-        if (!isQuitting) { e.preventDefault(); mainWindow.hide(); }
     });
 
     mainWindow.on('closed', () => { mainWindow = null; });
 }
-
-// ============================================================
-// createTray
-// ============================================================
 function createTray() {
     const iconPath = getIconPath(appConfig.iconFileName);
     const trayImage = trayImage24 || nativeImage.createFromPath(iconPath);
