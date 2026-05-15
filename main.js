@@ -18,6 +18,7 @@ const { createExporters, EXPORT_SCOPES } = require('./lib/exporters');
 const { createContextMenu } = require('./lib/context-menu');
 const { createQuickChatManager } = require('./lib/quick-chat');
 const { createAppMenu } = require('./lib/app-menu');
+const { createTrayMenu } = require('./lib/tray-menu');
 
 // === App-specific modules ===
 const {
@@ -490,81 +491,34 @@ function appendFileItems(...args) { return initAppMenu().appendFileItems(...args
 // ============================================================
 // Tray menu (rebuilt when Quick Chat windows change)
 // ============================================================
-function buildTrayMenuTemplate() {
-    const items = [
-        { label: 'Show', click: () => { if (mainWindow) reveal(mainWindow); } },
-        { label: 'Hide', click: () => { if (mainWindow) mainWindow.hide(); } },
-        { type: 'separator' },
-    ];
-
-    // Quick Chat windows
-    try {
-        const qm = initQuickChat();
-        const ids = qm.listQuickIds();
-        if (ids.length) {
-            items.push({ label: 'New Quick Chat', click: () => initQuickChat().createQuickChatWindow() });
-            items.push({ label: 'Show Active Quick Chat', click: () => {
-                const w = initQuickChat().getActiveQuickChatWindow();
-                if (w) reveal(w);
-            }});
-            for (const id of ids) {
-                items.push({
-                    label: `Quick Chat ${id}`,
-                    click: () => { const w = qm.getQuickById(id); if (w) reveal(w); },
-                });
-            }
-            items.push({ type: 'separator' });
-        }
-    } catch {}
-
-    // Save Chat Pane
-    items.push({
-        label: 'Save Chat Pane',
-        click: () => { if (mainWindow) promptSaveChatPane(mainWindow); }
+let trayMenuInstance = null;
+function initTrayMenu() {
+    if (trayMenuInstance) return trayMenuInstance;
+    trayMenuInstance = createTrayMenu({
+        Menu,
+        app,
+        appLabel: APP_LABEL,
+        getTray: () => tray,
+        getMainWindow: () => mainWindow,
+        getAppConfig,
+        getActiveAppWindow,
+        getActiveQuickChatWindow,
+        reveal,
+        createQuickChatWindow,
+        promptSaveChatPane,
+        reloadApp,
+        toggleActiveWindowAlwaysOnTop,
+        clearAppCache,
+        clearCookiesAndSignOut,
+        openLogsFolder,
+        openConfigFile,
+        showAboutDialog,
+        setIsQuitting: (value) => { isQuitting = !!value; },
     });
-    items.push({ type: 'separator' });
-
-    // Session management
-    items.push({
-        label: 'Reload',
-        click: () => reloadApp({ ignoreCache: false })
-    });
-    items.push({
-        label: 'Toggle Always on Top',
-        click: () => toggleActiveWindowAlwaysOnTop()
-    });
-    items.push({
-        label: 'Clear Session/Cache',
-        submenu: [
-            { label: 'Clear ' + APP_LABEL + ' Cache', click: () => clearAppCache() },
-            { label: 'Clear Cookies / Sign Out', click: () => clearCookiesAndSignOut() },
-        ]
-    });
-    items.push({ type: 'separator' });
-
-    // Config & Logs
-    items.push({
-        label: 'Open Logs Folder',
-        click: () => openLogsFolder()
-    });
-    items.push({
-        label: 'Open Config File',
-        click: () => openConfigFile()
-    });
-    items.push({ type: 'separator' });
-
-    // About & Quit
-    items.push({ label: 'About', click: () => showAboutDialog() });
-    items.push({ type: 'separator' });
-    items.push({ label: 'Quit', click: () => { isQuitting = true; app.quit(); } });
-
-    return items;
+    return trayMenuInstance;
 }
-
-function refreshTrayMenu() {
-    if (!tray) return;
-    tray.setContextMenu(Menu.buildFromTemplate(buildTrayMenuTemplate()));
-}
+function buildTrayMenuTemplate(...args) { return initTrayMenu().buildTrayMenuTemplate(...args); }
+function refreshTrayMenu(...args) { return initTrayMenu().refreshTrayMenu(...args); }
 
 // ============================================================
 // Icon helper
