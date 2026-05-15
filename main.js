@@ -19,6 +19,7 @@ const { createContextMenu } = require('./lib/context-menu');
 const { createQuickChatManager } = require('./lib/quick-chat');
 const { createAppMenu } = require('./lib/app-menu');
 const { createTrayMenu } = require('./lib/tray-menu');
+const { createWindowHelpers } = require('./lib/window-helpers');
 const { createIconHelpers } = require('./lib/icon-helpers');
 
 // === App-specific modules ===
@@ -109,24 +110,19 @@ let trayImage24 = null;  // Cached icon images
 // Utility
 // ============================================================================
 // Unified reveal helper to avoid repeated show/focus chains
-function reveal(win) {
-    if (!win) return;
-    if (win.isMinimized()) win.restore();
-    if (!win.isVisible()) win.show();
-    win.focus();
-    try { win.moveTop(); } catch {}
+let windowHelpersInstance = null;
+function initWindowHelpers() {
+    if (windowHelpersInstance) return windowHelpersInstance;
+    windowHelpersInstance = createWindowHelpers({
+        dialog,
+        getAppConfig,
+        applyMaxLayoutCSS,
+        attachVWResize,
+    });
+    return windowHelpersInstance;
 }
-
-function safeShowError(title, message) {
-    try {
-        dialog.showErrorBox(
-            String(title ?? 'Error'),
-            String(message ?? 'An error occurred')
-        );
-    } catch (err) {
-        console.error('Could not show error dialog:', err);
-    }
-}
+function reveal(...args) { return initWindowHelpers().reveal(...args); }
+function safeShowError(...args) { return initWindowHelpers().safeShowError(...args); }
 
 // ---------- Window-state module bridge ----------
 let windowStateInstance = null;
@@ -143,50 +139,12 @@ function isBoundsOnAnyDisplay(...args) { return initWindowState().isBoundsOnAnyD
 
 // === Safe 'did-stop-loading' wiring =========================================
 // A named handler so removeListener(...) can reliably detach the same function.
-function onDidStopLoading() {
-    try {
-        // Place post-load logic here. Keep it lightweight and idempotent.
-    } catch (err) {
-        console.error('did-stop-loading handler error:', err);
-    }
-}
-
-function ensureDidStopLoadingHandler(webContents) {
-    if (!webContents) return;
-    if (webContents.__hasDidStopLoadingHandler) return;
-    webContents.__hasDidStopLoadingHandler = true;
-    webContents.on('did-stop-loading', onDidStopLoading);
-}
-
-// ============================================================================
-// CSS & layout attachment helper
-// ============================================================================
-function attachCSSAndLayoutHandlers(win, { role = 'window', revealOnReady = true } = {}) {
-    if (!win?.webContents) return;
-
-    ensureDidStopLoadingHandler(win.webContents);
-    if (!APP_CONFIG.enableLayoutCss) {
-        win.once('ready-to-show', () => {
-            if (revealOnReady) reveal(win);
-        });
-        return;
-    }
-
-    try {
-        win.webContents.once('did-stop-loading', () => {
-            setTimeout(() => {
-                try { applyMaxLayoutCSS(win); }
-                catch (e) { console.error(`applyMaxLayoutCSS (${role}) failed:`, e); }
-            }, 0);
-        });
-    } catch (e) {
-        console.error(`applyMaxLayoutCSS ${role} defer wiring failed:`, e);
-    }
-
-    win.once('ready-to-show', () => {
-        if (revealOnReady) reveal(win);
-        try { attachVWResize(win); }
-        catch (e) { console.error(`attachVWResize (${role}) failed:`, e); }
+function onDidStopLoading(...args) { return initWindowHelpers().onDidStopLoading(...args); }
+function ensureDidStopLoadingHandler(webContents) { return initWindowHelpers().ensureDidStopLoadingHandler(webContents, onDidStopLoading); }
+function attachCSSAndLayoutHandlers(win, options = {}) {
+    return initWindowHelpers().attachCSSAndLayoutHandlers(win, {
+        ...options,
+        didStopLoadingHandler: onDidStopLoading,
     });
 }
 
@@ -278,28 +236,6 @@ function debugDirectOpen(...args) { return initDirectOpen().debugDirectOpen(...a
 
 // Utility — executeInAllFrames
 // ============================================================================
-async function executeInAllFrames(win, script) {
-    if (!win?.webContents) return [];
-    const wc = win.webContents;
-    const results = [];
-    // Main frame
-    try {
-        const value = await wc.executeJavaScript(script);
-        results.push({ frameId: 0, value });
-    } catch {}
-    // Sub-frames
-    try {
-        const frames = wc.mainFrame?.framesInSubtree ?? wc.mainFrame?.frames ?? [];
-        for (const frame of frames) {
-            if (frame === wc.mainFrame) continue;
-            try {
-                const value = await frame.executeJavaScript(script);
-                results.push({ frameId: frame.routingId ?? -1, value });
-            } catch {}
-        }
-    } catch {}
-    return results;
-}
 
 // ============================================================================
 // Exporters
@@ -312,7 +248,6 @@ function initExporters() {
         BrowserWindow,
         dialog,
         safeShowError,
-        executeInAllFrames,
         getAppPartition: () => APP_PARTITION,
         buildLocateChatRootScript,
         appSlug: APP_SLUG,
@@ -453,11 +388,7 @@ function buildSendToQuickSubmenu(...args) { return initQuickChat().buildSendToQu
 // ============================================================================
 // Utility — ensureSaveState
 // ============================================================================
-function ensureSaveState(win) {
-    if (!win) return;
-    if (win.__saveStateInitialized) return;
-    win.__saveStateInitialized = true;
-}
+function ensureSaveState(...args) { return initWindowHelpers().ensureSaveState(...args); }
 
 // ============================================================================
 // App menu
