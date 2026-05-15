@@ -19,6 +19,7 @@ const { createContextMenu } = require('./lib/context-menu');
 const { createQuickChatManager } = require('./lib/quick-chat');
 const { createAppMenu } = require('./lib/app-menu');
 const { createTrayMenu } = require('./lib/tray-menu');
+const { createIconHelpers } = require('./lib/icon-helpers');
 
 // === App-specific modules ===
 const {
@@ -101,8 +102,8 @@ const {
 let mainWindow  = null;
 let tray        = null;
 let isQuitting  = false;
-let appIconImage = null;
-let trayImage24  = null;
+let appIconImage = null;  // Cached icon images
+let trayImage24 = null;  // Cached icon images
 
 // ============================================================================
 // Utility
@@ -534,15 +535,18 @@ function createTray(...args) { return initTrayMenu().createTray(...args); }
 // ============================================================
 // Icon helper
 // ============================================================
-function getIconPath(filename) {
-    const basePath = app.getAppPath();
-    const iconPath = path.join(basePath, 'assets', filename);
-    if (app.isPackaged) {
-        const asarPath = path.join(process.resourcesPath, 'app.asar.unpacked', 'assets', filename);
-        if (fs.existsSync(asarPath)) return asarPath;
-    }
-    return iconPath;
+let iconHelpersInstance = null;
+function initIconHelpers() {
+  if (iconHelpersInstance) return iconHelpersInstance;
+  iconHelpersInstance = createIconHelpers({
+    app,
+    fs,
+    path,
+    process,
+  });
+    return iconHelpersInstance;
 }
+function getIconPath(...args) { return initIconHelpers().getIconPath(...args); }
 
 // ============================================================
 // createWindow
