@@ -21,6 +21,7 @@ const { createAppMenu } = require('./lib/app-menu');
 const { createTrayMenu } = require('./lib/tray-menu');
 const { createWindowHelpers } = require('./lib/window-helpers');
 const { createMainWindowManager } = require('./lib/main-window');
+const { createMainBootstrap } = require('./main.bootstrap');
 const { createIconHelpers } = require('./lib/icon-helpers');
 
 // === App-specific modules ===
@@ -232,7 +233,9 @@ function initDirectOpen() {
 }
 
 function registerDirectOpenDownloadHandler(...args) { return initDirectOpen().registerDirectOpenDownloadHandler(...args); }
+function registerDirectOpenIpcHandler(...args) { return initDirectOpen().registerDirectOpenIpcHandler(...args); }
 function pruneExpiredDirectOpenRequests(...args) { return initDirectOpen().pruneExpiredDirectOpenRequests(...args); }
+function cleanupTempFiles(...args) { return initDirectOpen().cleanupTempFiles(...args); }
 function debugDirectOpen(...args) { return initDirectOpen().debugDirectOpen(...args); }
 
 // Utility — executeInAllFrames
@@ -526,42 +529,31 @@ function initMainWindowManager() {
 }
 function createWindow(...args) { return initMainWindowManager().createWindow(...args); }
 // ============================================================
+// ============================================================
 // App lifecycle
 // ============================================================
-app.setName(appConfig.appName);
-app.setAppUserModelId(appConfig.appUserModelId);
-
-app.whenReady().then(() => {
-    loadAppConfig();
-
-    if (APP_CONFIG.enableDirectOpen) {
-        initDirectOpen().registerDirectOpenIpcHandler(IPC);
-        registerDirectOpenDownloadHandler();
-    }
-
-    createWindow();
-    createTray();
-    app.on('activate', () => {
-        if (BrowserWindow.getAllWindows().length === 0) createWindow();
-        else if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
+let mainBootstrapInstance = null;
+function initMainBootstrap() {
+    if (mainBootstrapInstance) return mainBootstrapInstance;
+    mainBootstrapInstance = createMainBootstrap({
+        app,
+        BrowserWindow,
+        appConfig,
+        getAppConfig,
+        loadAppConfig,
+        getLayoutObserverGlobal: () => LAYOUT_OBSERVER_GLOBAL,
+        getMainWindow: () => mainWindow,
+        setIsQuitting: (value) => { isQuitting = !!value; },
+        createWindow,
+        createTray,
+        registerDirectOpenIpcHandler: () => registerDirectOpenIpcHandler(IPC),
+        registerDirectOpenDownloadHandler,
+        pruneExpiredDirectOpenRequests,
+        cleanupTempFiles,
+        closeAllQuickChatWindows,
     });
-});
+    return mainBootstrapInstance;
+}
+function bootstrapApp(...args) { return initMainBootstrap().bootstrapApp(...args); }
 
-app.on('window-all-closed', () => { /* keep tray resident */ });
-
-app.on('before-quit', () => {
-    isQuitting = true;
-    try {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.executeJavaScript(`(function(observerName){
-                try {
-                    if (window[observerName]) {
-                        window[observerName].disconnect();
-                        window[observerName] = null;
-                    }
-                } catch {}
-            })(${JSON.stringify(LAYOUT_OBSERVER_GLOBAL)});`).catch(() => {});
-        }
-        try { initQuickChat().closeAllQuickChatWindows(); } catch {}
-    } catch {}
-});
+bootstrapApp();
