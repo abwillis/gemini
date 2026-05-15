@@ -5,40 +5,39 @@ const { app, BrowserWindow, Menu, MenuItem, Tray, nativeImage, shell, ipcMain, d
 const path = require('path');
 const fs = require('fs');
 
+const appConfig = require('./app.config');
 const { createIPC } = require('./lib/ipc');
 const { createRuntimeConfig } = require('./lib/runtime-config');
-const appConfig = require('./app.config');
-
-// === App-specific modules ===
-const {
-    CHAT_ROOT_SELECTORS, CHAT_MESSAGE_LIST_SELECTORS,
-    CHAT_SCOPE_SELECTOR, CHAT_SCOPE_PSEUDO,
-    CHAT_MESSAGE_LIST_SELECTOR, CHAT_MESSAGE_LIST_PSEUDO,
-    EXPORT_ROOT_CLASS, EXPORT_ROOT_SELECTOR,
-    CODE_PREVIEW_IFRAME_SELECTOR, DOM_CLEANUP_SELECTORS,
-    cleanupDOMFragmentScript, buildChatPaneDetectionScript,
-    buildLocateChatRootScript,
-} = require('./lib/chat-dom');
-
-const {
-    SELECTORS, IGNORE_SELECTORS, IGNORE_JOINED,
-    messageContentById, MAX_CHARS, VW_SIZE, MIN_VW, MAX_VW,
-    applyDynamicWidth, attachVWResize, buildMaxLayoutCSS,
-    maxLayoutCssCache, injectedFrameIdsByWC, insertedMainCssKeyByWC, cssApplyDebounceByWC,
-    injectCSSOnLoad, injectCSSIntoAllFrames, applyMaxLayoutCSS, requestExpandedLayout,
-    buildFindContentVisibilityCSS, enableFindContentVisibility, disableFindContentVisibility,
-} = require('./lib/layout-css');
 
 // === Shared modules ===
 const { createWindowState } = require('./lib/window-state');
-const { createQuickChatManager } = require('./lib/quick-chat');
+const { createSessionHelpers } = require('./lib/session-helpers');
 const { createFindInPage } = require('./lib/find-in-page');
 const { createDirectOpen } = require('./lib/direct-open');
-const { createSessionHelpers } = require('./lib/session-helpers');
-const { createContextMenu } = require('./lib/context-menu');
-const { createAppMenu } = require('./lib/app-menu');
 const { createExporters, EXPORT_SCOPES } = require('./lib/exporters');
+const { createContextMenu } = require('./lib/context-menu');
+const { createQuickChatManager } = require('./lib/quick-chat');
+const { createAppMenu } = require('./lib/app-menu');
 
+// === App-specific modules ===
+const {
+  CHAT_ROOT_SELECTORS, CHAT_MESSAGE_LIST_SELECTORS,
+  CHAT_SCOPE_SELECTOR, CHAT_SCOPE_PSEUDO,
+  CHAT_MESSAGE_LIST_SELECTOR, CHAT_MESSAGE_LIST_PSEUDO,
+  EXPORT_ROOT_CLASS, EXPORT_ROOT_SELECTOR,
+  CODE_PREVIEW_IFRAME_SELECTOR, DOM_CLEANUP_SELECTORS,
+  cleanupDOMFragmentScript, buildChatPaneDetectionScript,
+  buildLocateChatRootScript,
+} = require('./lib/chat-dom');
+
+const {
+  SELECTORS, IGNORE_SELECTORS, IGNORE_JOINED,
+  messageContentById, MAX_CHARS, VW_SIZE, MIN_VW, MAX_VW,
+  applyDynamicWidth, attachVWResize, buildMaxLayoutCSS,
+  maxLayoutCssCache, injectedFrameIdsByWC, insertedMainCssKeyByWC, cssApplyDebounceByWC,
+  injectCSSOnLoad, injectCSSIntoAllFrames, applyMaxLayoutCSS, requestExpandedLayout,
+  buildFindContentVisibilityCSS, enableFindContentVisibility, disableFindContentVisibility,
+} = require('./lib/layout-css');
 // ============================================================================
 // App identity & constants
 // ============================================================================
