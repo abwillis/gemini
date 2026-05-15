@@ -63,16 +63,16 @@ let APP_CONFIG = { ...DEFAULT_APP_CONFIG };
 // Runtime config/logging
 // ============================================================================
 const runtimeConfig = createRuntimeConfig({
-    app,
-    fs,
-    path,
-    defaultAppConfig: DEFAULT_APP_CONFIG,
-    partitionEnvVar: appConfig.partitionEnvVar,
-    onConfigLoaded(config) {
-        APP_CONFIG = config;
-        APP_URL = config.appUrl;
-        APP_PARTITION = config.partition;
-    },
+  app,
+  fs,
+  path,
+  defaultAppConfig: DEFAULT_APP_CONFIG,
+  partitionEnvVar: appConfig.partitionEnvVar,
+  onConfigLoaded(config) {
+    APP_CONFIG = config;
+    APP_PARTITION = config.partition;
+    APP_URL = config.appUrl;
+  },
 });
 
 const {
@@ -106,6 +106,7 @@ let trayImage24  = null;
 // ============================================================================
 // Utility
 // ============================================================================
+// Unified reveal helper to avoid repeated show/focus chains
 function reveal(win) {
     if (!win) return;
     if (win.isMinimized()) win.restore();
@@ -125,9 +126,7 @@ function safeShowError(title, message) {
     }
 }
 
-// ============================================================================
-// Window-state module bridge
-// ============================================================================
+// ---------- Window-state module bridge ----------
 let windowStateInstance = null;
 function initWindowState() {
     if (windowStateInstance) return windowStateInstance;
@@ -140,9 +139,8 @@ function scheduleSaveWindowState(...args) { return initWindowState().scheduleSav
 function loadWindowState(...args) { return initWindowState().loadWindowState(...args); }
 function isBoundsOnAnyDisplay(...args) { return initWindowState().isBoundsOnAnyDisplay(...args); }
 
-// ============================================================================
-// did-stop-loading handler
-// ============================================================================
+// === Safe 'did-stop-loading' wiring =========================================
+// A named handler so removeListener(...) can reliably detach the same function.
 function onDidStopLoading() {
     try {
         // Place post-load logic here. Keep it lightweight and idempotent.
