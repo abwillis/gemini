@@ -20,6 +20,7 @@ const { createQuickChatManager } = require('./lib/quick-chat');
 const { createAppMenu } = require('./lib/app-menu');
 const { createTrayMenu } = require('./lib/tray-menu');
 const { createWindowHelpers } = require('./lib/window-helpers');
+const { createMainWindowManager } = require('./lib/main-window');
 const { createIconHelpers } = require('./lib/icon-helpers');
 
 // === App-specific modules ===
@@ -482,110 +483,48 @@ function getIconPath(...args) { return initIconHelpers().getIconPath(...args); }
 // ============================================================
 // createWindow
 // ============================================================
-function createWindow() {
-    if (mainWindow) return;
-
-    const taIcon = nativeImage.createFromPath(getIconPath(appConfig.iconFileName));
-    if (!appIconImage || appIconImage.isEmpty()) appIconImage = taIcon;
-    console.log('ICON DEBUG:', 'empty:', appIconImage.isEmpty(), 'size:', appIconImage.getSize());
-    if (!trayImage24 || trayImage24.isEmpty?.()) {
-        try { trayImage24 = taIcon.resize({ width: 24, height: 24 }); } catch {}
-    }
-
-    const boundsKey = 'main';
-    const initialBounds = getInitialWindowBounds(boundsKey);
-
-    mainWindow = new BrowserWindow({
-        skipTaskbar: false,
-        title: `${APP_LABEL} Main Chat`,
-        width: initialBounds.width,
-        height: initialBounds.height,
-        x: typeof initialBounds.x === 'number' ? initialBounds.x : undefined,
-        y: typeof initialBounds.y === 'number' ? initialBounds.y : undefined,
-        show: false,
-        icon: appIconImage || taIcon,
-        webPreferences: {
-            nodeIntegration: false,
-            contextIsolation: true,
-            sandbox: false,
-            preload: path.join(__dirname, 'preload.js'),
-            partition: APP_PARTITION,
-            devTools: !!APP_CONFIG.devToolsEnabled,
-            backgroundThrottling: true,
-            spellcheck: false,
-        },
-        type: 'normal',
-        autoHideMenuBar: false,
+let mainWindowManagerInstance = null;
+function initMainWindowManager() {
+    if (mainWindowManagerInstance) return mainWindowManagerInstance;
+    mainWindowManagerInstance = createMainWindowManager({
+        BrowserWindow,
+        Menu,
+        nativeImage,
+        shell,
+        path,
+        dirname: __dirname,
+        appConfig,
+        appLabel: APP_LABEL,
+        getAppConfig,
+        getAppUrl: () => APP_URL,
+        getAppPartition: () => APP_PARTITION,
+        getMainWindow: () => mainWindow,
+        setMainWindow: (value) => { mainWindow = value; },
+        getAppIconImage: () => appIconImage,
+        setAppIconImage: (value) => { appIconImage = value; },
+        getTrayImage24: () => trayImage24,
+        setTrayImage24: (value) => { trayImage24 = value; },
+        getIconPath,
+        getInitialWindowBounds,
+        reveal,
+        setRoleTitle,
+        augmentApplicationMenu,
+        registerShowContextMenuIpcHandler,
+        ensureDidStopLoadingHandler,
+        attachCSSAndLayoutHandlers,
+        attachWindowStatePersistence,
+        attachFindResultForwarding,
+        onDidStopLoading,
+        buildContextMenuTemplate,
+        registerFindIpcHandlers: () => initFindInPage().registerFindIpcHandlers(),
+        handleEscapeStopFind: (...args) => initFindInPage().handleEscapeStopFind(...args),
+        enableLayoutWidthKeyboardShortcuts: false,
+        layoutWidthKeyboardApiPrefix: `__${APP_SLUG}`,
+        defaultVwSize: VW_SIZE,
     });
-
-    mainWindow.setMenuBarVisibility(true);
-    try { mainWindow.setIcon(appIconImage || taIcon); } catch {}
-
-    registerShowContextMenuIpcHandler();
-
-    mainWindow.once('ready-to-show', () => {
-        reveal(mainWindow);
-        try { mainWindow.__appRole = 'main'; } catch {}
-        try { mainWindow.__boundsKey = boundsKey; } catch {}
-        try { setRoleTitle(mainWindow, 'main'); } catch {}
-        augmentApplicationMenu(mainWindow);
-    });
-
-    mainWindow.setSkipTaskbar(false);
-    ensureDidStopLoadingHandler(mainWindow.webContents);
-    mainWindow.webContents.setMaxListeners(0);
-
-    mainWindow.loadURL(APP_URL);
-
-    attachCSSAndLayoutHandlers(mainWindow, { role: 'main', revealOnReady: false });
-    attachWindowStatePersistence(mainWindow, boundsKey, { hideOnClose: true });
-    attachFindResultForwarding(mainWindow);
-
-    mainWindow.webContents.on('did-start-navigation', () => {
-        // Keep the did-stop-loading handler singular across SPA navigations.
-    });
-    mainWindow.webContents.on('destroyed', () => {
-        try {
-            mainWindow?.webContents?.removeListener('did-stop-loading', onDidStopLoading);
-            if (mainWindow?.webContents) {
-                delete mainWindow.webContents.__hasDidStopLoadingHandler;
-            }
-        } catch {}
-    });
-
-    mainWindow.webContents.on('context-menu', (_event, params) => {
-        let menu;
-        try {
-            menu = Menu.buildFromTemplate(
-                buildContextMenuTemplate(mainWindow, params, {
-                    includeQuickChatFeatures: !!APP_CONFIG.enableQuickChat,
-                    includeChatPaneFeatures: true,
-                    includeMarkdownExport: true,
-                })
-            );
-        } catch (err) {
-            console.error('Context menu template error:', err);
-            const hasSelection = !!params?.selectionText && params.selectionText.length > 0;
-            menu = Menu.buildFromTemplate([{ role: 'copy', enabled: hasSelection }, { role: 'selectAll' }]);
-        }
-        try { menu.popup({ window: mainWindow }); }
-        catch (err) { console.error('Context menu popup failed:', err); }
-    });
-
-    mainWindow.webContents.setWindowOpenHandler(({ url }) => (
-        shell.openExternal(url), { action: 'deny' }
-    ));
-
-    initFindInPage().registerFindIpcHandlers();
-
-    mainWindow.webContents.on('before-input-event', (event, input) => {
-        if (input.type === 'keyDown' && input.key === 'Escape') {
-            initFindInPage().handleEscapeStopFind(mainWindow);
-        }
-    });
-
-    mainWindow.on('closed', () => { mainWindow = null; });
+    return mainWindowManagerInstance;
 }
+function createWindow(...args) { return initMainWindowManager().createWindow(...args); }
 // ============================================================
 // App lifecycle
 // ============================================================
