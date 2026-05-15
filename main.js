@@ -188,23 +188,22 @@ function initSessionHelpers() {
     });
     return sessionHelpersInstance;
 }
-
 function getRuntimeInfo(...args) { return initSessionHelpers().getRuntimeInfo(...args); }
-function showAboutDialog(...args) { return initSessionHelpers().showAboutDialog(...args); }
-function showApplicationHelp(...args) { return initSessionHelpers().showApplicationHelp(...args); }
+function getAppSession(...args) { return initSessionHelpers().getAppSession(...args); }
+function getActiveAppWindow(...args) { return initSessionHelpers().getActiveAppWindow(...args); }
+function getActiveAppWebContents(...args) { return initSessionHelpers().getActiveAppWebContents(...args); }
 function reloadApp(...args) { return initSessionHelpers().reloadApp(...args); }
 function clearAppCache(...args) { return initSessionHelpers().clearAppCache(...args); }
 function clearCookiesAndSignOut(...args) { return initSessionHelpers().clearCookiesAndSignOut(...args); }
 function copyCurrentUrl(...args) { return initSessionHelpers().copyCurrentUrl(...args); }
 function openCurrentUrlExternal(...args) { return initSessionHelpers().openCurrentUrlExternal(...args); }
-function getAppSession(...args) { return initSessionHelpers().getAppSession(...args); }
 function getLogsFolderPath(...args) { return initSessionHelpers().getLogsFolderPath(...args); }
 function openPathWithError(...args) { return initSessionHelpers().openPathWithError(...args); }
 function openLogsFolder(...args) { return initSessionHelpers().openLogsFolder(...args); }
 function openConfigFile(...args) { return initSessionHelpers().openConfigFile(...args); }
 function toggleActiveWindowAlwaysOnTop(...args) { return initSessionHelpers().toggleActiveWindowAlwaysOnTop(...args); }
-
-// ============================================================================
+function showAboutDialog(...args) { return initSessionHelpers().showAboutDialog(...args); }
+function showApplicationHelp(...args) { return initSessionHelpers().showApplicationHelp(...args); }
 
 // Find-in-page
 // ============================================================================
@@ -300,15 +299,14 @@ function initExporters() {
     });
     return exportersInstance;
 }
-
 async function findBestChatRoot(...args) { return initExporters().findBestChatRoot(...args); }
 async function getChatPaneSnapshot(...args) { return initExporters().getChatPaneSnapshot(...args); }
-async function getSelectionFragment(...args) { return initExporters().getSelectionFragment(...args); }
-async function getSelectionFragmentRaw(...args) { return initExporters().getSelectionFragmentRaw(...args); }
 function htmlToMarkdown(...args) { return initExporters().htmlToMarkdown(...args); }
 function stripTags(...args) { return initExporters().stripTags(...args); }
 function decodeEntities(...args) { return initExporters().decodeEntities(...args); }
 function stripExecutableBlocks(...args) { return initExporters().stripExecutableBlocks(...args); }
+async function getSelectionFragment(...args) { return initExporters().getSelectionFragment(...args); }
+async function getSelectionFragmentRaw(...args) { return initExporters().getSelectionFragmentRaw(...args); }
 async function buildSelectionMarkdownForExport(...args) { return initExporters().buildSelectionMarkdownForExport(...args); }
 async function selectChatPane(...args) { return initExporters().selectChatPane(...args); }
 async function promptSaveChatPane(...args) { return initExporters().promptSaveChatPane(...args); }
@@ -396,7 +394,6 @@ function initQuickChat() {
     quickChatManager.registerIpcHandlers();
     return quickChatManager;
 }
-
 function normalizeSendOptions(...args) { return initQuickChat().normalizeSendOptions(...args); }
 function quoteify(...args) { return initQuickChat().quoteify(...args); }
 function getQuickDisplayName(...args) { return initQuickChat().getQuickDisplayName(...args); }
@@ -416,8 +413,6 @@ function createQuickChatWindow(...args) { return initQuickChat().createQuickChat
 async function sendSelectionToQuick(...args) { return initQuickChat().sendSelectionToQuick(...args); }
 async function sendSelectionToSpecificQuickViaDialog(...args) { return initQuickChat().sendSelectionToSpecificQuickViaDialog(...args); }
 function buildSendToQuickSubmenu(...args) { return initQuickChat().buildSendToQuickSubmenu(...args); }
-
-// ============================================================================
 
 // ============================================================================
 // Utility — ensureSaveState
@@ -465,7 +460,6 @@ function initAppMenu() {
     });
     return appMenuInstance;
 }
-
 function appendEditItems(...args) { return initAppMenu().appendEditItems(...args); }
 function appendHelpItems(...args) { return initAppMenu().appendHelpItems(...args); }
 function appendSessionItems(...args) { return initAppMenu().appendSessionItems(...args); }
