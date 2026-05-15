@@ -618,6 +618,39 @@ function createWindow() {
     mainWindow.setMenuBarVisibility(true);
     try { mainWindow.setIcon(appIconImage || taIcon); } catch {}
 
+
+    // Right-click native context menu IPC helper, aligned with Copilot.
+    const baseContextMenu = Menu.buildFromTemplate([
+        { role: 'cut',        accelerator: 'Ctrl+X', enabled: false },
+        { role: 'copy',       accelerator: 'Ctrl+C', enabled: false },
+        { role: 'paste',      accelerator: 'Ctrl+V', enabled: false },
+        { type: 'separator' },
+        { role: 'selectAll',  accelerator: 'Ctrl+A', enabled: true  },
+    ]);
+
+    function popupContext(win, params) {
+        const menu = Menu.buildFromTemplate(
+            buildContextMenuTemplate(win, {
+                ...params,
+                selectionText: params?.selectionText ?? (params?.hasSelection ? 'x' : '')
+            }, {
+                includeQuickChatFeatures: false,
+                includeChatPaneFeatures: false,
+                includeMarkdownExport: false
+            })
+        );
+        menu.popup({ window: win });
+    }
+
+    // Guard against duplicate registrations.
+    if (!ipcMain.listenerCount('show-context-menu')) {
+        ipcMain.on('show-context-menu', (event, params) => {
+            const win = BrowserWindow.fromWebContents(event.sender);
+            if (!win) return;
+            popupContext(win, params);
+        });
+    }
+
     mainWindow.once('ready-to-show', () => {
         reveal(mainWindow);
         try { mainWindow.__appRole = 'main'; } catch {}
