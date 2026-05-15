@@ -116,8 +116,14 @@ function reveal(win) {
 }
 
 function safeShowError(title, message) {
-    try { dialog.showErrorBox(String(title ?? 'Error'), String(message ?? 'An error occurred')); }
-    catch (err) { console.error('Could not show error dialog:', err); }
+    try {
+        dialog.showErrorBox(
+            String(title ?? 'Error'),
+            String(message ?? 'An error occurred')
+        );
+    } catch (err) {
+        console.error('Could not show error dialog:', err);
+    }
 }
 
 // ============================================================================
@@ -139,7 +145,11 @@ function isBoundsOnAnyDisplay(...args) { return initWindowState().isBoundsOnAnyD
 // did-stop-loading handler
 // ============================================================================
 function onDidStopLoading() {
-    try { /* placeholder for post-load logic */ } catch (err) { console.error('did-stop-loading handler error:', err); }
+    try {
+        // Place post-load logic here. Keep it lightweight and idempotent.
+    } catch (err) {
+        console.error('did-stop-loading handler error:', err);
+    }
 }
 
 function ensureDidStopLoadingHandler(webContents) {
@@ -152,16 +162,33 @@ function ensureDidStopLoadingHandler(webContents) {
 // ============================================================================
 // CSS & layout attachment helper
 // ============================================================================
-function attachCSSAndLayoutHandlers(win) {
-    if (!win) return;
+function attachCSSAndLayoutHandlers(win, { role = 'window', revealOnReady = true } = {}) {
+    if (!win?.webContents) return;
+
+    ensureDidStopLoadingHandler(win.webContents);
+    if (!APP_CONFIG.enableLayoutCss) {
+        win.once('ready-to-show', () => {
+            if (revealOnReady) reveal(win);
+        });
+        return;
+    }
+
     try {
         win.webContents.once('did-stop-loading', () => {
             setTimeout(() => {
                 try { applyMaxLayoutCSS(win); }
-                catch (e) { console.error('applyMaxLayoutCSS (deferred) failed:', e); }
-            }, 10);
+                catch (e) { console.error(`applyMaxLayoutCSS (${role}) failed:`, e); }
+            }, 0);
         });
-    } catch (e) { console.error('applyMaxLayoutCSS defer wiring failed:', e); }
+    } catch (e) {
+        console.error(`applyMaxLayoutCSS ${role} defer wiring failed:`, e);
+    }
+
+    win.once('ready-to-show', () => {
+        if (revealOnReady) reveal(win);
+        try { attachVWResize(win); }
+        catch (e) { console.error(`attachVWResize (${role}) failed:`, e); }
+    });
 }
 
 // ============================================================================
@@ -603,7 +630,7 @@ function createWindow() {
     mainWindow.webContents.setMaxListeners(0);
     mainWindow.loadURL(APP_URL);
 
-    attachCSSAndLayoutHandlers(mainWindow);
+    attachCSSAndLayoutHandlers(mainWindow, { role: 'main', revealOnReady: false });
     attachWindowStatePersistence(mainWindow, boundsKey);
     initFindInPage().attachFindResultForwarding(mainWindow);
 
