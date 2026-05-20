@@ -81,32 +81,33 @@ const runtimeConfig = createRuntimeConfig({
 });
 
 const {
-    sanitizeLogFileName,
-    getConfigFilePath,
-    getLogFilePath,
-    formatConsoleArg,
-    appendConsoleLogToFile,
-    makeConsoleMethod,
-    applyConsoleLoggingConfig,
-    normalizeBooleanConfig,
-    normalizePositiveIntegerConfig,
-    normalizeExportFormat,
-    normalizeExportProfile,
-    normalizeAppConfig,
-    writeConfigFile,
-    loadAppConfig,
-    ensureConfigFile,
-    getAppConfig,
+  sanitizeLogFileName,
+  getConfigFilePath,
+  getLogFilePath,
+  formatConsoleArg,
+  appendConsoleLogToFile,
+  makeConsoleMethod,
+  applyConsoleLoggingConfig,
+  normalizeBooleanConfig,
+  normalizePositiveIntegerConfig,
+  normalizeExportFormat,
+  normalizeExportProfile,
+  normalizeAppConfig,
+  writeConfigFile,
+  loadAppConfig,
+  ensureConfigFile,
+  getAppConfig,
 } = runtimeConfig;
 
 // ============================================================================
 // State
 // ============================================================================
-let mainWindow  = null;
-let tray        = null;
-let isQuitting  = false;
+let mainWindow = null;
+let tray = null;
+let isQuitting = false;
 let appIconImage = null;  // Cached icon images
 let trayImage24 = null;  // Cached icon images
+let lastSavePath = null;  // (legacy) Remember where "Save" last wrote to (per session/window)
 
 // ============================================================================
 // Utility
@@ -114,14 +115,14 @@ let trayImage24 = null;  // Cached icon images
 // Unified reveal helper to avoid repeated show/focus chains
 let windowHelpersInstance = null;
 function initWindowHelpers() {
-    if (windowHelpersInstance) return windowHelpersInstance;
-    windowHelpersInstance = createWindowHelpers({
-        dialog,
-        getAppConfig,
-        applyMaxLayoutCSS,
-        attachVWResize,
-    });
-    return windowHelpersInstance;
+  if (windowHelpersInstance) return windowHelpersInstance;
+  windowHelpersInstance = createWindowHelpers({
+    dialog,
+    getAppConfig,
+    applyMaxLayoutCSS,
+    attachVWResize,
+  });
+  return windowHelpersInstance;
 }
 function reveal(...args) { return initWindowHelpers().reveal(...args); }
 function safeShowError(...args) { return initWindowHelpers().safeShowError(...args); }
@@ -129,9 +130,9 @@ function safeShowError(...args) { return initWindowHelpers().safeShowError(...ar
 // ---------- Window-state module bridge ----------
 let windowStateInstance = null;
 function initWindowState() {
-    if (windowStateInstance) return windowStateInstance;
-    windowStateInstance = createWindowState({ app, path, fs, screen, getIsQuitting: () => isQuitting });
-    return windowStateInstance;
+  if (windowStateInstance) return windowStateInstance;
+  windowStateInstance = createWindowState({ app, path, fs, screen, getIsQuitting: () => isQuitting });
+  return windowStateInstance;
 }
 function attachWindowStatePersistence(...args) { return initWindowState().attachWindowStatePersistence(...args); }
 function getInitialWindowBounds(...args) { return initWindowState().getInitialWindowBounds(...args); }
@@ -144,37 +145,35 @@ function isBoundsOnAnyDisplay(...args) { return initWindowState().isBoundsOnAnyD
 function onDidStopLoading(...args) { return initWindowHelpers().onDidStopLoading(...args); }
 function ensureDidStopLoadingHandler(webContents) { return initWindowHelpers().ensureDidStopLoadingHandler(webContents, onDidStopLoading); }
 function attachCSSAndLayoutHandlers(win, options = {}) {
-    return initWindowHelpers().attachCSSAndLayoutHandlers(win, {
-        ...options,
-        didStopLoadingHandler: onDidStopLoading,
-    });
+  return initWindowHelpers().attachCSSAndLayoutHandlers(win, {
+    ...options,
+    didStopLoadingHandler: onDidStopLoading,
+  });
 }
 
-// ============================================================================
-// Session helpers
-// ============================================================================
+// ---------- Session-helpers module bridge ----------
 let sessionHelpersInstance = null;
 function initSessionHelpers() {
-    if (sessionHelpersInstance) return sessionHelpersInstance;
+  if (sessionHelpersInstance) return sessionHelpersInstance;
 
-    sessionHelpersInstance = createSessionHelpers({
-        app, BrowserWindow, dialog, shell, session, clipboard, nativeImage,
-        fs, path, getAppConfig,
-        partition: APP_PARTITION,
-        appLabel: APP_LABEL,
-        getAppPartition: () => APP_PARTITION,
-        getAppUrl: () => APP_URL,
-        getConfigFilePath,
-        getLogFilePath,
-        ensureConfigFile,
-        getMainWindow: () => mainWindow,
-        getAppIconImage: () => appIconImage,
-        safeShowError,
-        refreshTrayMenu,
-        refreshQuickChatMenu,
-    });
+  sessionHelpersInstance = createSessionHelpers({
+    app, BrowserWindow, dialog, shell, session, clipboard, nativeImage,
+    fs, path, getAppConfig,
+    partition: APP_PARTITION,
+    appLabel: APP_LABEL,
+    getAppPartition: () => APP_PARTITION,
+    getAppUrl: () => APP_URL,
+    getConfigFilePath,
+    getLogFilePath,
+    ensureConfigFile,
+    getMainWindow: () => mainWindow,
+    getAppIconImage: () => appIconImage,
+    safeShowError,
+    refreshTrayMenu,
+    refreshQuickChatMenu,
+  });
 
-    return sessionHelpersInstance;
+  return sessionHelpersInstance;
 }
 function getRuntimeInfo(...args) { return initSessionHelpers().getRuntimeInfo(...args); }
 function getAppSession(...args) { return initSessionHelpers().getAppSession(...args); }
@@ -193,21 +192,20 @@ function toggleActiveWindowAlwaysOnTop(...args) { return initSessionHelpers().to
 function showAboutDialog(...args) { return initSessionHelpers().showAboutDialog(...args); }
 function showApplicationHelp(...args) { return initSessionHelpers().showApplicationHelp(...args); }
 
-// Find-in-page
-// ============================================================================
+// ---------- Find-in-page module bridge ----------
 let findInPageInstance = null;
 function initFindInPage() {
-    if (findInPageInstance) return findInPageInstance;
-    findInPageInstance = createFindInPage({
-        BrowserWindow,
-        ipcMain,
-        screen,
-        getMainWindow: () => mainWindow,
-        getAppConfig,
-        enableFindContentVisibility,
-        disableFindContentVisibility,
-    });
-    return findInPageInstance;
+  if (findInPageInstance) return findInPageInstance;
+  findInPageInstance = createFindInPage({
+    BrowserWindow,
+    ipcMain,
+    screen,
+    getMainWindow: () => mainWindow,
+    getAppConfig,
+    enableFindContentVisibility,
+    disableFindContentVisibility,
+  });
+  return findInPageInstance;
 }
 
 function openFindModal(...args) { return initFindInPage().openFindModal(...args); }
@@ -218,18 +216,18 @@ function getWCFromEventSender(...args) { return initFindInPage().getWCFromEventS
 function getWC(...args) { return initFindInPage().getWC(...args); }
 function applyWordStartOptions(...args) { return initFindInPage().applyWordStartOptions(...args); }
 
-// direct-open initialization
+// ---------- Direct-open module bridge ----------
 let directOpenInstance = null;
 function initDirectOpen() {
-    if (directOpenInstance) return directOpenInstance;
-    directOpenInstance = createDirectOpen({
-        session, shell, fs, path, app, ipcMain,
-        getAppConfig,
-        getAppPartition: () => APP_PARTITION,
-        appSlug: APP_SLUG,
-        safeShowError,
-    });
-    return directOpenInstance;
+  if (directOpenInstance) return directOpenInstance;
+  directOpenInstance = createDirectOpen({
+    session, shell, fs, path, app, ipcMain,
+    getAppConfig,
+    getAppPartition: () => APP_PARTITION,
+    appSlug: APP_SLUG,
+    safeShowError,
+  });
+  return directOpenInstance;
 }
 
 function registerDirectOpenDownloadHandler(...args) { return initDirectOpen().registerDirectOpenDownloadHandler(...args); }
@@ -238,35 +236,30 @@ function pruneExpiredDirectOpenRequests(...args) { return initDirectOpen().prune
 function cleanupTempFiles(...args) { return initDirectOpen().cleanupTempFiles(...args); }
 function debugDirectOpen(...args) { return initDirectOpen().debugDirectOpen(...args); }
 
-// Utility — executeInAllFrames
-// ============================================================================
-
-// ============================================================================
-// Exporters
-// ============================================================================
+// ---------- Exporter module bridge ----------
 let exportersInstance = null;
 function initExporters() {
-    if (exportersInstance) return exportersInstance;
-    exportersInstance = createExporters({
-        app,
-        BrowserWindow,
-        dialog,
-        safeShowError,
-        getAppPartition: () => APP_PARTITION,
-        buildLocateChatRootScript,
-        appSlug: APP_SLUG,
-        buildChatPaneDetectionScript,
-        cleanupDOMFragmentScript,
-        CHAT_SCOPE_PSEUDO,
-        EXPORT_ROOT_CLASS,
-        EXPORT_ROOT_SELECTOR,
-        getAppConfig,
-        DEFAULT_APP_CONFIG,
-        normalizeExportFormat,
-        appLabel: APP_LABEL,
-        appSlug: APP_SLUG,
-    });
-    return exportersInstance;
+  if (exportersInstance) return exportersInstance;
+  exportersInstance = createExporters({
+    app,
+    BrowserWindow,
+    dialog,
+    safeShowError,
+    getAppPartition: () => APP_PARTITION,
+    buildLocateChatRootScript,
+    appSlug: APP_SLUG,
+    buildChatPaneDetectionScript,
+    cleanupDOMFragmentScript,
+    CHAT_SCOPE_PSEUDO,
+    EXPORT_ROOT_CLASS,
+    EXPORT_ROOT_SELECTOR,
+    getAppConfig,
+    DEFAULT_APP_CONFIG,
+    normalizeExportFormat,
+    appLabel: APP_LABEL,
+    appSlug: APP_SLUG,
+  });
+  return exportersInstance;
 }
 async function findBestChatRoot(...args) { return initExporters().findBestChatRoot(...args); }
 async function getChatPaneSnapshot(...args) { return initExporters().getChatPaneSnapshot(...args); }
@@ -302,23 +295,20 @@ async function writeHtmlDocumentToPDF(...args) { return initExporters().writeHtm
 async function saveChatPaneAsPDF(...args) { return initExporters().saveChatPaneAsPDF(...args); }
 async function saveAsDialog(...args) { return initExporters().saveAsDialog(...args); }
 
-// ============================================================================
-// Context menu
-// ============================================================================
+// ---------- Context-menu module bridge ----------
 let contextMenuInstance = null;
 function initContextMenu() {
-    if (contextMenuInstance) return contextMenuInstance;
-    contextMenuInstance = createContextMenu({
-        Menu, MenuItem, clipboard, shell, BrowserWindow, dialog, ipcMain,
-        getAppConfig, SEND_MODE, EXPORT_SCOPES,
-        selectChatPane, promptSaveChatPane, getSelectionFragment,
-        htmlToMarkdown, buildSendToQuickSubmenu, createQuickChatWindow,
-        promptExportWithProfile, buildExportProfileMenuTemplate,
-        openFindModal, reveal, safeShowError, saveSelectionAsMarkdown,
-    });
-    return contextMenuInstance;
+  if (contextMenuInstance) return contextMenuInstance;
+  contextMenuInstance = createContextMenu({
+    Menu, MenuItem, clipboard, shell, BrowserWindow, dialog, ipcMain,
+    getAppConfig, SEND_MODE, EXPORT_SCOPES,
+    selectChatPane, promptSaveChatPane, getSelectionFragment,
+    htmlToMarkdown, buildSendToQuickSubmenu, createQuickChatWindow,
+    promptExportWithProfile, buildExportProfileMenuTemplate,
+    openFindModal, reveal, safeShowError, saveSelectionAsMarkdown,
+  });
+  return contextMenuInstance;
 }
-
 function buildContextMenuTemplate(...args) {
     return initContextMenu().buildContextMenuTemplate(...args);
 }
@@ -326,48 +316,46 @@ function registerShowContextMenuIpcHandler(...args) {
     return initContextMenu().registerShowContextMenuIpcHandler(...args);
 }
 
-// ============================================================================
-// Quick Chat manager
-// ============================================================================
+// ---------- Quick Chat module bridge ----------
 let quickChatManager = null;
 function initQuickChat() {
-    if (quickChatManager) return quickChatManager;
-    quickChatManager = createQuickChatManager({
-        app,
-        BrowserWindow,
-        Menu,
-        MenuItem,
-        ipcMain,
-        dialog,
-        shell,
-        clipboard,
-        path,
-        dirname: __dirname,
-        getMainWindow: () => mainWindow,
-        getAppIconImage: () => appIconImage,
-        getAppConfig,
-        DEFAULT_APP_CONFIG,
-        getAppUrl: () => APP_URL,
-        appLabel: APP_LABEL,
-        appSlug: APP_SLUG,
-        getAppPartition: () => APP_PARTITION,
-        SEND_MODE,
-        IPC,
-        reveal,
-        safeShowError,
-        getInitialWindowBounds,
-        attachWindowStatePersistence,
-        attachCSSAndLayoutHandlers,
-        attachFindResultForwarding,
-        ensureDidStopLoadingHandler,
-        onDidStopLoading,
-        buildContextMenuTemplate,
-        getSelectionFragment,
-        htmlToMarkdown,
-        refreshTrayMenu,
-    });
-    quickChatManager.registerIpcHandlers();
-    return quickChatManager;
+  if (quickChatManager) return quickChatManager;
+  quickChatManager = createQuickChatManager({
+    app,
+    BrowserWindow,
+    Menu,
+    MenuItem,
+    ipcMain,
+    dialog,
+    shell,
+    clipboard,
+    path,
+    dirname: __dirname,
+    getMainWindow: () => mainWindow,
+    getAppIconImage: () => appIconImage,
+    getAppConfig,
+    DEFAULT_APP_CONFIG,
+    getAppUrl: () => APP_URL,
+    appLabel: APP_LABEL,
+    appSlug: APP_SLUG,
+    getAppPartition: () => APP_PARTITION,
+    SEND_MODE,
+    IPC,
+    reveal,
+    safeShowError,
+    getInitialWindowBounds,
+    attachWindowStatePersistence,
+    attachCSSAndLayoutHandlers,
+    attachFindResultForwarding,
+    ensureDidStopLoadingHandler,
+    onDidStopLoading,
+    buildContextMenuTemplate,
+    getSelectionFragment,
+    htmlToMarkdown,
+    refreshTrayMenu,
+  });
+  quickChatManager.registerIpcHandlers();
+  return quickChatManager;
 }
 function normalizeSendOptions(...args) { return initQuickChat().normalizeSendOptions(...args); }
 function quoteify(...args) { return initQuickChat().quoteify(...args); }
@@ -394,29 +382,27 @@ function buildSendToQuickSubmenu(...args) { return initQuickChat().buildSendToQu
 // ============================================================================
 function ensureSaveState(...args) { return initWindowHelpers().ensureSaveState(...args); }
 
-// ============================================================================
-// App menu
-// ============================================================================
+// ---------- App-menu module bridge ----------
 let appMenuInstance = null;
 function initAppMenu() {
-    if (appMenuInstance) return appMenuInstance;
-    appMenuInstance = createAppMenu({
-        Menu, MenuItem, BrowserWindow, dialog, shell,
-        getAppConfig, getMainWindow: () => mainWindow,
-        appLabel: APP_LABEL,
-        openFindModal, initFindInPage,
-        reloadApp, clearAppCache, clearCookiesAndSignOut,
-        copyCurrentUrl, openCurrentUrlExternal, openLogsFolder, openConfigFile,
-        toggleActiveWindowAlwaysOnTop, showAboutDialog, showApplicationHelp,
-        getRuntimeInfo, appIconImage,
-        buildExportProfileMenuTemplate, promptExportWithProfile,
-        selectChatPane, promptSaveChatPane, saveSelectionAsMarkdown, EXPORT_SCOPES,
-        buildQuickChatManagerMenuTemplate, installQuickChatMenu, refreshQuickChatMenu,
-        createQuickChatWindow, buildSendToQuickSubmenu, SEND_MODE,
-        ensureSaveState,
-    });
+  if (appMenuInstance) return appMenuInstance;
+  appMenuInstance = createAppMenu({
+    Menu, MenuItem, BrowserWindow, dialog, shell,
+    getAppConfig, getMainWindow: () => mainWindow,
+    appLabel: APP_LABEL,
+    openFindModal, initFindInPage,
+    reloadApp, clearAppCache, clearCookiesAndSignOut,
+    copyCurrentUrl, openCurrentUrlExternal, openLogsFolder, openConfigFile,
+    toggleActiveWindowAlwaysOnTop, showAboutDialog, showApplicationHelp,
+    getRuntimeInfo, appIconImage,
+    buildExportProfileMenuTemplate, promptExportWithProfile,
+    selectChatPane, promptSaveChatPane, saveSelectionAsMarkdown, EXPORT_SCOPES,
+    buildQuickChatManagerMenuTemplate, installQuickChatMenu, refreshQuickChatMenu,
+    createQuickChatWindow, buildSendToQuickSubmenu, SEND_MODE,
+    ensureSaveState,
+  });
 
-    return appMenuInstance;
+  return appMenuInstance;
 }
 function appendEditItems(...args) { return initAppMenu().appendEditItems(...args); }
 function appendHelpItems(...args) { return initAppMenu().appendHelpItems(...args); }
@@ -429,43 +415,48 @@ function appendFileItems(...args) { return initAppMenu().appendFileItems(...args
 // ============================================================
 let trayMenuInstance = null;
 function initTrayMenu() {
-    if (trayMenuInstance) return trayMenuInstance;
-    trayMenuInstance = createTrayMenu({
-        Menu,
-        Tray,
-        nativeImage,
-        path,
-        app,
-        appConfig,
-        appLabel: APP_LABEL,
-        dirname: __dirname,
-        getTray: () => tray,
-        setTray: (value) => { tray = value; },
-        getTrayImage24: () => trayImage24,
-        setTrayImage24: (value) => { trayImage24 = value; },
-        getAppIconImage: () => appIconImage,
-        getIconPath,
-        getMainWindow: () => mainWindow,
-        getAppConfig,
-        getActiveAppWindow,
-        getActiveQuickChatWindow,
-        reveal,
-        createQuickChatWindow,
-        promptSaveChatPane,
-        reloadApp,
-        toggleActiveWindowAlwaysOnTop,
-        clearAppCache,
-        clearCookiesAndSignOut,
-        openLogsFolder,
-        openConfigFile,
-        showAboutDialog,
-        setIsQuitting: (value) => { isQuitting = !!value; },
-    });
-    return trayMenuInstance;
+  if (trayMenuInstance) return trayMenuInstance;
+  trayMenuInstance = createTrayMenu({
+    Menu,
+    Tray,
+    nativeImage,
+    path,
+    app,
+    appConfig,
+    appLabel: APP_LABEL,
+    dirname: __dirname,
+    getTray: () => tray,
+    setTray: (value) => { tray = value; },
+    getTrayImage24: () => trayImage24,
+    setTrayImage24: (value) => { trayImage24 = value; },
+    getAppIconImage: () => appIconImage,
+    getIconPath,
+    getMainWindow: () => mainWindow,
+    getAppConfig,
+    getActiveAppWindow,
+    getActiveQuickChatWindow,
+    reveal,
+    createQuickChatWindow,
+    promptSaveChatPane,
+    reloadApp,
+    toggleActiveWindowAlwaysOnTop,
+    clearAppCache,
+    clearCookiesAndSignOut,
+    openLogsFolder,
+    openConfigFile,
+    showAboutDialog,
+    setIsQuitting: (value) => { isQuitting = !!value; },
+  });
+  return trayMenuInstance;
 }
 function buildTrayMenuTemplate(...args) { return initTrayMenu().buildTrayMenuTemplate(...args); }
 function refreshTrayMenu(...args) { return initTrayMenu().refreshTrayMenu(...args); }
 function createTray(...args) { return initTrayMenu().createTray(...args); }
+
+// ============================================================================
+// Structured selection -> envelope -> quick chat inject (active OR specific #N)
+// ============================================================================
+  initDirectOpen().registerDirectOpenIpcHandler(IPC);
 
 // ============================================================
 // Icon helper
@@ -479,7 +470,7 @@ function initIconHelpers() {
     path,
     process,
   });
-    return iconHelpersInstance;
+  return iconHelpersInstance;
 }
 function getIconPath(...args) { return initIconHelpers().getIconPath(...args); }
 
@@ -488,71 +479,71 @@ function getIconPath(...args) { return initIconHelpers().getIconPath(...args); }
 // ============================================================
 let mainWindowManagerInstance = null;
 function initMainWindowManager() {
-    if (mainWindowManagerInstance) return mainWindowManagerInstance;
-    mainWindowManagerInstance = createMainWindowManager({
-        BrowserWindow,
-        Menu,
-        nativeImage,
-        shell,
-        path,
-        dirname: __dirname,
-        appConfig,
-        appLabel: APP_LABEL,
-        getAppConfig,
-        getAppUrl: () => APP_URL,
-        getAppPartition: () => APP_PARTITION,
-        getMainWindow: () => mainWindow,
-        setMainWindow: (value) => { mainWindow = value; },
-        getAppIconImage: () => appIconImage,
-        setAppIconImage: (value) => { appIconImage = value; },
-        getTrayImage24: () => trayImage24,
-        setTrayImage24: (value) => { trayImage24 = value; },
-        getIconPath,
-        getInitialWindowBounds,
-        reveal,
-        setRoleTitle,
-        augmentApplicationMenu,
-        registerShowContextMenuIpcHandler,
-        ensureDidStopLoadingHandler,
-        attachCSSAndLayoutHandlers,
-        attachWindowStatePersistence,
-        attachFindResultForwarding,
-        onDidStopLoading,
-        buildContextMenuTemplate,
-        registerFindIpcHandlers: () => initFindInPage().registerFindIpcHandlers(),
-        handleEscapeStopFind: (...args) => initFindInPage().handleEscapeStopFind(...args),
-        enableLayoutWidthKeyboardShortcuts: false,
-        layoutWidthKeyboardApiPrefix: `__${APP_SLUG}`,
-        defaultVwSize: VW_SIZE,
-    });
-    return mainWindowManagerInstance;
+  if (mainWindowManagerInstance) return mainWindowManagerInstance;
+  mainWindowManagerInstance = createMainWindowManager({
+    BrowserWindow,
+    Menu,
+    nativeImage,
+    shell,
+    path,
+    dirname: __dirname,
+    appConfig,
+    appLabel: APP_LABEL,
+    getAppConfig,
+    getAppUrl: () => APP_URL,
+    getAppPartition: () => APP_PARTITION,
+    getMainWindow: () => mainWindow,
+    setMainWindow: (value) => { mainWindow = value; },
+    getAppIconImage: () => appIconImage,
+    setAppIconImage: (value) => { appIconImage = value; },
+    getTrayImage24: () => trayImage24,
+    setTrayImage24: (value) => { trayImage24 = value; },
+    getIconPath,
+    getInitialWindowBounds,
+    reveal,
+    setRoleTitle,
+    augmentApplicationMenu,
+    registerShowContextMenuIpcHandler,
+    ensureDidStopLoadingHandler,
+    attachCSSAndLayoutHandlers,
+    attachWindowStatePersistence,
+    attachFindResultForwarding,
+    onDidStopLoading,
+    buildContextMenuTemplate,
+    registerFindIpcHandlers: () => initFindInPage().registerFindIpcHandlers(),
+    handleEscapeStopFind: (...args) => initFindInPage().handleEscapeStopFind(...args),
+    enableLayoutWidthKeyboardShortcuts: false,
+    layoutWidthKeyboardApiPrefix: `__${APP_SLUG}`,
+    defaultVwSize: VW_SIZE,
+  });
+  return mainWindowManagerInstance;
 }
 function createWindow(...args) { return initMainWindowManager().createWindow(...args); }
-// ============================================================
+
 // ============================================================
 // App lifecycle
 // ============================================================
 let mainBootstrapInstance = null;
 function initMainBootstrap() {
-    if (mainBootstrapInstance) return mainBootstrapInstance;
-    mainBootstrapInstance = createMainBootstrap({
-        app,
-        BrowserWindow,
-        appConfig,
-        getAppConfig,
-        loadAppConfig,
-        getLayoutObserverGlobal: () => LAYOUT_OBSERVER_GLOBAL,
-        getMainWindow: () => mainWindow,
-        setIsQuitting: (value) => { isQuitting = !!value; },
-        createWindow,
-        createTray,
-        registerDirectOpenIpcHandler: () => registerDirectOpenIpcHandler(IPC),
-        registerDirectOpenDownloadHandler,
-        pruneExpiredDirectOpenRequests,
-        cleanupTempFiles,
-        closeAllQuickChatWindows,
-    });
-    return mainBootstrapInstance;
+  if (mainBootstrapInstance) return mainBootstrapInstance;
+  mainBootstrapInstance = createMainBootstrap({
+    app,
+    BrowserWindow,
+    appConfig,
+    getAppConfig,
+    loadAppConfig,
+    getLayoutObserverGlobal: () => LAYOUT_OBSERVER_GLOBAL,
+    getMainWindow: () => mainWindow,
+    setIsQuitting: (value) => { isQuitting = !!value; },
+    createWindow,
+    createTray,
+    registerDirectOpenIpcHandler: () => registerDirectOpenIpcHandler(IPC),
+    registerDirectOpenDownloadHandler,
+    pruneExpiredDirectOpenRequests,
+    cleanupTempFiles,
+    closeAllQuickChatWindows,
+  });
+  return mainBootstrapInstance;
 }
 function bootstrapApp(...args) { return initMainBootstrap().bootstrapApp(...args); }
 
