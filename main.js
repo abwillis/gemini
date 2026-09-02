@@ -31,18 +31,139 @@ const {
   CHAT_MESSAGE_LIST_SELECTOR, CHAT_MESSAGE_LIST_PSEUDO,
   EXPORT_ROOT_CLASS, EXPORT_ROOT_SELECTOR,
   CODE_PREVIEW_IFRAME_SELECTOR, DOM_CLEANUP_SELECTORS, DOM_PRESERVE_CONTENT_SELECTORS,
-  cleanupDOMFragmentScript, buildChatPaneDetectionScript,
-  buildLocateChatRootScript,
+  PRINT_BUBBLE_CSS,
+  VIRTUALIZER_SELECTORS,
+  DOM_SCORE_RULES,
+  DOM_COLLECTION_SELECTORS,
+  DOM_COLLECTION_KEY_ATTRIBUTES,
+  DOM_COLLECTION_ROW_SELECTORS,
+  DOM_COLLECTION_EXCLUDE_SELECTORS,
+  CHAT_INPUT_SELECTORS,
+  REASONING_EXPAND_SELECTORS,
 } = require('./lib/chat-dom');
 
 const {
   SELECTORS, IGNORE_SELECTORS, IGNORE_JOINED,
   messageContentById, MAX_CHARS, VW_SIZE, MIN_VW, MAX_VW,
-  applyDynamicWidth, attachVWResize, buildMaxLayoutCSS,
+  buildMaxLayoutCSS,
   maxLayoutCssCache, injectedFrameIdsByWC, insertedMainCssKeyByWC, cssApplyDebounceByWC,
   injectCSSOnLoad, injectCSSIntoAllFrames, applyMaxLayoutCSS, requestExpandedLayout,
-  buildFindContentVisibilityCSS, enableFindContentVisibility, disableFindContentVisibility,
+  buildFindContentVisibilityCSS,
+  createLayoutCSS,
 } = require('./lib/layout-css');
+
+// ============================================================================
+// Renderer-side agent installer
+// ----------------------------------------------------------------------------
+// Installs renderer/agent.js into every webContents we own (main + quick chat
+// windows + same-origin frames). This is not a normal Electron renderer
+// entrypoint; it is an injected page agent for the remote app document.
+// The agent exposes a configured window renderer API for chat-root detection,
+// selection extraction, export-marker cleanup, print expansion, and virtualized
+// chat collection. Main-process modules should call those methods by name
+// instead of shipping large script bodies on every invocation.
+// ============================================================================
+const RENDERER_AGENT_PATH = path.join(__dirname, 'renderer', 'agent.js');
+const RENDERER_API_GLOBAL = String(appConfig.rendererApiGlobal || '__appRenderer');
+const RENDERER_AGENT_VERSION = Number(appConfig.rendererAgentVersion || 1);
+
+// Project-specific dynamic-width config lives in app.config.js so shared
+// files never embed the Copilot / Gemini / Grok CSS variable name or clamp
+// range.  main.js forwards the whole block; it never touches the values.
+const APP_DYNAMIC_WIDTH = appConfig.dynamicWidth || null;
+
+// Renderer-aware layout-css helpers.  The factory receives the app's
+// rendererApiGlobal and dynamicWidth block so Find visibility,
+// applyDynamicWidth, and attachVWResize all target the correct
+// window[globalName] renderer agent and the correct CSS variable.
+const {
+    enableFindContentVisibility,
+    disableFindContentVisibility,
+    applyDynamicWidth,
+    attachVWResize,
+} = createLayoutCSS({
+    rendererApiGlobal: RENDERER_API_GLOBAL,
+    dynamicWidth: APP_DYNAMIC_WIDTH,
+});
+
+let __cachedRendererAgentBoot = null;
+function getRendererAgentBoot() {
+  if (__cachedRendererAgentBoot !== null) return __cachedRendererAgentBoot;
+  try {
+    const src = fs.readFileSync(RENDERER_AGENT_PATH, 'utf8');
+    const cfg = JSON.stringify({
+      chatRootSelectors: CHAT_ROOT_SELECTORS,
+      junkSelectors: DOM_CLEANUP_SELECTORS,
+      preserveSelectors: DOM_PRESERVE_CONTENT_SELECTORS,
+      virtualizerSelectors: VIRTUALIZER_SELECTORS,
+      scoreRules: DOM_SCORE_RULES,
+      collectionSelectors: DOM_COLLECTION_SELECTORS,
+      collectionKeyAttributes: DOM_COLLECTION_KEY_ATTRIBUTES,
+      collectionRowSelectors: DOM_COLLECTION_ROW_SELECTORS,
+      collectionExcludeSelectors: DOM_COLLECTION_EXCLUDE_SELECTORS,
+      chatInputSelectors: CHAT_INPUT_SELECTORS,
+      reasoningExpandSelectors: REASONING_EXPAND_SELECTORS,
+      dynamicWidthCssVar:    APP_DYNAMIC_WIDTH?.cssVar    || '',
+      dynamicWidthMinVw:     APP_DYNAMIC_WIDTH?.minVw     ?? 0,
+      dynamicWidthMaxVw:     APP_DYNAMIC_WIDTH?.maxVw     ?? 100,
+      dynamicWidthDefaultVw: APP_DYNAMIC_WIDTH?.defaultVw ?? 100,
+      rendererApiGlobal: RENDERER_API_GLOBAL,
+      rendererAgentVersion: RENDERER_AGENT_VERSION,
+    });
+    const globalJson = JSON.stringify(RENDERER_API_GLOBAL);
+
+    // Boot prelude: expose the renderer-agent config to the injected agent
+    // BEFORE agent source executes.  Without this, the agent installs at
+    // window.__appRenderer (its default) instead of the configured global
+    // (e.g. window.__copilotRenderer), and every callRendererMethod(...)
+    // returns { ok:false, missing:true, method:... }.
+    const bootConfigPrelude =
+      'try { window.__APP_RENDERER_AGENT_CONFIG__ = ' + JSON.stringify({
+        rendererApiGlobal: RENDERER_API_GLOBAL,
+        rendererAgentVersion: RENDERER_AGENT_VERSION,
+      }) + '; } catch (e) {}\n';
+    __cachedRendererAgentBoot =
+      bootConfigPrelude +
+      src +
+      '\n;try {' +
+        'var __rendererApiGlobal = ' + globalJson + ';' +
+        'var __rendererApi = window[__rendererApiGlobal];' +
+        'if (__rendererApi && typeof __rendererApi.init === "function") { __rendererApi.init(' + cfg + '); }' +
+      '} catch (e) {}';
+  } catch (err) {
+    console.error('[renderer-agent] failed to load renderer/agent.js:', err);
+    __cachedRendererAgentBoot = '';
+  }
+  return __cachedRendererAgentBoot;
+}
+
+function installRendererAgent(webContents) {
+  const boot = getRendererAgentBoot();
+  if (!boot || !webContents) return;
+  const run = () => {
+    try { webContents.executeJavaScript(boot, true).catch(() => {}); } catch {}
+  };
+  webContents.on('did-finish-load', run);
+  webContents.on('did-navigate-in-page', run);
+  webContents.on('frame-created', (_e, payload) => {
+    const frame = payload && payload.frame;
+    if (!frame) return;
+    try {
+      frame.on('dom-ready', () => {
+        try { frame.executeJavaScript(boot, true).catch(() => {}); } catch {}
+      });
+    } catch {}
+  });
+}
+app.on('web-contents-created', (_event, wc) => {
+  installRendererAgent(wc);
+  // Mirror renderer-side console output into the renderer log file. Attaching
+  // here catches every webContents (main window, quick chat, find modal, and
+  // the offscreen print windows) from one place. runtimeConfig is defined below
+  // in module scope; this callback only ever runs after module evaluation.
+  try { runtimeConfig.attachRendererConsoleCapture(wc, 'renderer'); } catch {}
+});
+
 // ============================================================================
 // App identity & constants
 // ============================================================================
@@ -84,8 +205,12 @@ const {
   sanitizeLogFileName,
   getConfigFilePath,
   getLogFilePath,
+  getRendererLogFilePath,
   formatConsoleArg,
   appendConsoleLogToFile,
+  appendRendererLogToFile,
+  attachRendererConsoleCapture,
+  logVerbose,
   makeConsoleMethod,
   applyConsoleLoggingConfig,
   normalizeBooleanConfig,
@@ -121,6 +246,7 @@ function initWindowHelpers() {
     getAppConfig,
     applyMaxLayoutCSS,
     attachVWResize,
+    applyDynamicWidth,
   });
   return windowHelpersInstance;
 }
@@ -246,10 +372,8 @@ function initExporters() {
     dialog,
     safeShowError,
     getAppPartition: () => APP_PARTITION,
-    buildLocateChatRootScript,
     appSlug: APP_SLUG,
-    buildChatPaneDetectionScript,
-    cleanupDOMFragmentScript,
+    PRINT_BUBBLE_CSS,
     CHAT_SCOPE_PSEUDO,
     EXPORT_ROOT_CLASS,
     EXPORT_ROOT_SELECTOR,
@@ -257,8 +381,10 @@ function initExporters() {
     getAppConfig,
     DEFAULT_APP_CONFIG,
     normalizeExportFormat,
+    logVerbose,
     appLabel: APP_LABEL,
     appSlug: APP_SLUG,
+    rendererApiGlobal: RENDERER_API_GLOBAL,
   });
   return exportersInstance;
 }
@@ -272,6 +398,7 @@ async function getSelectionFragment(...args) { return initExporters().getSelecti
 async function getSelectionFragmentRaw(...args) { return initExporters().getSelectionFragmentRaw(...args); }
 async function buildSelectionMarkdownForExport(...args) { return initExporters().buildSelectionMarkdownForExport(...args); }
 async function selectChatPane(...args) { return initExporters().selectChatPane(...args); }
+async function expandChatPane(...args) { return initExporters().expandChatPane(...args); }
 async function promptSaveChatPane(...args) { return initExporters().promptSaveChatPane(...args); }
 async function saveSelectionAsMarkdown(...args) { return initExporters().saveSelectionAsMarkdown(...args); }
 async function saveSelectionAsCleanMarkdown(...args) { return initExporters().saveSelectionAsCleanMarkdown(...args); }
@@ -338,6 +465,7 @@ function initQuickChat() {
     getAppIconImage: () => appIconImage,
     getAppConfig,
     DEFAULT_APP_CONFIG,
+    rendererApiGlobal: RENDERER_API_GLOBAL,
     getAppUrl: () => APP_URL,
     appLabel: APP_LABEL,
     appSlug: APP_SLUG,
@@ -399,7 +527,7 @@ function initAppMenu() {
     toggleActiveWindowAlwaysOnTop, showAboutDialog, showApplicationHelp,
     getRuntimeInfo, appIconImage,
     buildExportProfileMenuTemplate, promptExportWithProfile,
-    selectChatPane, promptSaveChatPane, printChatPane, printSelection, saveSelectionAsMarkdown, EXPORT_SCOPES,
+    selectChatPane, expandChatPane, promptSaveChatPane, printChatPane, printSelection, saveSelectionAsMarkdown, EXPORT_SCOPES,
     buildQuickChatManagerMenuTemplate, installQuickChatMenu, refreshQuickChatMenu,
     createQuickChatWindow, buildSendToQuickSubmenu, SEND_MODE,
     ensureSaveState,
@@ -516,7 +644,9 @@ function initMainWindowManager() {
     registerFindIpcHandlers: () => initFindInPage().registerFindIpcHandlers(),
     handleEscapeStopFind: (...args) => initFindInPage().handleEscapeStopFind(...args),
     enableLayoutWidthKeyboardShortcuts: true,
-    layoutWidthKeyboardApiPrefix: `__${APP_SLUG}`,
+    // Keyboard shortcuts read the CSS variable directly.  No renderer
+    // global name is needed here.
+    dynamicWidth: APP_DYNAMIC_WIDTH,
     defaultVwSize: VW_SIZE,
   });
   return mainWindowManagerInstance;

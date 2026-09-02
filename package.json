@@ -1,6 +1,6 @@
 {
   "name": "gemini-for-linux",
-  "version": "1.17.15",
+  "version": "2.99.06",
   "description": "Gemini for Linux",
   "desktopName": "gemini-for-linux",
   "main": "main.js",
@@ -22,7 +22,7 @@
       "app.config.js",
       "preload.js",
       "preload-core.js",
-      "renderer.js",
+      "renderer/**",
       "package.json",
       "assets/**",
       "lib/**"
@@ -109,11 +109,12 @@
   },
   "license": "BSD 3-Clause License",
   "devDependencies": {
-    "electron": "^42.4.0",
+    "electron": "^43.0.0",
     "electron-builder": "^26.4.0"
   },
   "dependencies": {
     "npm": "^11.7.0",
+    "pdf-lib": "^1.17.1",
     "turndown": "^7.2.2",
     "turndown-plugin-gfm": "^1.0.2"
   }
