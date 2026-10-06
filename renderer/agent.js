@@ -46,6 +46,8 @@
   // Gemini, and Grok without embedded host-page fingerprints.
   var CHAT_ROOT_SELECTORS = [];
   var DOM_CLEANUP_SELECTORS = [];
+  var DOM_CLEANUP_POLICY = null;
+  var DOM_ADAPTER_CONTRACT = null;
   var DOM_PRESERVE_CONTENT_SELECTORS = [
     '[data-preserve]', 'pre', 'code', 'table', 'ul', 'ol',
     'img', 'picture', 'svg', 'canvas', 'video', 'iframe'
@@ -176,59 +178,132 @@
     } catch (e) {}
   }
 
-  function cleanedClone(el, junkSelectors, preserveSelectors) {
-    var clone = el.cloneNode(true);
-    if (junkSelectors && junkSelectors.length) {
-      clone.querySelectorAll(junkSelectors.join(',')).forEach(function (n) {
-        try { n.remove(); } catch (e) {}
-      });
-    }
-    if (preserveSelectors && preserveSelectors.length) {
-      var preserveSel = preserveSelectors.join(',');
-      clone.querySelectorAll(preserveSel).forEach(function (n) {
-        try { n.setAttribute('data-preserve', 'true'); } catch (e) {}
-      });
-      clone.querySelectorAll('div, span').forEach(function (n) {
+  function cleanupCategory(el) {
+    try {
+      if (el.matches('[data-testid*="feedback" i],[data-testid*="thumb" i],[data-testid*="reaction" i]')) return 'feedback';
+      if (el.matches('[data-testid*="copy" i]')) return 'copy';
+      if (el.matches('[role="toolbar"],[class*="toolbar" i],[class*="actionbar" i],[class*="action-bar" i]')) return 'toolbar';
+      if (el.matches('[role="menu"],[role="menuitem"],[aria-haspopup]')) return 'menu';
+      if (el.matches('button,[role="button"]')) return 'button';
+    } catch (e) {}
+    return 'interactive-chrome';
+  }
+  function hasMeaningfulContent(el, preserveSel) {
+    try {
+      if (preserveSel && (el.matches(preserveSel) || el.querySelector(preserveSel))) return true;
+      // A control's own label ("Copy", "Show more", "More actions", etc.) is
+      // chrome, not exported content. Semantic descendants configured by the
+      // app (links, citations, attachments, media, tables, code and lists) are
+      // always meaningful. Unknown non-trivial labels are kept rather than
+      // guessed away; a class substring is never enough, and only a small,
+      // generic chrome vocabulary is disposable.
+      var text = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!text) return false;
+      var chromeLabel = /^(?:copy|copied|like|dislike|thumbs? up|thumbs? down|more (?:actions|options)|show more(?: lines)?|see more|read more|expand|collapse|retry|regenerate(?: response)?|share|edit|delete|menu)$/i;
+      return !chromeLabel.test(text);
+    } catch (e) { return true; }
+  }
+  function isInteractiveChrome(el, interactiveSel) {
+    try {
+      if (interactiveSel && el.matches(interactiveSel)) return true;
+      var tabIndex = el.getAttribute('tabindex');
+      if (tabIndex !== null && Number(tabIndex) >= 0) return true;
+      // A toolbar/action wrapper is chrome only when it actually owns an
+      // interactive descendant. This prevents a broad class candidate from
+      // becoming sufficient evidence to delete a subtree.
+      return !!(interactiveSel && el.querySelector && el.querySelector(interactiveSel));
+    } catch (e) { return false; }
+  }
+  function isAtomicPreservedContent(el) {
+    try {
+      return el.matches(
+        'a[href],pre,code,table,ul,ol,img,picture,svg,canvas,video,iframe,' +
+        '[data-file-name],[data-attachment]'
+      );
+    } catch (e) { return false; }
+  }
+  function emptyCleanupReport() {
+    return {
+      examined: 0,
+      removed: 0,
+      unwrapped: 0,
+      preserved: 0,
+      skippedNonInteractive: 0,
+      categories: {}
+    };
+  }
+  function recordCleanupAction(report, category, action) {
+    var bucket = report.categories[category];
+    if (!bucket) bucket = report.categories[category] = { removed: 0, unwrapped: 0, preserved: 0 };
+    bucket[action] = Number(bucket[action] || 0) + 1;
+  }
+  function cleanupCloneByPredicate(clone) {
+    var policy = DOM_CLEANUP_POLICY || {};
+    var candidates = safeSelectorList(policy.candidateSelectors || DOM_CLEANUP_SELECTORS);
+    var interactive = safeSelectorList(policy.interactiveSelectors || ['button','[role="button"]']);
+    var preserves = (policy.preserveSelectors || []).concat(DOM_PRESERVE_CONTENT_SELECTORS || []);
+    var preserveSel = safeSelectorList(preserves);
+    var report = emptyCleanupReport();
+    if (!candidates) return { clone: clone, report: report };
+    var nodes = [];
+    try { nodes = Array.from(clone.querySelectorAll(candidates)); } catch (e) {}
+    // Process descendants before containers. This lets a toolbar that contains
+    // only controls become empty and removable, while preserved descendants
+    // (for example a citation anchor) survive and cause the shell to unwrap.
+    nodes.sort(function (a, b) {
+      var ad = 0, bd = 0, n = a;
+      while (n && n !== clone) { ad++; n = n.parentElement; }
+      n = b;
+      while (n && n !== clone) { bd++; n = n.parentElement; }
+      return bd - ad;
+    });
+    nodes.forEach(function (el) {
+      if (!el || !el.parentNode) return;
+      report.examined++;
+      var category = cleanupCategory(el);
+      var meaningful = hasMeaningfulContent(el, preserveSel);
+      if (!isInteractiveChrome(el, interactive)) {
+        report.preserved++;
+        report.skippedNonInteractive++;
+        recordCleanupAction(report, category, 'preserved');
+        return;
+      }
+      if (isAtomicPreservedContent(el)) {
+        report.preserved++;
+        recordCleanupAction(report, category, 'preserved');
+        return;
+      }
+      if (meaningful) {
+        // Controls can wrap real labels, citations, images, or file metadata.
+        // Preserve their children and remove only the interactive shell.
         try {
-          if (!n.textContent.trim() && !n.querySelector(preserveSel)) {
-            n.remove();
-          }
+          el.replaceWith.apply(el, Array.from(el.childNodes));
+          report.unwrapped++;
+          recordCleanupAction(report, category, 'unwrapped');
+        } catch (e) {
+          report.preserved++;
+          recordCleanupAction(report, category, 'preserved');
+        }
+      } else {
+        try {
+          el.remove();
+          report.removed++;
+          recordCleanupAction(report, category, 'removed');
         } catch (e) {}
-      });
-    }
-    return clone;
+      }
+    });
+    return { clone: clone, report: report };
   }
-
+  function cleanedClone(el) {
+    var result = cleanupCloneByPredicate(el.cloneNode(true));
+    try { result.clone.__cleanupReport = result.report; } catch (e) {}
+    return result.clone;
+  }
   function cleanupDOMFragment(container) {
-    if (!container) return;
-
-    try {
-      if (DOM_CLEANUP_SELECTORS.length) {
-        container.querySelectorAll(DOM_CLEANUP_SELECTORS.join(',')).forEach(function (el) {
-          try { el.remove(); } catch (e) {}
-        });
-      }
-    } catch (e) {}
-
-    try {
-      if (DOM_PRESERVE_CONTENT_SELECTORS.length) {
-        var preserveSel = DOM_PRESERVE_CONTENT_SELECTORS.join(',');
-
-        container.querySelectorAll(preserveSel).forEach(function (el) {
-          try { el.setAttribute('data-preserve', 'true'); } catch (e) {}
-        });
-
-        container.querySelectorAll('div, span').forEach(function (el) {
-          try {
-            if (!el.textContent.trim() && !el.querySelector(preserveSel)) {
-              el.remove();
-            }
-          } catch (e) {}
-        });
-      }
-    } catch (e) {}
+    if (!container) return emptyCleanupReport();
+    var result = cleanupCloneByPredicate(container);
+    return result.report;
   }
-
   function getSelectionFragment(options) {
     var opts = options || {};
     var clean = opts.clean !== false;
@@ -242,13 +317,14 @@
       var range = sel.getRangeAt(0);
       var container = document.createElement('div');
       container.appendChild(range.cloneContents());
-      if (clean) cleanupDOMFragment(container);
+      var cleanupReport = clean ? cleanupDOMFragment(container) : null;
 
       return {
         ok: true,
         hasSelection: true,
         html: container.innerHTML,
-        text: String(sel.toString() || '')
+        text: String(sel.toString() || ''),
+        cleanupReport: cleanupReport
       };
     } catch (e) {
       return {
@@ -269,8 +345,26 @@
     var scrollIntoView = !!opts.scrollIntoView;
     var markForExport  = !!opts.markForExport;
 
-    var best = pickBest();
-    if (!best) return null;
+    var rootHit = findCapability('chatRoot');
+    if (!rootHit || !rootHit.ok || !rootHit.element) return null;
+    var requiredLevel = markForExport ? 'destructive' : 'read';
+    var requiredConfidence = capabilityThreshold(requiredLevel);
+    if (Number(rootHit.confidence || 0) < requiredConfidence) {
+      return {
+        ok: false,
+        reason: 'low-confidence-chat-root',
+        confidence: Number(rootHit.confidence || 0),
+        evidence: rootHit.evidence || [],
+        warnings: rootHit.warnings || [],
+        requiredConfidence: requiredConfidence,
+        operationLevel: requiredLevel
+      };
+    }
+    var best = {
+      el: rootHit.element,
+      sel: rootHit.selector,
+      score: Number(rootHit.confidence || 0)
+    };
 
     if (scrollIntoView) {
       try { best.el.scrollIntoView({ block: 'start', inline: 'nearest' }); } catch (e) {}
@@ -290,9 +384,12 @@
     }
 
     var html = '';
+    var cleanupReport = null;
     if (includeHtml) {
-      if (cleanupJunk && DOM_CLEANUP_SELECTORS.length) {
-        html = cleanedClone(best.el, DOM_CLEANUP_SELECTORS, DOM_PRESERVE_CONTENT_SELECTORS).outerHTML;
+      if (cleanupJunk) {
+        var cleaned = cleanupCloneByPredicate(best.el.cloneNode(true));
+        html = cleaned.clone.outerHTML;
+        cleanupReport = cleaned.report;
       } else {
         html = best.el.outerHTML;
       }
@@ -313,9 +410,14 @@
       html: html,
       textLength: String(best.el.innerText || '').length,
       score: Number(best.score || 0),
+      confidence: Number(rootHit.confidence || 0),
+      evidence: rootHit.evidence || [],
+      warnings: rootHit.warnings || [],
+      fallbackTier: rootHit.tier || 'none',
       selectedTextLength: selectedTextLength,
       markerApplied: markForExport,
-      markerAttr: markForExport ? EXPORT_MARKER_ATTR : null
+      markerAttr: markForExport ? EXPORT_MARKER_ATTR : null,
+      cleanupReport: cleanupReport
     };
   }
 
@@ -1444,6 +1546,26 @@
       if (!chatPane) {
         return { ok: false, error: 'chat pane not found' };
       }
+      var rootCap = DOM_ADAPTER_CONTRACT && DOM_ADAPTER_CONTRACT.capabilities &&
+        DOM_ADAPTER_CONTRACT.capabilities.chatRoot || {};
+      var rootAssessment = scoreCapability(
+        'chatRoot',
+        chatPane,
+        DOM_ADAPTER_CONTRACT || {},
+        capabilityMetadataForElement(chatPane, rootCap),
+        {}
+      );
+      var destructiveThreshold = capabilityThreshold('destructive');
+      if (rootAssessment.confidence < destructiveThreshold) {
+        return {
+          ok: false,
+          reason: 'low-confidence-chat-root',
+          confidence: rootAssessment.confidence,
+          requiredConfidence: destructiveThreshold,
+          evidence: rootAssessment.evidence,
+          warnings: rootAssessment.warnings
+        };
+      }
 
       var hidden = [];
       var overridden = [];
@@ -1573,7 +1695,10 @@
         hiddenCount: hidden.length,
         overriddenCount: overridden.length,
         rootOverrideCount: rootOverrides.length,
-        rowMinSizeOverrideApplied: !!rowMinSizeStyle
+        rowMinSizeOverrideApplied: !!rowMinSizeStyle,
+        confidence: rootAssessment.confidence,
+        evidence: rootAssessment.evidence,
+        warnings: rootAssessment.warnings
       };
     } catch (e) {
       return { ok: false, error: String((e && e.message) || e) };
@@ -1681,9 +1806,23 @@
       var preserve = Array.isArray(preserveSelectors)
         ? preserveSelectors.slice()
         : DOM_PRESERVE_CONTENT_SELECTORS.slice();
-
-      var preserveSel = preserve.join(',');
       var clone = root.firstElementChild || root;
+      var cleanup = cleanupCloneByPredicate(clone);
+      clone = cleanup.clone;
+
+      // Mark protected nodes before classes/data attributes are stripped. Some
+      // preservation evidence (citation/reference test IDs, attachment data,
+      // file classes) would otherwise disappear before the empty-wrapper pass.
+      var policyPreserves = DOM_CLEANUP_POLICY && DOM_CLEANUP_POLICY.preserveSelectors || [];
+      var preserveSel = safeSelectorList(preserve.concat(policyPreserves));
+      if (preserveSel) {
+        try {
+          if (clone.matches && clone.matches(preserveSel)) clone.setAttribute('data-export-preserve', '1');
+          clone.querySelectorAll(preserveSel).forEach(function (n) {
+            try { n.setAttribute('data-export-preserve', '1'); } catch (e) {}
+          });
+        } catch (e) {}
+      }
 
       try {
         clone.querySelectorAll('[class]').forEach(function (n) {
@@ -1703,7 +1842,7 @@
             Array.from(n.attributes || []).forEach(function (a) {
               var name = String(a.name || '').toLowerCase();
               if (
-                name.indexOf('data-') === 0 ||
+                (name.indexOf('data-') === 0 && name !== 'data-export-preserve') ||
                 name.indexOf('aria-') === 0 ||
                 name === 'role' ||
                 name === 'tabindex'
@@ -1721,26 +1860,31 @@
 
       if (preserveSel) {
         try {
-          clone.querySelectorAll(preserveSel).forEach(function (n) {
-            try { n.setAttribute('data-preserve', 'true'); } catch (e) {}
-          });
-        } catch (e) {}
-
-        try {
           clone.querySelectorAll('div, span').forEach(function (n) {
             try {
-              if (!String(n.textContent || '').trim() && !n.querySelector(preserveSel)) {
+              if (
+                !String(n.textContent || '').trim() &&
+                !n.hasAttribute('data-export-preserve') &&
+                !n.querySelector('[data-export-preserve]')
+              ) {
                 n.remove();
               }
             } catch (e) {}
           });
         } catch (e) {}
       }
+      try {
+        if (clone.removeAttribute) clone.removeAttribute('data-export-preserve');
+        clone.querySelectorAll('[data-export-preserve]').forEach(function (n) {
+          try { n.removeAttribute('data-export-preserve'); } catch (e) {}
+        });
+      } catch (e) {}
 
       return {
         ok: true,
         title: String(document.title || ''),
-        html: clone.innerHTML
+        html: clone.innerHTML,
+        cleanupReport: cleanup.report
       };
     } catch (e) {
       return {
@@ -1984,6 +2128,29 @@
     var scrollerCandidatesForDiag = [];
     var scroller = findBestChatScroller(root, scrollerCandidatesForDiag);
 
+    if (scroller) {
+      var virtualCap = DOM_ADAPTER_CONTRACT && DOM_ADAPTER_CONTRACT.capabilities &&
+        DOM_ADAPTER_CONTRACT.capabilities.virtualizer || {};
+      var virtualMeta = capabilityMetadataForElement(scroller, virtualCap);
+      if (virtualMeta.tiers.indexOf('behavioral') < 0) virtualMeta.tiers.push('behavioral');
+      var virtualAssessment = scoreCapability(
+        'virtualizer', scroller, DOM_ADAPTER_CONTRACT || {}, virtualMeta, { root: root }
+      );
+      var virtualLevel = restoreScrollTop ? 'interact' : 'destructive';
+      var virtualThreshold = capabilityThreshold(virtualLevel);
+      if (virtualAssessment.confidence < virtualThreshold) {
+        return Promise.resolve({
+          ok: false,
+          reason: 'low-confidence-virtualizer',
+          confidence: virtualAssessment.confidence,
+          requiredConfidence: virtualThreshold,
+          operationLevel: virtualLevel,
+          evidence: virtualAssessment.evidence,
+          warnings: virtualAssessment.warnings
+        });
+      }
+    }
+
     // pdfPrepare() can flatten a real nested virtualizer before hydration:
     // its scroll range becomes zero while HTML becomes scrollable. Scrolling
     // HTML in that state feeds the document's growing print height back into
@@ -2182,13 +2349,14 @@
   //
   // Handles, inside the marked pane (or document if no marker is set):
   //   1. <details>                          -> set .open = true
-  //   2. [aria-expanded="false"] (buttons)  -> click(), then set aria-expanded
+  //   2. [aria-expanded="false"] (buttons)  -> click and verify state change
   //   3. [data-state="closed"]              -> .click() if it has a handler
   // Returns counts. The actual openings are intentionally not undone --
   // the prep/restore lifecycle is responsible for any rollback the caller
   // wants. For PDF the snapshot is read-only so leaving them open is fine.
   // -------------------------------------------------------------------------
   function expandForPrint(options) {
+    return (async function () {
     var opts = options || {};
     // When true, leave chain-of-thought reasoning controls alone so the
     // dedicated expandReasoningForPrint() pass can handle them.
@@ -2295,13 +2463,58 @@
     }
 
     var details = 0, ariaButtons = 0, dataState = 0, skipped = 0, rolledBack = 0, reasoningSkipped = 0;
+    var lowConfidenceSkipped = 0, behaviorVerified = 0, behaviorUnverified = 0;
     var opened = []; // for rollback on menu detection
+    var disclosureThreshold = capabilityThreshold('interact');
+    var disclosureCap = DOM_ADAPTER_CONTRACT && DOM_ADAPTER_CONTRACT.capabilities &&
+      DOM_ADAPTER_CONTRACT.capabilities.disclosureControl || {};
+    function disclosureAssessment(control) {
+      return scoreCapability(
+        'disclosureControl',
+        control,
+        DOM_ADAPTER_CONTRACT || {},
+        capabilityMetadataForElement(control, disclosureCap),
+        { root: root }
+      );
+    }
+    function disclosureState(control) {
+      var controlled = controlledRegionInsideRoot(control);
+      var hidden = null;
+      try {
+        hidden = controlled ? !!(controlled.hidden || controlled.getAttribute('aria-hidden') === 'true') : null;
+      } catch (e) {}
+      return {
+        expanded: control && control.getAttribute ? control.getAttribute('aria-expanded') : null,
+        state: control && control.getAttribute ? control.getAttribute('data-state') : null,
+        controlledHidden: hidden,
+        detailsOpen: control && control.tagName === 'SUMMARY' && control.parentElement &&
+          control.parentElement.tagName === 'DETAILS' ? !!control.parentElement.open : null
+      };
+    }
+    function stateChanged(before, after) {
+      return before.expanded !== after.expanded ||
+        before.state !== after.state ||
+        before.controlledHidden !== after.controlledHidden ||
+        before.detailsOpen !== after.detailsOpen;
+    }
 
     // 1) <details> -- always safe, never opens a portal.
     try {
       var ds = root.querySelectorAll('details:not([open])');
       for (var i = 0; i < ds.length; i++) {
-        try { ds[i].open = true; details++; } catch (e) {}
+        var summary = null;
+        try { summary = ds[i].querySelector('summary'); } catch (e) {}
+        var detailsScore = summary ? disclosureAssessment(summary) : null;
+        if (!summary || detailsScore.confidence < disclosureThreshold) {
+          lowConfidenceSkipped++;
+          continue;
+        }
+        try {
+          var detailsBefore = disclosureState(summary);
+          ds[i].open = true;
+          opened.push({ el: summary, kind: 'details', before: detailsBefore });
+          details++;
+        } catch (e) {}
       }
     } catch (e) {}
 
@@ -2313,12 +2526,14 @@
         if (isReasoningControl(b)) { reasoningSkipped++; continue; }
         if (looksLikeMenuTrigger(b)) { skipped++; continue; }
         if (!looksLikeContentDisclosure(b)) { skipped++; continue; }
+        var assessment = disclosureAssessment(b);
+        if (assessment.confidence < disclosureThreshold) { lowConfidenceSkipped++; continue; }
         try {
+          var before = disclosureState(b);
           b.click();
-          opened.push({ el: b, kind: 'aria' });
+          opened.push({ el: b, kind: 'aria', before: before });
           ariaButtons++;
         } catch (e) {}
-        try { b.setAttribute('aria-expanded', 'true'); } catch (e) {}
       }
     } catch (e) {}
 
@@ -2332,13 +2547,31 @@
         if (looksLikeMenuTrigger(c)) { skipped++; continue; }
         // Accept only accordion-shaped triggers: has aria-controls into root.
         if (!controlledRegionInsideRoot(c)) { skipped++; continue; }
+        var closedAssessment = disclosureAssessment(c);
+        if (closedAssessment.confidence < disclosureThreshold) { lowConfidenceSkipped++; continue; }
         try {
+          var closedBefore = disclosureState(c);
           c.click();
-          opened.push({ el: c, kind: 'dataState' });
+          opened.push({ el: c, kind: 'dataState', before: closedBefore });
           dataState++;
         } catch (e) {}
       }
     } catch (e) {}
+
+    // Let framework-managed state updates commit before evaluating behavior.
+    // This avoids reporting a false failure for React controls whose ARIA or
+    // controlled-region state changes on the next render turn.
+    await new Promise(function (resolve) {
+      try {
+        requestAnimationFrame(function () {
+          requestAnimationFrame(function () { setTimeout(resolve, 0); });
+        });
+      } catch (e) { setTimeout(resolve, 0); }
+    });
+    for (var v = 0; v < opened.length; v++) {
+      if (stateChanged(opened[v].before, disclosureState(opened[v].el))) behaviorVerified++;
+      else behaviorUnverified++;
+    }
 
     // 4) Sanity sweep: if anything we clicked caused a new menu/dialog/listbox
     //    to appear, roll those clicks back. This catches the failure mode
@@ -2353,8 +2586,14 @@
     if (newMenu) {
       for (var o = opened.length - 1; o >= 0; o--) {
         try {
-          opened[o].el.click();          // toggle closed
-          opened[o].el.setAttribute('aria-expanded', 'false');
+          if (opened[o].kind === 'details' && opened[o].el.parentElement) {
+            opened[o].el.parentElement.open = !!opened[o].before.detailsOpen;
+          } else {
+            opened[o].el.click();          // toggle closed
+          }
+          if (opened[o].before && opened[o].before.expanded !== null) {
+            opened[o].el.setAttribute('aria-expanded', opened[o].before.expanded);
+          }
           rolledBack++;
         } catch (e) {}
       }
@@ -2366,14 +2605,18 @@
 
     return {
       ok: true,
-      details: details,
-      ariaButtons: ariaButtons - (newMenu ? rolledBack : 0),
-      dataState: dataState,
+      details: newMenu ? 0 : details,
+      ariaButtons: newMenu ? 0 : ariaButtons,
+      dataState: newMenu ? 0 : dataState,
       skipped: skipped,
+      lowConfidenceSkipped: lowConfidenceSkipped,
+      behaviorVerified: behaviorVerified,
+      behaviorUnverified: behaviorUnverified,
       reasoningSkipped: reasoningSkipped,
       rolledBack: rolledBack,
       menuDetected: !!newMenu
     };
+    })();
   }
 
   // -------------------------------------------------------------------------
@@ -2400,6 +2643,27 @@
     if (!root) return Promise.resolve({ ok: false, reason: 'no-marked-pane', html: '' });
 
     var scroller = findBestChatScroller(root, scrollerCandidatesForDiag);
+    if (scroller) {
+      var virtualCap = DOM_ADAPTER_CONTRACT && DOM_ADAPTER_CONTRACT.capabilities &&
+        DOM_ADAPTER_CONTRACT.capabilities.virtualizer || {};
+      var virtualMeta = capabilityMetadataForElement(scroller, virtualCap);
+      if (virtualMeta.tiers.indexOf('behavioral') < 0) virtualMeta.tiers.push('behavioral');
+      var virtualAssessment = scoreCapability(
+        'virtualizer', scroller, DOM_ADAPTER_CONTRACT || {}, virtualMeta, { root: root }
+      );
+      var interactThreshold = capabilityThreshold('interact');
+      if (virtualAssessment.confidence < interactThreshold) {
+        return Promise.resolve({
+          ok: false,
+          reason: 'low-confidence-virtualizer',
+          confidence: virtualAssessment.confidence,
+          requiredConfidence: interactThreshold,
+          evidence: virtualAssessment.evidence,
+          warnings: virtualAssessment.warnings,
+          html: ''
+        });
+      }
+    }
 
     function settle(ms) {
       return new Promise(function (res) {
@@ -2740,6 +3004,392 @@
     });
   }
 
+  function negativeRegionFor(el, selectors) {
+    var n = el;
+    while (n && n !== document.body) {
+      if (matchesConfiguredSelector(n, selectors)) return elementLabel(n);
+      n = n.parentElement;
+    }
+    return null;
+  }
+  function capabilityThreshold(level) {
+    var thresholds = DOM_ADAPTER_CONTRACT && DOM_ADAPTER_CONTRACT.thresholds || {};
+    var fallback = level === 'destructive' ? 85 : (level === 'interact' ? 70 : 55);
+    var configured = Number(thresholds[level]);
+    return isFinite(configured) && configured >= 0 ? configured : fallback;
+  }
+  function candidateRecord(list, el, tier, selector) {
+    if (!el || el.nodeType !== 1) return;
+    var existing = null;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].element === el) { existing = list[i]; break; }
+    }
+    if (!existing) {
+      existing = { element: el, tiers: [], selectors: [] };
+      list.push(existing);
+    }
+    if (tier && existing.tiers.indexOf(tier) < 0) existing.tiers.push(tier);
+    if (selector && existing.selectors.indexOf(selector) < 0) existing.selectors.push(selector);
+  }
+  function queryCapabilityCandidates(list, selectors, tier) {
+    if (!Array.isArray(selectors)) return;
+    for (var i = 0; i < selectors.length; i++) {
+      var selector = String(selectors[i] || '').trim();
+      if (!selector) continue;
+      try {
+        Array.from(document.querySelectorAll(selector)).forEach(function (el) {
+          candidateRecord(list, el, tier, selector);
+        });
+      } catch (e) {}
+    }
+  }
+  function stableAttributeEvidence(el, hints) {
+    var raw = '';
+    try {
+      raw = String(el.id || '') + ' ' + String(el.getAttribute('data-testid') || '');
+    } catch (e) {}
+    raw = raw.trim().toLowerCase();
+    if (!raw) return { score: 0, label: '' };
+    var wanted = Array.isArray(hints) ? hints : [];
+    for (var i = 0; i < wanted.length; i++) {
+      if (raw.indexOf(String(wanted[i] || '').toLowerCase()) >= 0) {
+        return { score: 15, label: 'stable attribute hint' };
+      }
+    }
+    return { score: 6, label: 'generic id/test id' };
+  }
+  function capabilityMetadataForElement(el, cap) {
+    var meta = { tiers: [], selectors: [] };
+    var groups = [
+      { tier: 'semantic', selectors: cap && cap.semanticSelectors || [] },
+      { tier: 'configured', selectors: cap && cap.selectors || [] }
+    ];
+    for (var i = 0; i < groups.length; i++) {
+      for (var j = 0; j < groups[i].selectors.length; j++) {
+        var selector = String(groups[i].selectors[j] || '').trim();
+        if (!selector) continue;
+        try {
+          if (el.matches(selector)) {
+            if (meta.tiers.indexOf(groups[i].tier) < 0) meta.tiers.push(groups[i].tier);
+            if (meta.selectors.indexOf(selector) < 0) meta.selectors.push(selector);
+          }
+        } catch (e) {}
+      }
+    }
+    return meta;
+  }
+  function rowsAreOrdered(rows) {
+    if (!Array.isArray(rows) || rows.length < 2) return false;
+    var lastIndex = null;
+    for (var i = 0; i < rows.length; i++) {
+      try {
+        var currentIndexRaw =
+          rows[i].getAttribute('aria-posinset') ||
+          rows[i].getAttribute('data-index') ||
+          rows[i].getAttribute('data-item-index');
+        var currentIndex = currentIndexRaw === null || currentIndexRaw === ''
+          ? null
+          : Number(currentIndexRaw);
+        if (currentIndex !== null && isFinite(currentIndex) && lastIndex !== null && currentIndex < lastIndex) return false;
+        if (currentIndex !== null && isFinite(currentIndex)) lastIndex = currentIndex;
+        // DOCUMENT_POSITION_PRECEDING (2) means the visually later row occurs
+        // earlier in DOM order, which is inconsistent with export ordering.
+        if (i + 1 < rows.length && (rows[i].compareDocumentPosition(rows[i + 1]) & 2)) return false;
+      } catch (e) {}
+    }
+    return true;
+  }
+  function verifyComposerFocus(el) {
+    var previous = null;
+    try {
+      previous = document.activeElement;
+      el.focus({ preventScroll: true });
+      var focused = document.activeElement === el || (el.contains && el.contains(document.activeElement));
+      if (previous && previous !== el && previous.focus) previous.focus({ preventScroll: true });
+      return !!focused;
+    } catch (e) {
+      try { if (previous && previous.focus) previous.focus(); } catch (_) {}
+      return false;
+    }
+  }
+  function verifyScrollBehavior(el) {
+    try {
+      var range = scrollRange(el);
+      if (range <= 8) return false;
+      var before = Number(el.scrollTop || 0);
+      var target = before < range ? Math.min(range, before + Math.min(24, range)) : Math.max(0, before - 24);
+      el.scrollTop = target;
+      var moved = Math.abs(Number(el.scrollTop || 0) - before) > 1;
+      el.scrollTop = before;
+      return moved;
+    } catch (e) { return false; }
+  }
+  function relationToRoot(el, root) {
+    if (!el || !root) return '';
+    try {
+      if (root === el) return 'root';
+      if (root.contains(el)) return 'inside-root';
+      if (el.contains(root)) return 'owns-root';
+      var a = el.parentElement;
+      while (a && a !== document.body) {
+        if (a.contains(root)) return 'shared-shell';
+        a = a.parentElement;
+      }
+    } catch (e) {}
+    return '';
+  }
+  function scoreCapability(name, el, contract, meta, context) {
+    contract = contract || {};
+    meta = meta || { tiers: [], selectors: [] };
+    context = context || {};
+    var caps = contract.capabilities || {};
+    var cap = caps[name] || {};
+    var evidence = [], warnings = [], score = 0;
+    var negative = negativeRegionFor(el, contract.negativeRegionSelectors || []);
+    if (visible(el)) { score += 15; evidence.push('visible'); }
+    else warnings.push('not currently visible');
+
+    if (meta.tiers && meta.tiers.indexOf('configured') >= 0) {
+      score += 8;
+      evidence.push('configured selector evidence');
+    }
+    var stable = stableAttributeEvidence(el, cap.stableAttributeHints || []);
+    if (stable.score) { score += stable.score; evidence.push(stable.label); }
+
+    var role = String(el.getAttribute && el.getAttribute('role') || '').toLowerCase();
+    if (name === 'chatRoot') {
+      if (role === 'feed' || role === 'log') { score += 25; evidence.push('semantic ' + role); }
+      else if (role === 'main' || el.tagName === 'MAIN') { score += 10; evidence.push('semantic main region'); }
+      var rowSel = safeSelectorList(cap.repeatedDescendants || []);
+      var rowNodes = [];
+      try { rowNodes = getDiagnosticRows(el); } catch (e) {}
+      if (!rowNodes.length) {
+        try { rowNodes = rowSel ? Array.from(el.querySelectorAll(rowSel)) : []; } catch (e) {}
+      }
+      if (rowNodes.length >= 2) {
+        score += Math.min(35, 15 + rowNodes.length);
+        evidence.push(rowNodes.length + ' repeated message descendants');
+        if (rowsAreOrdered(rowNodes)) { score += 10; evidence.push('row order verified'); }
+        else warnings.push('row order not verified');
+      } else {
+        warnings.push('no repeated message structure');
+      }
+      var sc = findBestChatScroller(el, null);
+      if (sc) { score += 20; evidence.push('scroll owner'); }
+      else warnings.push('no scroll owner');
+    }
+
+    if (name === 'messageRow') {
+      if (role === 'article' || el.tagName === 'ARTICLE') { score += 30; evidence.push('semantic article'); }
+      var rowRelation = relationToRoot(el, context.root);
+      if (rowRelation === 'inside-root') { score += 20; evidence.push('inside selected root'); }
+      else if (context.root) warnings.push('outside selected root');
+      try {
+        var textLength = String(el.innerText || el.textContent || '').trim().length;
+        if (textLength > 0) { score += 10; evidence.push('non-empty row'); }
+        var siblings = el.parentElement ? el.parentElement.children.length : 0;
+        if (siblings >= 2) { score += 10; evidence.push('repeated sibling rows'); }
+      } catch (e) {}
+    }
+
+    if (name === 'composer') {
+      var editable = !!(el.isContentEditable || role === 'textbox' || el.tagName === 'TEXTAREA');
+      if (editable) { score += 30; evidence.push('editable textbox'); }
+      try {
+        if (!el.disabled && !el.readOnly && el.getAttribute('aria-disabled') !== 'true') {
+          score += 10;
+          evidence.push('enabled editor');
+        }
+        if (el.tabIndex >= 0 || el.isContentEditable || el.tagName === 'TEXTAREA') {
+          score += 5;
+          evidence.push('focusable editor');
+        }
+      } catch (e) {}
+      if (context.verifyBehavior) {
+        if (verifyComposerFocus(el)) { score += 10; evidence.push('input focus verified'); }
+        else warnings.push('input focus not verified');
+      }
+      var composerRelation = relationToRoot(el, context.root);
+      if (composerRelation) { score += 15; evidence.push('proximate to chat root'); }
+      else if (context.root) warnings.push('not proximate to chat root');
+    }
+
+    if (name === 'disclosureControl') {
+      var isDisclosure = !!(el.hasAttribute && (el.hasAttribute('aria-expanded') || el.tagName === 'SUMMARY'));
+      if (isDisclosure) { score += 30; evidence.push('disclosure state'); }
+      var disclosureRelation = relationToRoot(el, context.root);
+      if (disclosureRelation === 'inside-root') { score += 20; evidence.push('inside selected root'); }
+      else if (context.root) warnings.push('outside selected root');
+      try {
+        var messageSel = safeSelectorList(DOM_COLLECTION_SELECTORS);
+        var owningMessage = messageSel && el.closest ? el.closest(messageSel) : null;
+        if (owningMessage && (!context.root || context.root.contains(owningMessage))) {
+          score += 15;
+          evidence.push('inside message row');
+        }
+      } catch (e) {}
+      try {
+        var controls = String(el.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean);
+        var targetInside = controls.some(function (id) {
+          var target = document.getElementById(id);
+          return !!(target && (!context.root || context.root.contains(target)));
+        });
+        if (targetInside) { score += 15; evidence.push('controlled region resolved'); }
+        else if (el.tagName === 'SUMMARY' && el.parentElement && el.parentElement.tagName === 'DETAILS') {
+          score += 15;
+          evidence.push('native disclosure target');
+        } else warnings.push('no resolved controlled region');
+      } catch (e) {}
+    }
+
+    if (name === 'virtualizer') {
+      var range = scrollRange(el);
+      if (range > 8) { score += 20; evidence.push('scroll range'); }
+      else warnings.push('no measurable scroll range');
+      if (verifyScrollBehavior(el)) {
+        score += 15;
+        evidence.push('scroll movement verified');
+      } else if (range > 8) warnings.push('scroll movement not verified');
+      if (isScrollableStyle(el)) { score += 10; evidence.push('scroll ownership style'); }
+      var virtualRelation = relationToRoot(el, context.root);
+      if (virtualRelation === 'inside-root' || virtualRelation === 'owns-root' || virtualRelation === 'root') {
+        score += 20;
+        evidence.push('structurally related to chat root');
+      } else if (context.root) {
+        warnings.push('not structurally related to chat root');
+      }
+    }
+
+    if (negative) { score -= 60; warnings.push('inside negative region: ' + negative); }
+    score = Math.max(0, Math.min(100, Math.round(score)));
+    var tier = evidence.some(function (x) { return /^semantic |editable textbox|disclosure state/.test(x); })
+      ? 'semantic-structural'
+      : (evidence.indexOf('configured selector evidence') >= 0 ? 'structural-stable' : 'structural');
+    return {
+      element: el,
+      selector: meta.selectors && meta.selectors[0] || null,
+      confidence: score,
+      evidence: evidence,
+      warnings: warnings,
+      tier: tier
+    };
+  }
+  function collectCapabilityCandidates(name, cap, contract, context) {
+    var candidates = [];
+    queryCapabilityCandidates(candidates, cap.semanticSelectors || [], 'semantic');
+    queryCapabilityCandidates(candidates, cap.selectors || [], 'configured');
+
+    if (name === 'chatRoot') {
+      // A selector drift must not make discovery impossible. Promote ancestors
+      // of repeated message-shaped nodes as structural root candidates.
+      var rowSelectors = cap.repeatedDescendants || [];
+      var rows = [];
+      queryCapabilityCandidates(rows, rowSelectors, 'message-evidence');
+      var ancestorCounts = new Map();
+      for (var i = 0; i < rows.length && i < 200; i++) {
+        var n = rows[i].element && rows[i].element.parentElement;
+        var depth = 0;
+        while (n && n !== document.body && depth++ < 7) {
+          ancestorCounts.set(n, Number(ancestorCounts.get(n) || 0) + 1);
+          n = n.parentElement;
+        }
+      }
+      ancestorCounts.forEach(function (count, ancestor) {
+        if (count >= 2) candidateRecord(candidates, ancestor, 'structural', '');
+      });
+      try {
+        candidateRecord(candidates, document.querySelector('[' + EXPORT_MARKER_ATTR + '="1"]'), 'marker', '');
+      } catch (e) {}
+    }
+    if (name === 'messageRow' && context.root) {
+      try {
+        getDiagnosticRows(context.root).forEach(function (row) {
+          candidateRecord(candidates, row, 'structural', '');
+        });
+      } catch (e) {}
+    }
+    if (name === 'virtualizer' && context.root) {
+      try { candidateRecord(candidates, findBestChatScroller(context.root, null), 'behavioral', ''); } catch (e) {}
+    }
+    return candidates;
+  }
+  function findCapability(name, suppliedContext) {
+    var contract = DOM_ADAPTER_CONTRACT || {};
+    var cap = contract.capabilities && contract.capabilities[name];
+    if (!cap) return { ok: false, capability: name, confidence: 0, evidence: [], warnings: ['capability not configured'] };
+    var context = suppliedContext || { root: null };
+    if (name !== 'chatRoot' && !context.root) {
+      var rootHit = findCapability('chatRoot');
+      context.root = rootHit && rootHit.element || null;
+    }
+    var candidates = collectCapabilityCandidates(name, cap, contract, context);
+    var scored = candidates.map(function (candidate) {
+      return scoreCapability(name, candidate.element, contract, candidate, context);
+    });
+    scored.sort(function (a,b) { return b.confidence - a.confidence; });
+    var best = scored[0];
+    if (!best) return { ok: false, capability: name, confidence: 0, evidence: [], warnings: ['no candidates'] };
+    return {
+      ok: true,
+      capability: name,
+      element: best.element,
+      selector: best.selector,
+      confidence: best.confidence,
+      evidence: best.evidence,
+      warnings: best.warnings,
+      tier: best.tier
+    };
+  }
+  function countStableRowIdentifiers(rows) {
+    var count = 0;
+    var rowCap = DOM_ADAPTER_CONTRACT && DOM_ADAPTER_CONTRACT.capabilities &&
+      DOM_ADAPTER_CONTRACT.capabilities.messageRow || {};
+    for (var i = 0; i < rows.length; i++) {
+      try {
+        if (rows[i].getAttribute('data-message-id')) { count++; continue; }
+        if (stableAttributeEvidence(rows[i], rowCap.stableAttributeHints || []).score >= 15) count++;
+      } catch (e) {}
+    }
+    return count;
+  }
+  function getDomAdapterHealth() {
+    var names = ['chatRoot','messageRow','composer','disclosureControl','virtualizer'];
+    var result = { ok: true, adapterVersion: RENDERER_AGENT_VERSION, contractVersion: Number(DOM_ADAPTER_CONTRACT && DOM_ADAPTER_CONTRACT.version || 0), capabilities: {}, activeFallbackTier: 'none' };
+    var root = findCapability('chatRoot');
+    names.forEach(function (name) {
+      var hit = name === 'chatRoot' ? root : findCapability(name, {
+        root: root.element || null,
+        verifyBehavior: name === 'composer'
+      });
+      result.capabilities[name] = {
+        found: !!hit.ok && Number(hit.confidence || 0) >= capabilityThreshold('read'),
+        confidence: Number(hit.confidence || 0),
+        evidence: hit.evidence || [],
+        warnings: hit.warnings || [],
+        label: hit.element ? elementLabel(hit.element) : null,
+        tier: hit.tier || 'none'
+      };
+    });
+    result.selectedRoot = root.element ? elementLabel(root.element) : null;
+    result.selectedRootConfidence = Number(root.confidence || 0);
+    result.activeFallbackTier = root.tier || 'none';
+    var rows = root.element ? getDiagnosticRows(root.element) : [];
+    var stableRows = countStableRowIdentifiers(rows);
+    var scroller = root.element ? findBestChatScroller(root.element, null) : null;
+    result.messageRowCount = rows.length;
+    result.exportThresholds = (DOM_ADAPTER_CONTRACT && DOM_ADAPTER_CONTRACT.thresholds) || {};
+    result.exportCompleteness = {
+      readReady: Number(root.confidence || 0) >= capabilityThreshold('read'),
+      destructiveReady: Number(root.confidence || 0) >= capabilityThreshold('destructive'),
+      orderedRows: rowsAreOrdered(rows),
+      stableRowIdentifiers: stableRows,
+      stableRowIdentifierCoveragePct: rows.length ? Math.round((stableRows / rows.length) * 100) : 0,
+      scrollerFound: !!scroller,
+      scrollerRange: scroller ? scrollRange(scroller) : 0,
+      warnings: rows.length && stableRows === 0 ? ['no stable message identifiers'] : []
+    };
+    return result;
+  }
   function init(config) {
     var c = config || {};
     if (Array.isArray(c.chatRootSelectors) && c.chatRootSelectors.length) {
@@ -2747,6 +3397,12 @@
     }
     if (Array.isArray(c.junkSelectors)) {
       DOM_CLEANUP_SELECTORS = c.junkSelectors.slice();
+    }
+    if (c.cleanupPolicy && typeof c.cleanupPolicy === 'object') {
+      DOM_CLEANUP_POLICY = c.cleanupPolicy;
+    }
+    if (c.domAdapterContract && typeof c.domAdapterContract === 'object') {
+      DOM_ADAPTER_CONTRACT = c.domAdapterContract;
     }
     if (Array.isArray(c.preserveSelectors) && c.preserveSelectors.length) {
       DOM_PRESERVE_CONTENT_SELECTORS = c.preserveSelectors.slice();
@@ -3054,22 +3710,16 @@
   //   { ok: false, error }
   // -------------------------------------------------------------------------
   function findFirstChatInput() {
-    if (!Array.isArray(CHAT_INPUT_SELECTORS) || !CHAT_INPUT_SELECTORS.length) {
-      return null;
-    }
-    for (var i = 0; i < CHAT_INPUT_SELECTORS.length; i++) {
-      var selector = CHAT_INPUT_SELECTORS[i];
-      if (!selector) continue;
-      try {
-        var el = document.querySelector(selector);
-        if (!el) continue;
-        var r = el.getBoundingClientRect && el.getBoundingClientRect();
-        var visible = !!r && r.width > 0 && r.height > 0;
-        if (!visible) continue;
-        return { el: el, selector: selector };
-      } catch (e) {}
-    }
-    return null;
+    var root = findCapability('chatRoot');
+    var hit = findCapability('composer', { root: root.element || null, verifyBehavior: true });
+    if (!hit || !hit.ok || hit.confidence < capabilityThreshold('interact')) return null;
+    return {
+      el: hit.element,
+      selector: hit.selector,
+      confidence: hit.confidence,
+      evidence: hit.evidence,
+      warnings: hit.warnings
+    };
   }
 
   function waitForChatInputReady(options) {
@@ -3094,7 +3744,14 @@
 
       var immediate = findFirstChatInput();
       if (immediate) {
-        resolve({ ok: true, ready: true, selector: immediate.selector });
+        resolve({
+          ok: true,
+          ready: true,
+          selector: immediate.selector,
+          confidence: immediate.confidence,
+          evidence: immediate.evidence,
+          warnings: immediate.warnings
+        });
         return;
       }
 
@@ -3113,7 +3770,14 @@
 
         obs = new MutationObserver(function () {
           var hit = findFirstChatInput();
-          if (hit) finish({ ok: true, ready: true, selector: hit.selector });
+          if (hit) finish({
+            ok: true,
+            ready: true,
+            selector: hit.selector,
+            confidence: hit.confidence,
+            evidence: hit.evidence,
+            warnings: hit.warnings
+          });
         });
 
         obs.observe(document.documentElement || document.body, {
@@ -3199,22 +3863,9 @@
   // Multiline editors only -- CHAT_INPUT_SELECTORS is supplied by each app's
   // lib/chat-dom.js, so a bare <input> (sidebar search) is never a candidate.
   function findComposerEditor() {
-    var selectors = (CHAT_INPUT_SELECTORS && CHAT_INPUT_SELECTORS.length)
-      ? CHAT_INPUT_SELECTORS
-      : COMPOSER_FALLBACK_INPUT_SELECTORS;
-    for (var i = 0; i < selectors.length; i++) {
-      var selector = String(selectors[i] || '').trim();
-      if (!selector) continue;
-      try {
-        var candidates = document.querySelectorAll(selector);
-        // Last match wins: when an app renders more than one editor the
-        // composer is the one latest in document order.
-        for (var j = candidates.length - 1; j >= 0; j--) {
-          if (visible(candidates[j])) return candidates[j];
-        }
-      } catch (e) {}
-    }
-    return null;
+    var hit = findCapability('composer');
+    if (!hit || !hit.ok || hit.confidence < capabilityThreshold('interact')) return null;
+    return hit.element;
   }
 
   function findComposerWrapperChain(editor) {
@@ -3312,11 +3963,18 @@
     var first = updateComposerMarker();
     try {
       composerObserver = new MutationObserver(function () {
-        if (composerTimer) return; // trailing throttle
-        composerTimer = setTimeout(function () {
+      // Ordinary editor mutations do not invalidate the wrapper chain.
+      // Only rescan after the tracked editor has been detached or replaced.
+      if (composerEditor && composerEditor.isConnected) return;
+
+      if (composerTimer) return; // trailing throttle
+
+      composerTimer = setTimeout(function () {
           composerTimer = null;
-          try { updateComposerMarker(); } catch (e) {}
-        }, throttleMs);
+          try {
+              updateComposerMarker();
+          } catch (e) {}
+      }, throttleMs);
       });
       composerObserver.observe(document.documentElement || document.body, {
         childList: true,
@@ -3936,6 +4594,7 @@ function waitForPrintableAssets(options) {
     var maxRows = Number(opts.maxRows || 300);
     var previewLen = Number(opts.previewLen || 180);
     var maxReasoningPerRow = Number(opts.maxReasoningPerRow || 6);
+    var includeContent = opts.includeContent === true;
     // Marker separating a turn's user text from the assistant's answer.
     // Caller-supplied so this shared file stays project-neutral.
     var answerMarker = String(opts.answerMarker || 'Copilot said:');
@@ -4026,12 +4685,13 @@ function waitForPrintableAssets(options) {
       var reasoningTextRe = /reasoning|thought|thinking|completed in\s*\d+\s*steps?/i;
       function scanReasoningControls(scope) {
         var results = [];
+        var count = 0;
         try {
           var pool = scope.querySelectorAll(
             '[class*="Reasoning" i],[class*="reasoning" i],' +
             '[aria-expanded],[data-state],button,[role="button"],summary'
           );
-          for (var i = 0; i < pool.length && results.length < maxReasoningPerRow; i++) {
+          for (var i = 0; i < pool.length; i++) {
             var el = pool[i];
             var cls = '';
             try { cls = String(el.className || ''); } catch (e) {}
@@ -4045,16 +4705,19 @@ function waitForPrintableAssets(options) {
             var isReasoning = /reasoning/i.test(cls) ||
               (label.length <= 80 && reasoningTextRe.test(label));
             if (!isReasoning) continue;
-            results.push({
-              label: elementLabel(el),
-              tagName: String(el.tagName || '').toLowerCase(),
-              text: label.slice(0, previewLen),
-              attributes: dumpAttributes(el),
-              controlledRegion: describeControlledRegion(el)
-            });
+            count++;
+            if (includeContent && results.length < maxReasoningPerRow) {
+              results.push({
+                label: elementLabel(el),
+                tagName: String(el.tagName || '').toLowerCase(),
+                text: label.slice(0, previewLen),
+                attributes: dumpAttributes(el),
+                controlledRegion: describeControlledRegion(el)
+              });
+            }
           }
         } catch (e) {}
-        return results;
+        return { count: count, details: results };
       }
 
       var rowEls = getDiagnosticRows(root);
@@ -4098,7 +4761,11 @@ function waitForPrintableAssets(options) {
           var after = t.slice(idx + answerMarker.length).trim();
           after = after.replace(/^copilot\b/i, '').trim();
           after = after.replace(/\bsources\b/gi, '').trim();
-          return { present: true, len: after.length, preview: after.slice(0, previewLen) };
+          return {
+            present: true,
+            len: after.length,
+            preview: includeContent ? after.slice(0, previewLen) : ''
+          };
         }
         var c = { present: false, len: 0, preview: '' };
         var i = { present: false, len: 0, preview: '' };
@@ -4121,6 +4788,7 @@ function waitForPrintableAssets(options) {
         totalAnswerChars: 0,
         totalHiddenChars: 0
       };
+      var reasoningControlCount = 0;
 
       for (var r = 0; r < rowEls.length && r < maxRows; r++) {
         var el2 = rowEls[r];
@@ -4131,6 +4799,8 @@ function waitForPrintableAssets(options) {
         var txt2 = '';
         try { txt2 = String(el2.innerText || el2.textContent || '').replace(/\s+/g, ' ').trim(); } catch (e) {}
         var body2 = answerBodyOf(el2);
+        var reasoning2 = scanReasoningControls(el2);
+        reasoningControlCount += Number(reasoning2.count || 0);
         var role = guessRole(el2);
         var rectH = rect2 ? Math.round(rect2.height) : 0;
         var display2 = cs2 ? String(cs2.display) : '';
@@ -4141,34 +4811,36 @@ function waitForPrintableAssets(options) {
           visibility2 === 'hidden' ||
           (cs2 && Number(cs2.opacity) === 0);
 
-        rows.push({
-          index: r,
-          role: role,
-          label: elementLabel(el2),
-          isConnected: !!el2.isConnected,
-          rectHeight: rectH,
-          offsetHeight: Number(el2.offsetHeight || 0),
-          scrollHeight: Number(el2.scrollHeight || 0),
-          display: display2,
-          visibility: visibility2,
-          opacity: opacity2,
-          contentVisibility: cs2 ? String(cs2.contentVisibility) : '',
-          contain: cs2 ? String(cs2.contain) : '',
-          maxHeight: cs2 ? String(cs2.maxHeight) : '',
-          overflow: cs2 ? String(cs2.overflow) : '',
-          textLength: txt2.length,
-          textHead: txt2.slice(0, previewLen),
-          textTail: txt2.slice(-previewLen),
-          // Answer-body measurements. answerLen is the CSS-independent truth;
-          // answerVisibleLen is what CSS currently exposes; the difference is
-          // text present in the DOM but suppressed from rendering.
-          hasAnswerMarker: body2.hasMarker,
-          answerLen: body2.contentLen,
-          answerVisibleLen: body2.innerLen,
-          answerHiddenChars: body2.hiddenChars,
-          answerPreview: body2.preview,
-          reasoningControls: scanReasoningControls(el2)
-        });
+        if (includeContent) {
+          rows.push({
+            index: r,
+            role: role,
+            label: elementLabel(el2),
+            isConnected: !!el2.isConnected,
+            rectHeight: rectH,
+            offsetHeight: Number(el2.offsetHeight || 0),
+            scrollHeight: Number(el2.scrollHeight || 0),
+            display: display2,
+            visibility: visibility2,
+            opacity: opacity2,
+            contentVisibility: cs2 ? String(cs2.contentVisibility) : '',
+            contain: cs2 ? String(cs2.contain) : '',
+            maxHeight: cs2 ? String(cs2.maxHeight) : '',
+            overflow: cs2 ? String(cs2.overflow) : '',
+            textLength: txt2.length,
+            textHead: txt2.slice(0, previewLen),
+            textTail: txt2.slice(-previewLen),
+            // Answer-body measurements. answerLen is the CSS-independent truth;
+            // answerVisibleLen is what CSS currently exposes; the difference is
+            // text present in the DOM but suppressed from rendering.
+            hasAnswerMarker: body2.hasMarker,
+            answerLen: body2.contentLen,
+            answerVisibleLen: body2.innerLen,
+            answerHiddenChars: body2.hiddenChars,
+            answerPreview: body2.preview,
+            reasoningControls: reasoning2.details
+          });
+        }
 
         if (body2.hasMarker) {
           answerStats.turnsWithMarker++;
@@ -4192,19 +4864,41 @@ function waitForPrintableAssets(options) {
         }
       }
 
-      return {
+      var healthMetrics = {
+        rowCount: Number(rowEls.length || 0),
+        rowsExamined: Number(Math.min(rowEls.length, maxRows) || 0),
+        reasoningControlCount: Number(reasoningControlCount || 0),
+        assistantVisible: Number(summary.assistantVisible || 0),
+        assistantZeroHeight: Number(summary.assistantZeroHeight || 0),
+        assistantHidden: Number(summary.assistantHidden || 0),
+        assistantDisconnected: Number(summary.assistantDisconnected || 0),
+        assistantEmptyText: Number(summary.assistantEmptyText || 0),
+        userVisible: Number(summary.userVisible || 0),
+        unknownVisible: Number(summary.unknownVisible || 0),
+        turnsWithMarker: Number(answerStats.turnsWithMarker || 0),
+        answersPresent: Number(answerStats.answersPresent || 0),
+        answersEmpty: Number(answerStats.answersEmpty || 0),
+        answersHiddenByCss: Number(answerStats.answersHiddenByCss || 0),
+        totalAnswerChars: Number(answerStats.totalAnswerChars || 0),
+        totalHiddenChars: Number(answerStats.totalHiddenChars || 0)
+      };
+      var result = {
         ok: true,
         stage: stage,
-        rootLabel: elementLabel(root),
-        answerMarker: answerMarker,
-        answerStats: answerStats,
-        userHints: userHints,
-        assistantHints: assistantHints,
-        rowCount: rowEls.length,
-        reported: rows.length,
-        assistantSummary: summary,
-        rows: rows
+        healthMetrics: healthMetrics
       };
+      if (includeContent) {
+        result.rootLabel = elementLabel(root);
+        result.answerMarker = answerMarker;
+        result.answerStats = answerStats;
+        result.userHints = userHints;
+        result.assistantHints = assistantHints;
+        result.rowCount = rowEls.length;
+        result.reported = rows.length;
+        result.assistantSummary = summary;
+        result.rows = rows;
+      }
+      return result;
     } catch (e) {
       return { ok: false, stage: stage, error: String((e && e.message) || e) };
     }
@@ -5011,7 +5705,9 @@ function waitForPrintableAssets(options) {
       requestExpandCancel: requestExpandCancel,
       showExpandOverlay: showExpandOverlay,
       hideExpandOverlay: hideExpandOverlay,
-      measureChatScroller: measureChatScroller
+      measureChatScroller: measureChatScroller,
+      findCapability: findCapability,
+      getDomAdapterHealth: getDomAdapterHealth
     }),
     writable: false,
     configurable: true,

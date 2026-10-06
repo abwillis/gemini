@@ -1,102 +1,127 @@
 'use strict';
 
 const defaultAppConfig = Object.freeze({
-    appUrl: 'https://gemini.google.com',
-    partition: String(process.env.GEMINI_PARTITION ?? 'persist:gemini-for-linux').trim(),
-    enableLayoutCss: true,
-    enableDirectOpen: true,
-    enableQuickChat: true,
-
-    // --- Export: decorative-icon stripping (new, shared default) ---
-    // Drop decorative UI icons (file-type glyphs on attachment/reference chips,
-    // favicons) from exports instead of inlining them as base64. Real content
-    // images are unaffected. Set false to embed every image.
-    stripDecorativeIcons: true,
-    // cleanMarkdown export strips UI chrome via DOM_CLEANUP_SELECTORS: buttons,
-    // copy/feedback widgets, toolbars, and code-gutter line numbers / "Show more
-    // lines" expanders. Content selectors (pre, code, table, lists, images) are
-    // preserved. Set false to make cleanMarkdown behave like rawMarkdown.
-    cleanMarkdownStripsJunk: true,
-
-    // --- Export: flatten-retry + scroller-stability (new, shared default) ---
-    // Retry the flatten/capture until captured content stops growing; both paths
-    // first wait for the live scroller range to hold steady so nothing is
-    // captured mid-layout. All bounded so they can never hang.
-    flattenRetryMaxPasses: 4,
-    flattenRetryBudgetMs: 60000,
-    scrollerStableSamples: 2,
-    scrollerStablePollMs: 400,
-    scrollerStableBudgetMs: 8000,
-    scrollerStableBeforePdf: true,
-
-    // Gemini keeps markdown as its default export profile.
-    defaultExportFormat: 'md',
-    defaultPaneExportProfile: 'cleanMarkdown',
-    defaultSelectionExportProfile: 'cleanMarkdown',
-    quickPasteDelayMs: 3000,
-    findContentVisibilityOverride: false,
-    devToolsEnabled: true,
-
-    // --- Export diagnostics (new, shared default) ---
-    enableExportDiagnostics: false,
-    // Conversation export diagnostic: logs per-row user/assistant classification,
-    // geometry, connectivity and reasoning-control attributes at each export
-    // stage. Independent of enableExportDiagnostics. Set false to silence.
-    enableConversationExportDiagnostic: true,
-
-    // --- Reasoning expansion (new, shared default) ---
-    // Expand chain-of-thought reasoning before taking the markdown/HTML/text
-    // snapshot so those exports contain the same reasoning the PDF does. Adds
-    // roughly a second per reasoning panel; set false for headlines only.
-    expandReasoningForSnapshot: true,
-    // PDF export's own post-flatten reasoning attempt. Off by default: it cannot
-    // work reliably from inside the export pipeline. Use View > Expand first.
-    enableReasoningExpansion: false,
-    // Wall-clock ceiling for the whole reasoning-expansion pass, in ms.
-    reasoningExpandBudgetMs: 60000,
-
-    // --- Large-pane PDF chunking (new, shared default) ---
-    // Render large PDFs as stitched page-range slices so a single giant
-    // printToPDF() pass cannot exhaust the renderer. Engages once the estimated
-    // page count exceeds pdfChunkPageThreshold.
-    enablePdfChunking: true,
-    pdfChunkPageThreshold: 50,
-    pdfChunkSize: 50,
-    pdfChunkPageHeightPx: 1056,
-
-    enableConsoleLogging: true,
-    enableFileLogging: false,
-    logFileName: 'gemini-for-linux.log',
-
-    // --- Renderer console capture (new, shared default) ---
-    // Capture renderer-side console output (renderer/agent.js, preload, and the
-    // hosted web app) via Electron's webContents 'console-message' event.
-    // Written to rendererLogFileName so the noisy hosted web app cannot drown
-    // out the app's own main-process log.
-    enableRendererConsoleCapture: true,
-    rendererLogFileName: 'gemini-for-linux-renderer.log',
-    // Verbose diagnostic dumps are written to the log FILE but kept off the
-    // console by default. Set true to also print them to the terminal.
-    verboseDiagnosticsToConsole: false,
+  appUrl: 'https://gemini.google.com',
+  partition: String(process.env.GEMINI_PARTITION ?? 'persist:gemini-for-linux').trim(),
+  enableLayoutCss: true,
+  enableDirectOpen: true,
+  enableQuickChat: true,
+  // Drop decorative UI icons (file-type glyphs on attachment/reference chips,
+  // favicons) from exports instead of inlining them as base64. A measured
+  // markdown export was 34% icon data -- 104 images, all file-type glyphs, for
+  // 291,180 of 853,955 chars. Real content images are unaffected. Set false to
+  // restore the previous behaviour of embedding every image.
+  stripDecorativeIcons: true,
+  // cleanMarkdown export evaluates likely UI chrome with a cleanup predicate.
+  // Selector matches only generate candidates; controls are removed or
+  // unwrapped only after interactive and content-preservation checks. Anchors,
+  // citations, attachments, code, tables, lists, and media are preserved. Set
+  // false to make cleanMarkdown behave like rawMarkdown. rawMarkdown is never
+  // affected by this.
+  cleanMarkdownStripsJunk: true,
+  // Flatten-retry + scroller-stability. Exporting the same conversation could
+  // yield a half-size file that only completed on a second export: pdfPrepare()
+  // mounts rows and leaves them mounted, so the second run built on the first.
+  // The markdown/HTML/text snapshot now retries the flatten/capture until the
+  // captured content stops growing; both paths first wait for the live scroller
+  // range to hold steady (the app finishing layout) so nothing is captured
+  // mid-layout. All bounded so they can never hang.
+  flattenRetryMaxPasses: 4,
+  flattenRetryBudgetMs: 60000,
+  scrollerStableSamples: 2,
+  scrollerStablePollMs: 400,
+  scrollerStableBudgetMs: 8000,
+  scrollerStableBeforePdf: true,
+  defaultExportFormat: 'md',
+  defaultPaneExportProfile: 'cleanMarkdown',
+  defaultSelectionExportProfile: 'cleanMarkdown',
+  quickPasteDelayMs: 3000,
+  findContentVisibilityOverride: false,
+  devToolsEnabled: true,
+  enableExportDiagnostics: false,
+  // Numeric-only export health metrics are safe to emit during normal use.
+  // Per-row text previews, labels, attributes, and reasoning-control details are
+  // available only while a temporary diagnostic session is active.
+  enableExportHealthMetrics: true,
+  enableConversationExportDiagnostic: false,
+  diagnosticSessionDurationMinutes: 15,
+  // Expand chain-of-thought / "Reasoning completed in N steps" panels during
+  // PDF export so the full reasoning is captured. Runs after the virtualizer is
+  // flattened (all rows mounted). Set false to keep reasoning collapsed in the
+  // export (the prior behaviour).
+  // Reasoning expansion during EXPORT is now off by default: it cannot work
+  // reliably from inside the export pipeline (see expandChatPane() in
+  // lib/exporters.js for the measured reasons). Use View > Expand to expand the
+  // conversation in the live app first, then export -- the export will print
+  // whatever is already expanded on screen. Set true only to re-enable the old
+  // in-export attempt.
+  // Expand chain-of-thought reasoning before taking the markdown/HTML/text
+  // snapshot, so those exports contain the same reasoning the PDF does. This
+  // runs after hydration but before the pane is flattened -- the only point at
+  // which the web app actually renders reasoning bodies. Adds roughly a second
+  // per reasoning panel to those exports; set false to skip it (headlines only,
+  // as before). Distinct from enableReasoningExpansion below, which governs the
+  // PDF export's own post-flatten attempt.
+  expandReasoningForSnapshot: true,
+  enableReasoningExpansion: false,
+  // Wall-clock ceiling for the whole reasoning-expansion pass, in ms.
+  // Cost scales with the number of reasoning panels: a 30-panel conversation
+  // exhausted the previous hard-coded 12s budget after only 10 panels, so the
+  // remaining 20 were never expanded at all. Panels are processed top-to-bottom,
+  // so a too-small budget silently truncates the tail of the export. Raise this
+  // for very long conversations; lower it if you would rather cap export time.
+  reasoningExpandBudgetMs: 60000,
+  // Large-pane PDF export is rendered as stitched page-range slices so a
+  // single giant printToPDF() pass cannot exhaust the renderer. Chunking
+  // only engages once the estimated page count exceeds pdfChunkPageThreshold.
+  enablePdfChunking: true,
+  pdfChunkPageThreshold: 50,
+  pdfChunkSize: 50,
+  pdfChunkPageHeightPx: 1056,
+  enableConsoleLogging: true,
+  enableFileLogging: false,
+  logFileName: 'gemini-for-linux.log',
+  // File writes are buffered and asynchronous. The active file plus four
+  // numbered archives are retained; rotation occurs at either limit.
+  logFlushIntervalMs: 250,
+  logBufferMaxBytes: 65536,
+  logMaxBytes: 5242880,
+  logMaxAgeDays: 7,
+  logMaxFiles: 5,
+  // Capture renderer-side console output (renderer/agent.js, preload, and the
+  // hosted web app) via Electron's webContents 'console-message' event. Without
+  // this, renderer console.log never reaches any file -- which is why the
+  // renderer heartbeats added during the PDF export investigation never showed
+  // up in the log. Written to rendererLogFileName so the noisy hosted web app
+  // cannot drown out the app's own main-process log.
+  enableRendererConsoleCapture: false,
+  rendererLogFileName: 'gemini-for-linux-renderer.log',
+  // Verbose diagnostic dumps (the multi-hundred-line [conv] detail: /
+  // hydrateVirtualizer JSON blobs) are written to the log FILE but kept off the
+  // console by default, because they scroll everything else off screen. Set
+  // true to also print them to the terminal.
+  verboseDiagnosticsToConsole: false,
 });
 
 module.exports = Object.freeze({
-    appLabel: 'Gemini',
-    appSlug: 'gemini',
-    appName: 'gemini-for-linux',
-    appUserModelId: 'your.company.gemini',
-    iconFileName: 'gemini-for-linux.png',
-    trayToolTip: 'Gemini for Linux',
-    partitionEnvVar: 'GEMINI_PARTITION',
-    layoutObserverGlobal: '__gemini_layoutObserver',
-    rendererApiGlobal: '__geminiRenderer',
-    rendererAgentVersion: 1,
-    dynamicWidth: Object.freeze({
-        cssVar: '--gemini-vw',
-        minVw: 70,
-        maxVw: 100,
-        defaultVw: 100,
-        screenPercent: 95,
-    }),
-    defaultAppConfig,
+  appLabel: 'Gemini',
+  appSlug: 'gemini',
+  appName: 'gemini-for-linux',
+  appUserModelId: 'your.company.gemini',
+  iconFileName: 'gemini-for-linux.png',
+  trayToolTip: 'Gemini for Linux',
+  partitionEnvVar: 'GEMINI_PARTITION',
+  layoutObserverGlobal: '__gemini_layoutObserver',
+  rendererApiGlobal: '__geminiRenderer',
+  rendererAgentVersion: 2,
+
+  dynamicWidth: Object.freeze({
+    cssVar: '--gemini-vw',
+    minVw: 70,
+    maxVw: 100,
+    defaultVw: 100,
+    screenPercent: 95,
+  }),
+
+  defaultAppConfig,
 });
