@@ -36,7 +36,7 @@ const defaultAppConfig = Object.freeze({
   defaultPaneExportProfile: 'cleanMarkdown',
   defaultSelectionExportProfile: 'cleanMarkdown',
   quickPasteDelayMs: 3000,
-  findContentVisibilityOverride: false,
+  findContentVisibilityOverride: true,
   devToolsEnabled: true,
   enableExportDiagnostics: false,
   // Numeric-only export health metrics are safe to emit during normal use.
@@ -113,7 +113,7 @@ module.exports = Object.freeze({
   partitionEnvVar: 'GEMINI_PARTITION',
   layoutObserverGlobal: '__gemini_layoutObserver',
   rendererApiGlobal: '__geminiRenderer',
-  rendererAgentVersion: 2,
+  rendererAgentVersion: 3,
 
   dynamicWidth: Object.freeze({
     cssVar: '--gemini-vw',

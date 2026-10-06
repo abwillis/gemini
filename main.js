@@ -78,6 +78,8 @@ const APP_DYNAMIC_WIDTH = appConfig.dynamicWidth || null;
 // window[globalName] renderer agent and the correct CSS variable.
 const {
     enableFindContentVisibility,
+    indexFindConversation,
+    cancelFindContentVisibilityIndexing,
     disableFindContentVisibility,
     applyDynamicWidth,
     attachVWResize,
@@ -393,6 +395,8 @@ function initFindInPage() {
     getMainWindow: () => mainWindow,
     getAppConfig,
     enableFindContentVisibility,
+    indexFindConversation,
+    cancelFindContentVisibilityIndexing,
     disableFindContentVisibility,
   });
   return findInPageInstance;

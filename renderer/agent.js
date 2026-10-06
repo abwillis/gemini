@@ -13,8 +13,9 @@
 //   pdfPrepare(options)      -- prepares marked chat pane for native PDF print
 //   pdfRestore()             -- restores DOM state changed by pdfPrepare()
 //   cleanExportHtml(html, preserveSelectors) -- cleans detached export HTML
-//   enableFindContentVisibility()  -- force content-visibility open for Find
-//   disableFindContentVisibility() -- restore Find visibility overrides
+//   enableFindContentVisibility()  -- mark and watch the active Find scope
+//   indexFindConversation()        -- cancellable virtualizer scroll walk
+//   disableFindContentVisibility() -- restore exact Find-time mutations
 //
 // The main process calls it by name instead of shipping the full body of
 // buildChatPaneDetectionScript on every export/find/select. The function
@@ -3474,16 +3475,17 @@
   }
 
   // -------------------------------------------------------------------------
-  // Find-in-page: force content-visibility open under the configured chat root
+  // Find-in-page visibility and virtualized-conversation indexing
   //
-  // This is the JS half of the Find visibility override. The CSS half lives
-  // in lib/layout-css.js and is injected by the main process. This method
-  // is called by layout-css.js via the renderer-agent seam so it also runs
-  // in every subframe.
-  //
-  // State is stored on window with generic __appRenderer_* keys so the
-  // shared agent stays project-neutral.
+  // The main process injects a high-specificity stylesheet. This agent only
+  // marks the matched chat root and its ancestor chain, then verifies targeted
+  // nodes in case a host rule still wins the cascade. Every inline style or
+  // marker mutation is recorded before the first write and restored exactly.
   // -------------------------------------------------------------------------
+  var FIND_ROOT_ATTR = 'data-app-find-root';
+  var FIND_ANCESTOR_ATTR = 'data-app-find-ancestor';
+  var findVisibilityState = null;
+
   function findVisibilityRoot() {
     try {
       for (var i = 0; i < CHAT_ROOT_SELECTORS.length; i++) {
@@ -3494,203 +3496,375 @@
     return null;
   }
 
-  function findVisibilityForce(el, counter) {
+  function findVisibilityMutationEntry(state, el) {
+    if (!state || !el || el.nodeType !== 1) return null;
+    var entry = state.mutations.get(el);
+    if (!entry) {
+      entry = { styles: new Map(), attributes: new Map() };
+      state.mutations.set(el, entry);
+      state.touched.add(el);
+    }
+    return entry;
+  }
+
+  function findVisibilitySetStyle(state, el, property, value, priority) {
+    try {
+      var entry = findVisibilityMutationEntry(state, el);
+      if (!entry) return;
+      if (!entry.styles.has(property)) {
+        var had = false;
+        try {
+          for (var i = 0; i < el.style.length; i++) {
+            if (el.style.item(i) === property) { had = true; break; }
+          }
+        } catch (e) {}
+        entry.styles.set(property, {
+          had: had,
+          value: el.style.getPropertyValue(property),
+          priority: el.style.getPropertyPriority(property)
+        });
+      }
+      el.style.setProperty(property, value, priority || '');
+    } catch (e) {}
+  }
+
+  function findVisibilitySetAttribute(state, el, name, value) {
+    try {
+      var entry = findVisibilityMutationEntry(state, el);
+      if (!entry) return;
+      if (!entry.attributes.has(name)) {
+        entry.attributes.set(name, {
+          had: el.hasAttribute(name),
+          value: el.getAttribute(name)
+        });
+      }
+      el.setAttribute(name, value);
+    } catch (e) {}
+  }
+
+  function findVisibilityRestoreMutations(state) {
+    if (!state) return 0;
+    var restored = 0;
+    state.touched.forEach(function (el) {
+      var entry = state.mutations.get(el);
+      if (!entry || !el) return;
+      entry.styles.forEach(function (previous, property) {
+        try {
+          if (previous.had) {
+            el.style.setProperty(property, previous.value, previous.priority);
+          } else {
+            el.style.removeProperty(property);
+          }
+          restored++;
+        } catch (e) {}
+      });
+      entry.attributes.forEach(function (previous, name) {
+        try {
+          if (previous.had) el.setAttribute(name, previous.value);
+          else el.removeAttribute(name);
+          restored++;
+        } catch (e) {}
+      });
+    });
+    state.touched.clear();
+    return restored;
+  }
+
+  function findVisibilityMarkScope(state) {
+    var root = state && state.root;
+    if (!root) return;
+    findVisibilitySetAttribute(state, root, FIND_ROOT_ATTR, '1');
+    var node = root.parentElement;
+    while (node) {
+      findVisibilitySetAttribute(state, node, FIND_ANCESTOR_ATTR, '1');
+      if (node === document.documentElement) break;
+      node = node.parentElement;
+    }
+  }
+
+  function findVisibilityForceFallback(state, el, counter) {
     try {
       if (!el || el.nodeType !== 1) return;
       var cs = getComputedStyle(el);
-      if (cs.contentVisibility === 'auto' || cs.contentVisibility === 'hidden') {
-        el.style.setProperty('content-visibility', 'visible', 'important');
-        el.style.setProperty('contain-intrinsic-size', 'auto', 'important');
-        el.style.setProperty('contain', 'none', 'important');
-        if (counter) counter.n = (counter.n || 0) + 1;
-      }
+      if (cs.contentVisibility !== 'auto' && cs.contentVisibility !== 'hidden') return;
+      findVisibilitySetStyle(state, el, 'content-visibility', 'visible', 'important');
+      findVisibilitySetStyle(state, el, 'contain-intrinsic-size', 'auto', 'important');
+      findVisibilitySetStyle(state, el, 'contain', 'none', 'important');
+      if (counter) counter.n = (counter.n || 0) + 1;
     } catch (e) {}
   }
 
-  function findVisibilityGetScrollParent(el) {
+  function findVisibilityCheckNode(state, node, includeDescendants, counter) {
+    if (!state || !node || node.nodeType !== 1 || !state.root) return;
     try {
-      var p = el && el.parentElement;
-      while (p && p !== document.body) {
-        var s = getComputedStyle(p);
-        if (
-          (s.overflowY === 'auto' || s.overflowY === 'scroll') &&
-          p.scrollHeight > p.clientHeight + 10
-        ) {
-          return p;
-        }
-        p = p.parentElement;
-      }
+      if (node !== state.root && !state.root.contains(node)) return;
+    } catch (e) { return; }
+
+    findVisibilityForceFallback(state, node, counter);
+    if (!includeDescendants || !node.querySelectorAll) return;
+
+    // CSS handles the normal case. JS checks only likely inline clamps and
+    // configured virtualizer nodes in the newly-added subtree.
+    var selectors = [
+      '[style*="content-visibility" i]',
+      '[style*="contain" i]'
+    ].concat(VIRTUALIZER_SELECTORS || []);
+    var selectorList = safeSelectorList(selectors);
+    if (!selectorList) return;
+    try {
+      node.querySelectorAll(selectorList).forEach(function (el) {
+        findVisibilityForceFallback(state, el, counter);
+      });
     } catch (e) {}
-    return el || document.body;
+  }
+
+  function findVisibilityFlushTargetedChecks(state) {
+    if (!state) return;
+    if (state.checkTimer) {
+      try { clearTimeout(state.checkTimer); } catch (e) {}
+      state.checkTimer = null;
+    }
+    var pending = state.pending;
+    state.pending = new Map();
+    pending.forEach(function (includeDescendants, node) {
+      findVisibilityCheckNode(state, node, includeDescendants, null);
+    });
+  }
+
+  function findVisibilityScheduleCheck(state, node, includeDescendants) {
+    if (!state || !node || node.nodeType !== 1) return;
+    var prior = state.pending.get(node) || false;
+    state.pending.set(node, prior || !!includeDescendants);
+    if (state.checkTimer) return;
+    state.checkTimer = setTimeout(function () {
+      findVisibilityFlushTargetedChecks(state);
+    }, 80);
+  }
+
+  function findVisibilityGetScrollPlan(state) {
+    var root = state && state.root;
+    if (!root || state.scrollDone) {
+      return { needsScrollWalk: false, scroller: null, range: 0 };
+    }
+    try {
+      var candidates = [];
+      var scroller = findBestChatScroller(root, candidates);
+      var virtualizer = null;
+      if (scroller && matchesAnyVirtualizerSelector(scroller)) virtualizer = scroller;
+      if (!virtualizer) virtualizer = firstConfiguredDescendant(root, VIRTUALIZER_SELECTORS);
+      var range = scrollRange(scroller);
+      return {
+        needsScrollWalk: !!(scroller && virtualizer && range > 8),
+        scroller: scroller,
+        range: range,
+        scrollerLabel: elementLabel(scroller),
+        candidates: candidates.slice(0, 12)
+      };
+    } catch (e) {
+      return {
+        needsScrollWalk: false,
+        scroller: null,
+        range: 0,
+        error: String((e && e.message) || e)
+      };
+    }
   }
 
   function enableFindContentVisibility() {
-    return (async function () {
-      try {
-        var chatRoot = findVisibilityRoot();
+    try {
+      var chatRoot = findVisibilityRoot();
+      if (!chatRoot) {
+        return { ok: true, rootFound: false, needsScrollWalk: false, overridden: 0 };
+      }
+
+      if (findVisibilityState && findVisibilityState.root !== chatRoot) {
+        disableFindContentVisibility();
+      }
+
+      var state = findVisibilityState;
+      if (!state) {
+        state = {
+          root: chatRoot,
+          observer: null,
+          checkTimer: null,
+          pending: new Map(),
+          mutations: new WeakMap(),
+          touched: new Set(),
+          scrollDone: false,
+          walkId: 0,
+          cancelRequested: false,
+          walking: false
+        };
+        findVisibilityState = state;
+        findVisibilityMarkScope(state);
+
         var counter = { n: 0 };
+        findVisibilityCheckNode(state, chatRoot, true, counter);
 
-        // Walk ancestors of chat root.
-        if (chatRoot) {
-          var node = chatRoot.parentElement;
-          while (node && node !== document.documentElement) {
-            findVisibilityForce(node, counter);
-            node = node.parentElement;
-          }
-        }
-
-        // Walk all descendants.
-        var scope = chatRoot || document.body;
-        try {
-          scope.querySelectorAll('*').forEach(function (el) {
-            findVisibilityForce(el, counter);
-          });
-        } catch (e) {}
-
-        // One-time scroll-to-render pass so IntersectionObserver-based
-        // virtualization mounts every row before Find highlights them.
-        if (!window.__appRenderer_findVisScrollDone && chatRoot) {
-          window.__appRenderer_findVisScrollDone = true;
-
-          try {
-            var sp = findVisibilityGetScrollParent(chatRoot);
-            var savedTop = sp.scrollTop;
-            var origOF = sp.style.overflow;
-            var origMH = sp.style.maxHeight;
-
-            sp.style.setProperty('overflow', 'visible', 'important');
-            sp.style.setProperty('max-height', 'none', 'important');
-            void sp.offsetHeight;
-
-            await new Promise(function (r) {
-              requestAnimationFrame(function () {
-                requestAnimationFrame(r);
-              });
-            });
-
-            var total = sp.scrollHeight;
-            var view = sp.clientHeight || 500;
-            var step = Math.max(view * 0.75, 200);
-
-            for (var pos = 0; pos <= total; pos += step) {
-              sp.scrollTop = pos;
-              await new Promise(function (r) { setTimeout(r, 30); });
+        state.observer = new MutationObserver(function (mutations) {
+          for (var i = 0; i < mutations.length; i++) {
+            var mutation = mutations[i];
+            if (mutation.type === 'attributes') {
+              findVisibilityScheduleCheck(state, mutation.target, false);
+              continue;
             }
-
-            sp.scrollTop = total;
-            await new Promise(function (r) { setTimeout(r, 30); });
-
-            try {
-              scope.querySelectorAll('*').forEach(function (el) {
-                findVisibilityForce(el, counter);
-              });
-            } catch (e) {}
-
-            sp.style.overflow = origOF;
-            sp.style.maxHeight = origMH;
-            sp.scrollTop = savedTop;
-          } catch (e) {
-            try {
-              console.warn('[renderer-agent] enableFindContentVisibility scroll-to-render failed:', {
-                error: String((e && e.message) || e)
-              });
-            } catch (_) {}
-          }
-        }
-
-        try { void document.body.offsetHeight; } catch (e) {}
-
-        // MutationObserver: keep new nodes overridden while Find is open.
-        if (window.__appRenderer_findVisObs) {
-          try { window.__appRenderer_findVisObs.disconnect(); } catch (e) {}
-        }
-
-        var obs = new MutationObserver(function (muts) {
-          for (var m = 0; m < muts.length; m++) {
-            var mut = muts[m];
-            if (mut.type === 'attributes') {
-              findVisibilityForce(mut.target, counter);
-            }
-            if (mut.type === 'childList') {
-              var added = mut.addedNodes || [];
-              for (var n = 0; n < added.length; n++) {
-                if (added[n].nodeType !== 1) continue;
-                findVisibilityForce(added[n], counter);
-                try {
-                  added[n].querySelectorAll('*').forEach(function (el) {
-                    findVisibilityForce(el, counter);
-                  });
-                } catch (e) {}
+            if (mutation.type !== 'childList') continue;
+            var added = mutation.addedNodes || [];
+            for (var j = 0; j < added.length; j++) {
+              if (added[j].nodeType === 1) {
+                findVisibilityScheduleCheck(state, added[j], true);
               }
             }
           }
         });
-
-        obs.observe(document.body, {
+        state.observer.observe(chatRoot, {
           attributes: true,
           attributeFilter: ['style', 'class'],
           childList: true,
           subtree: true
         });
+        state.initialOverrides = counter.n || 0;
+      } else {
+        // Re-assert markers without scanning the full conversation. The
+        // stylesheet immediately covers all existing and future descendants.
+        findVisibilityMarkScope(state);
+        findVisibilityScheduleCheck(state, chatRoot, false);
+      }
 
-        window.__appRenderer_findVisObs = obs;
+      var plan = findVisibilityGetScrollPlan(state);
+      return {
+        ok: true,
+        rootFound: true,
+        needsScrollWalk: !!plan.needsScrollWalk,
+        scrollerRange: Number(plan.range || 0),
+        scrollerLabel: plan.scrollerLabel || '',
+        overridden: Number(state.initialOverrides || 0)
+      };
+    } catch (e) {
+      return { ok: false, error: String((e && e.message) || e) };
+    }
+  }
 
-        // Periodic sweep to catch anything the observer missed (Fluent's
-        // virtualizer sometimes re-hides rows after a short debounce).
-        if (window.__appRenderer_findVisInterval) {
-          try { clearInterval(window.__appRenderer_findVisInterval); } catch (e) {}
+  function indexFindConversation(options) {
+    var opts = options || {};
+    var state = findVisibilityState;
+    if (!state || !state.root) {
+      return Promise.resolve({ ok: false, reason: 'find-visibility-not-enabled' });
+    }
+    var plan = findVisibilityGetScrollPlan(state);
+    if (!plan.needsScrollWalk || !plan.scroller) {
+      state.scrollDone = true;
+      return Promise.resolve({ ok: true, reason: 'scroll-walk-not-needed', steps: 0 });
+    }
+
+    var scroller = plan.scroller;
+    var savedTop = Number(scroller.scrollTop || 0);
+    var stepDelayMs = Math.max(10, Number(opts.stepDelayMs || 30));
+    var maxSteps = Math.max(1, Number(opts.maxSteps || 800));
+    var maxStuckPasses = Math.max(1, Number(opts.maxStuckPasses || 3));
+    var walkId = ++state.walkId;
+    state.cancelRequested = false;
+    state.walking = true;
+
+    function cancelled() {
+      return !findVisibilityState || state.cancelRequested || state.walkId !== walkId;
+    }
+    function settle(ms) {
+      return new Promise(function (resolve) { setTimeout(resolve, ms); });
+    }
+
+    return (async function () {
+      var steps = 0;
+      var stoppedAt = 'bottom';
+      var maxObservedHeight = Number(scroller.scrollHeight || 0);
+      var stuckPasses = 0;
+      try {
+        try { scroller.scrollTop = 0; } catch (e) {}
+        await settle(stepDelayMs * 2);
+        var step = Math.max(200, Number(scroller.clientHeight || 500) * 0.75);
+        var target = 0;
+
+        while (steps < maxSteps && !cancelled()) {
+          try { scroller.scrollTop = target; } catch (e) {}
+          steps++;
+          await settle(stepDelayMs);
+          if (cancelled()) break;
+          findVisibilityFlushTargetedChecks(state);
+
+          var height = Number(scroller.scrollHeight || 0);
+          if (height > maxObservedHeight + 4) {
+            maxObservedHeight = height;
+            stuckPasses = 0;
+          }
+          if (target + step >= height) {
+            try { scroller.scrollTop = height; } catch (e) {}
+            await settle(stepDelayMs * 2);
+            if (cancelled()) break;
+            var nextHeight = Number(scroller.scrollHeight || 0);
+            if (nextHeight > maxObservedHeight + 4) {
+              maxObservedHeight = nextHeight;
+              stuckPasses = 0;
+              target = Number(scroller.scrollTop || 0);
+              continue;
+            }
+            stuckPasses++;
+            if (stuckPasses >= maxStuckPasses) break;
+            target = nextHeight;
+            continue;
+          }
+          target += step;
         }
 
-        window.__appRenderer_findVisInterval = setInterval(function () {
-          try {
-            var s = findVisibilityRoot() || document.body;
-            s.querySelectorAll('*').forEach(function (el) {
-              findVisibilityForce(el);
-            });
-          } catch (e) {}
-        }, 2000);
+        if (cancelled()) stoppedAt = 'cancelled';
+        else if (steps >= maxSteps) stoppedAt = 'max-steps';
+        else state.scrollDone = true;
 
-        return { ok: true, overridden: counter.n || 0 };
+        return {
+          ok: true,
+          cancelled: stoppedAt === 'cancelled',
+          steps: steps,
+          stoppedAt: stoppedAt,
+          finalHeight: maxObservedHeight,
+          restoredScrollTop: true
+        };
       } catch (e) {
-        return { ok: false, error: String((e && e.message) || e) };
+        return {
+          ok: false,
+          cancelled: cancelled(),
+          steps: steps,
+          error: String((e && e.message) || e)
+        };
+      } finally {
+        try { scroller.scrollTop = savedTop; } catch (e) {}
+        if (state.walkId === walkId) state.walking = false;
       }
     })();
   }
 
+  function cancelFindContentVisibilityIndexing() {
+    var state = findVisibilityState;
+    if (!state) return { ok: true, cancelled: false };
+    state.cancelRequested = true;
+    state.walkId++;
+    return { ok: true, cancelled: !!state.walking };
+  }
+
   function disableFindContentVisibility() {
     try {
-      if (window.__appRenderer_findVisObs) {
-        try { window.__appRenderer_findVisObs.disconnect(); } catch (e) {}
-        try { delete window.__appRenderer_findVisObs; } catch (e) {
-          window.__appRenderer_findVisObs = null;
-        }
+      var state = findVisibilityState;
+      if (!state) return { ok: true, restored: 0 };
+      state.cancelRequested = true;
+      state.walkId++;
+      if (state.observer) {
+        try { state.observer.disconnect(); } catch (e) {}
       }
-
-      if (window.__appRenderer_findVisInterval) {
-        try { clearInterval(window.__appRenderer_findVisInterval); } catch (e) {}
-        try { delete window.__appRenderer_findVisInterval; } catch (e) {
-          window.__appRenderer_findVisInterval = null;
-        }
+      if (state.checkTimer) {
+        try { clearTimeout(state.checkTimer); } catch (e) {}
       }
-
-      try { delete window.__appRenderer_findVisScrollDone; } catch (e) {
-        window.__appRenderer_findVisScrollDone = false;
-      }
-
-      document.querySelectorAll('[style]').forEach(function (el) {
-        try {
-          if (
-            el.style.getPropertyValue('content-visibility') === 'visible' &&
-            el.style.getPropertyPriority('content-visibility') === 'important'
-          ) {
-            el.style.removeProperty('content-visibility');
-            el.style.removeProperty('contain-intrinsic-size');
-            el.style.removeProperty('contain');
-          }
-        } catch (e) {}
-      });
-
-      return { ok: true };
+      state.pending.clear();
+      var restored = findVisibilityRestoreMutations(state);
+      findVisibilityState = null;
+      return { ok: true, restored: restored };
     } catch (e) {
       return { ok: false, error: String((e && e.message) || e) };
     }
@@ -5680,6 +5854,8 @@ function waitForPrintableAssets(options) {
       pdfRestore: pdfRestore,
       cleanExportHtml: cleanExportHtml,
       enableFindContentVisibility: enableFindContentVisibility,
+      indexFindConversation: indexFindConversation,
+      cancelFindContentVisibilityIndexing: cancelFindContentVisibilityIndexing,
       disableFindContentVisibility: disableFindContentVisibility,
       waitForChatInputReady: waitForChatInputReady,
       updateComposerMarker: updateComposerMarker,
