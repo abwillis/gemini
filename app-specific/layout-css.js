@@ -8,7 +8,7 @@ const {
     CHAT_MESSAGE_LIST_PSEUDO,
     messageContentById,
 } = require('./chat-dom');
-const { callRendererMethodInAllFrames } = require('./renderer-api');
+const { callRendererMethodInAllFrames } = require('../lib/renderer-api');
 
 // --- Dynamic width constants -----------------------------------------------
 const MAX_CHARS = 2048;

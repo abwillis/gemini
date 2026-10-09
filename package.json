@@ -1,11 +1,12 @@
 {
   "name": "gemini-for-linux",
-  "version": "3.00.07",
+  "version": "3.00.09",
   "description": "Gemini for Linux",
   "desktopName": "gemini-for-linux",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "test": "node --test",
     "dist": "electron-builder --linux rpm",
     "dist:deb": "electron-builder --linux deb",
     "dist:win": "electron-builder --win nsis portable"
@@ -19,13 +20,13 @@
     "files": [
       "main.js",
       "main.bootstrap.js",
-      "app.config.js",
-      "preload.js",
       "preload-core.js",
+      "app-specific/**",
       "renderer/**",
       "package.json",
       "assets/**",
-      "lib/**"
+      "lib/**",
+      "test/**"
     ],
     "asarUnpack": [
       "**/*.node",
