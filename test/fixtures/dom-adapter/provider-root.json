@@ -1,0 +1,23 @@
+{
+  "expectedRootId": "chat-history",
+  "body": {
+    "children": [
+      {
+        "tag": "main",
+        "attrs": { "id": "gemini-app", "class": "chat-app", "role": "main" },
+        "children": [
+          {
+            "tag": "div",
+            "attrs": { "id": "chat-history", "role": "log" },
+            "children": [
+              { "tag": "user-query", "attrs": { "id": "gemini-query-1" }, "text": "Gemini question" },
+              { "tag": "model-response", "attrs": { "id": "gemini-response-1" }, "text": "Gemini answer" },
+              { "tag": "user-query", "attrs": { "id": "gemini-query-2" }, "text": "Gemini follow-up" },
+              { "tag": "model-response", "attrs": { "id": "gemini-response-2" }, "text": "Gemini second answer" }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

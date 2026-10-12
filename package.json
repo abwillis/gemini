@@ -1,6 +1,6 @@
 {
   "name": "gemini-for-linux",
-  "version": "3.00.10",
+  "version": "3.00.12",
   "description": "Gemini for Linux",
   "desktopName": "gemini-for-linux",
   "main": "main.js",
@@ -26,7 +26,8 @@
       "package.json",
       "assets/**",
       "lib/**",
-      "test/**"
+      "test/**",
+      "test-support/**"
     ],
     "asarUnpack": [
       "**/*.node",
