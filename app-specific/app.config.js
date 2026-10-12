@@ -154,7 +154,7 @@ module.exports = Object.freeze({
   partitionEnvVar: 'GEMINI_PARTITION',
   layoutObserverGlobal: '__gemini_layoutObserver',
   rendererApiGlobal: '__geminiRenderer',
-  rendererAgentVersion: 6,
+  rendererAgentVersion: 7,
 
   dynamicWidth: Object.freeze({
     cssVar: '--gemini-vw',
