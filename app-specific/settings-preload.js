@@ -7,9 +7,15 @@ const IPC = Object.freeze({
   SETTINGS_GET: 'gemini:settings-get',
   SETTINGS_VALIDATE: 'gemini:settings-validate',
   SETTINGS_SAVE: 'gemini:settings-save',
+  SETTINGS_RESTORE: 'gemini:settings-restore',
+  SETTINGS_EXPORT: 'gemini:settings-export',
+  SETTINGS_IMPORT: 'gemini:settings-import',
 });
 
 contextBridge.exposeInMainWorld('appSettings', Object.freeze({
+  restorePrevious() { return ipcRenderer.invoke(IPC.SETTINGS_RESTORE); },
+  exportSettings() { return ipcRenderer.invoke(IPC.SETTINGS_EXPORT); },
+  importSettings() { return ipcRenderer.invoke(IPC.SETTINGS_IMPORT); },
   get() {
     return ipcRenderer.invoke(IPC.SETTINGS_GET);
   },
