@@ -195,32 +195,58 @@ function applyMaxLayoutCSS(win, { specificMessageId } = {}) {
 
 // --- injectCSSOnLoad -------------------------------------------------------
 function injectCSSOnLoad(win, css, keyHolder) {
-    if (!win || !win.webContents) return;
+    if (!win || !win.webContents || !keyHolder) return;
+
     const wc = win.webContents;
-    if (!keyHolder) return;
     keyHolder.css = String(css ?? keyHolder.css ?? '');
-    const inject = () => {
-        try {
-            const currentCss = String(keyHolder.css ?? '');
-            if (!currentCss) return;
-            if (keyHolder.key) {
-                try { wc.removeInsertedCSS(keyHolder.key); } catch {}
-                keyHolder.key = null;
-            }
-            wc.insertCSS(currentCss)
-                .then(k => { keyHolder.key = k; })
-                .catch(() => {});
-        } catch (err) {
-            console.error('insertCSS failed:', err);
-        }
+    keyHolder.queue ||= Promise.resolve();
+
+    const queueInject = () => {
+        if (keyHolder.timer) clearTimeout(keyHolder.timer);
+
+        keyHolder.timer = setTimeout(() => {
+            keyHolder.timer = null;
+
+            keyHolder.queue = keyHolder.queue
+                .catch(() => {})
+                .then(async () => {
+                    if (wc.isDestroyed?.()) return;
+
+                    const currentCss = String(keyHolder.css ?? '');
+                    if (!currentCss) return;
+
+                    // Insert first to avoid flashing the original layout.
+                    const nextKey = await wc.insertCSS(currentCss);
+                    const previousKey = keyHolder.key;
+                    keyHolder.key = nextKey;
+
+                    if (previousKey && previousKey !== nextKey) {
+                        try {
+                            await wc.removeInsertedCSS(previousKey);
+                        } catch {}
+                    }
+                })
+                .catch(err => {
+                    console.error('insertCSS failed:', err);
+                });
+        }, 75);
     };
+
     if (!keyHolder.__wired) {
         keyHolder.__wired = true;
-        wc.on('dom-ready', inject);
-        wc.on('did-finish-load', inject);
-        wc.on('did-start-navigation', inject);
+
+        // One event for full-document loads and one for SPA navigation.
+        wc.on('dom-ready', queueInject);
+        wc.on('did-navigate-in-page', queueInject);
+
+        wc.once('destroyed', () => {
+            if (keyHolder.timer) clearTimeout(keyHolder.timer);
+            keyHolder.timer = null;
+            keyHolder.key = null;
+        });
     }
-    inject();
+
+    queueInject();
 }
 
 // --- injectCSSIntoAllFrames ------------------------------------------------
@@ -233,16 +259,17 @@ function injectCSSIntoAllFrames(win, css) {
             if (prev) clearTimeout(prev);
             const t = setTimeout(() => {
                 try {
-                    let injected = injectedFrameIdsByWC.get(wc);
-                    if (!injected) {
-                        injected = new Set();
-                        injectedFrameIdsByWC.set(wc, injected);
-                    }
+                    // Frames can navigate while keeping the same routingId and CSS is
+                    // dropped on navigation, so bookkeeping is reset on every apply.
+                    const injected = new Set();
+                    injectedFrameIdsByWC.set(wc, injected);
                     const frames = wc.mainFrame?.framesInSubtree ?? wc.mainFrame?.frames ?? [];
                     for (const f of frames) {
                         try {
+                            // framesInSubtree includes the main frame, which is handled
+                            // (and its key tracked) by wc.insertCSS() below.
+                            if (f === wc.mainFrame) continue;
                             const rid = (typeof f?.routingId === 'number') ? f.routingId : null;
-                            if (rid !== null && injected.has(rid)) continue;
                             f.insertCSS(css).then(() => { if (rid !== null) injected.add(rid); }).catch(() => {});
                         } catch {}
                     }
@@ -464,11 +491,23 @@ function createLayoutCSS(deps = {}) {
         }
         try {
             const runtimeWidth = Number(getRuntimeConfig?.()?.layoutWidthVw);
+            const targetVw = Number.isFinite(runtimeWidth)
+                ? runtimeWidth
+                : Number(dynamicWidth.defaultVw) || VW_SIZE;
             await callRAFrames(
                 { webContents: win.webContents },
                 'setTargetVW',
-                { vw: Number.isFinite(runtimeWidth) ? runtimeWidth : Number(dynamicWidth.defaultVw) || VW_SIZE }
+                { vw: targetVw }
             );
+            // Re-arm the responsive listener with the new target. Otherwise the next
+            // window resize recomputes the width from the pre-Settings percentage.
+            if (win.webContents.__vwResizeAttached) {
+                await callRAFrames(
+                    { webContents: win.webContents },
+                    'startVWResize',
+                    { screenPercent: targetVw }
+                );
+            }
         } catch (err) {
             console.error('applyDynamicWidth failed:', err);
         }
@@ -500,7 +539,11 @@ function createLayoutCSS(deps = {}) {
             }
         };
 
-        wc.once('dom-ready', install);
+        // attachCSSAndLayoutHandlers calls this from ready-to-show, which can fire
+        // after the first dom-ready. Install now and again for every replacement
+        // document; startVWResize is idempotent in the agent.
+        wc.on('dom-ready', install);
+        await install();
     }
 
     async function attachComposerTracking(win) {
