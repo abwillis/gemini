@@ -4,6 +4,8 @@
 'use strict';
 
 const {
+    CHAT_ROOT_SELECTORS,
+    CHAT_MESSAGE_LIST_SELECTORS,
     CHAT_SCOPE_PSEUDO,
     CHAT_MESSAGE_LIST_PSEUDO,
     messageContentById,
@@ -17,6 +19,19 @@ const MIN_VW    = 70;
 const MAX_VW    = 100;
 
 // --- Selector groups -------------------------------------------------------
+// chat-dom keeps the bare app-shell selectors (main / [role="main"]) because DOM
+// detection and export need them. The layout stylesheet must not: forcing width,
+// min-width, overflow, padding and a blanket descendant rule onto the page shell
+// also hits the sidebar-adjacent content and the centered new-chat composer.
+// Every layout rule therefore uses these shell-free scopes, so the stylesheet is
+// inert unless a real conversation container is present.
+const APP_SHELL_SELECTORS = new Set(['main', '[role="main"]']);
+const withoutAppShell = list => list.filter(selector => !APP_SHELL_SELECTORS.has(String(selector).trim()));
+const LAYOUT_SCOPE_PSEUDO = `:is(${withoutAppShell(CHAT_ROOT_SELECTORS).join(', ')})`;
+const LAYOUT_MESSAGE_LIST_PSEUDO = `:is(${withoutAppShell(CHAT_MESSAGE_LIST_SELECTORS).join(', ')})`;
+const layoutMessageContentById = id =>
+    `${LAYOUT_SCOPE_PSEUDO} #${id}, ${LAYOUT_MESSAGE_LIST_PSEUDO} #${id}, [id="${id}"]`;
+
 const SELECTORS = Object.freeze({
     chatScope: CHAT_SCOPE_PSEUDO,
     messageList: CHAT_MESSAGE_LIST_PSEUDO,
@@ -34,7 +49,7 @@ const cssApplyDebounceByWC    = new WeakMap();
 // --- buildMaxLayoutCSS -----------------------------------------------------
 function buildMaxLayoutCSS({ specificMessageId } = {}) {
     const CONTENT = [
-        specificMessageId ? messageContentById(specificMessageId) : null,
+        specificMessageId ? layoutMessageContentById(specificMessageId) : null,
         '.conversation-container [role="article"]',
         '.conversation-container article',
         '.conversation-container [class*="response-content"]',
@@ -47,9 +62,9 @@ function buildMaxLayoutCSS({ specificMessageId } = {}) {
         '.conversation-container [role="article"]:has(table)',
         '.conversation-container article:has(table)',
         '.conversation-container div:has(> table)',
-        `${CHAT_SCOPE_PSEUDO} [role="article"]:has(table)`,
-        `${CHAT_SCOPE_PSEUDO} article:has(table)`,
-        `${CHAT_SCOPE_PSEUDO} div:has(> table)`
+        `${LAYOUT_SCOPE_PSEUDO} [role="article"]:has(table)`,
+        `${LAYOUT_SCOPE_PSEUDO} article:has(table)`,
+        `${LAYOUT_SCOPE_PSEUDO} div:has(> table)`
     ].join(',\n');
 
     return String.raw`
@@ -66,14 +81,14 @@ html, body {
 @supports (overflow: clip) {
     html, body { overflow-x: clip !important; }
 }
-${CHAT_SCOPE_PSEUDO},
-${CHAT_SCOPE_PSEUDO} * {
+${LAYOUT_SCOPE_PSEUDO},
+${LAYOUT_SCOPE_PSEUDO} * {
     box-sizing: border-box !important;
     max-width: 100% !important;
     overflow-wrap: anywhere !important;
     word-break: break-word !important;
 }
-${CHAT_SCOPE_PSEUDO} {
+${LAYOUT_SCOPE_PSEUDO} {
     width: 100% !important;
     max-width: none !important;
     min-width: 0 !important;
@@ -81,7 +96,7 @@ ${CHAT_SCOPE_PSEUDO} {
     overflow-y: auto !important;
     scrollbar-gutter: stable both-edges !important;
 }
-${CHAT_MESSAGE_LIST_PSEUDO},
+${LAYOUT_MESSAGE_LIST_PSEUDO},
 .conversation-container,
 [class="response-container"] {
     width: 100% !important;
@@ -109,9 +124,9 @@ form,
 [class*="composer" i],
 [class*="prompt-box" i],
 [class*="text-input" i],
-${CHAT_SCOPE_PSEUDO} textarea,
-${CHAT_SCOPE_PSEUDO} [contenteditable="true"],
-${CHAT_SCOPE_PSEUDO} div[role="textbox"] {
+${LAYOUT_SCOPE_PSEUDO} textarea,
+${LAYOUT_SCOPE_PSEUDO} [contenteditable="true"],
+${LAYOUT_SCOPE_PSEUDO} div[role="textbox"] {
     width: 100% !important;
     max-width: none !important;
     min-width: 0 !important;
@@ -138,7 +153,7 @@ ${TABLE_WRAPPERS} {
     padding-right: 0 !important;
 }
 .conversation-container table,
-${CHAT_SCOPE_PSEUDO} table {
+${LAYOUT_SCOPE_PSEUDO} table {
     table-layout: fixed !important;
     width: 100% !important;
     min-width: 100% !important;
@@ -148,8 +163,8 @@ ${CHAT_SCOPE_PSEUDO} table {
 }
 .conversation-container th,
 .conversation-container td,
-${CHAT_SCOPE_PSEUDO} th,
-${CHAT_SCOPE_PSEUDO} td {
+${LAYOUT_SCOPE_PSEUDO} th,
+${LAYOUT_SCOPE_PSEUDO} td {
     white-space: normal !important;
     overflow-wrap: anywhere !important;
     word-break: break-word !important;
@@ -158,15 +173,15 @@ ${CHAT_SCOPE_PSEUDO} td {
 }
 .conversation-container pre,
 .conversation-container code,
-${CHAT_SCOPE_PSEUDO} pre,
-${CHAT_SCOPE_PSEUDO} code {
+${LAYOUT_SCOPE_PSEUDO} pre,
+${LAYOUT_SCOPE_PSEUDO} code {
     white-space: pre-wrap !important;
     overflow-wrap: anywhere !important;
     word-break: break-word !important;
     max-width: 92vw !important;
 }
 .conversation-container pre,
-${CHAT_SCOPE_PSEUDO} pre {
+${LAYOUT_SCOPE_PSEUDO} pre {
     width: 100% !important;
     overflow-x: hidden !important;
     box-sizing: border-box !important;
@@ -532,7 +547,7 @@ function createLayoutCSS(deps = {}) {
                     'startVWResize',
                     { screenPercent: Number.isFinite(runtimeWidth)
                         ? runtimeWidth
-                        : Number(dynamicWidth.screenPercent) || dynamicWidth.maxVw || MAX_VW }
+                        : Number(dynamicWidth.defaultVw) || dynamicWidth.maxVw || MAX_VW }
                 );
             } catch (err) {
                 console.error('attachVWResize failed:', err);
@@ -624,7 +639,7 @@ module.exports = {
     SELECTORS, IGNORE_SELECTORS, IGNORE_JOINED,
     messageContentById,
     MAX_CHARS, VW_SIZE, MIN_VW, MAX_VW,
-    buildMaxLayoutCSS,
+    buildMaxLayoutCSS, LAYOUT_SCOPE_PSEUDO, LAYOUT_MESSAGE_LIST_PSEUDO,
     maxLayoutCssCache, injectedFrameIdsByWC, insertedMainCssKeyByWC, cssApplyDebounceByWC,
     injectCSSOnLoad, injectCSSIntoAllFrames, applyMaxLayoutCSS, requestExpandedLayout,
     buildFindContentVisibilityCSS,
