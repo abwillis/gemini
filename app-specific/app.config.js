@@ -152,6 +152,9 @@ module.exports = Object.freeze({
   iconFileName: 'gemini-for-linux.png',
   trayToolTip: 'Gemini for Linux',
   partitionEnvVar: 'GEMINI_PARTITION',
+  // Additional origins treated as the app itself (none needed currently).
+  // Kept in sync with the Copilot config; see lib/permissions.js.
+  trustedOrigins: Object.freeze([]),
   layoutObserverGlobal: '__gemini_layoutObserver',
   rendererApiGlobal: '__geminiRenderer',
   rendererAgentVersion: 7,
