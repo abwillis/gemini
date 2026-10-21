@@ -1,6 +1,6 @@
 {
   "name": "gemini-for-linux",
-  "version": "3.01.06",
+  "version": "3.01.07",
   "description": "Gemini for Linux",
   "desktopName": "gemini-for-linux",
   "main": "main.js",
@@ -25,7 +25,6 @@
     "files": [
       "main.js",
       "main.bootstrap.js",
-      "preload-core.js",
       "app-specific/**",
       "renderer/**",
       "package.json",
