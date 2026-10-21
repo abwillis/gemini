@@ -147,7 +147,7 @@ module.exports = Object.freeze({
   appLabel: 'Gemini',
   appSlug: 'gemini',
   appName: 'gemini-for-linux',
-  appUserModelId: 'com.company.gemini',
+  appUserModelId: 'com.local.gemini',
   iconFileName: 'gemini-for-linux.png',
   trayToolTip: 'Gemini for Linux',
   partitionEnvVar: 'GEMINI_PARTITION',
