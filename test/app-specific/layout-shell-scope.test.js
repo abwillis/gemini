@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const layout = require('../app-specific/layout-css');
+const layout = require('../../app-specific/layout-css');
 
 test('layout scopes exclude the bare app shell but keep conversation containers', () => {
   for (const scope of [layout.LAYOUT_SCOPE_PSEUDO, layout.LAYOUT_MESSAGE_LIST_PSEUDO]) {
