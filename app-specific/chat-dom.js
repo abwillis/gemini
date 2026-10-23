@@ -1,10 +1,9 @@
-// lib/chat-dom.js  — Gemini-specific DOM selector constants & detection scripts
+// lib/chat-dom.js  — Gemini-specific DOM selector constants
 // This module is NOT shared between apps; each app has its own chat-dom.js
 // that exports the same shape of API but with app-specific selectors.
 'use strict';
 
 // === Selector constants (Gemini UI 2024/2025) ==============================
-const CHAT_SELECTOR = '#mainChat';  // Legacy/fallback root selector
 
 const CHAT_ROOT_SELECTORS = [
     '#mainChat',
@@ -42,24 +41,6 @@ function messageContentById(id) {
 // Code-preview iframe selector (Gemini uses iframes for rendered code)
 const CODE_PREVIEW_IFRAME_SELECTOR = 'iframe[src*="immersive"]';
 
-// === Transcript child selectors (Gemini-specific) ==========================
-const TRANSCRIPT_SELECTORS = [
-    'message-content',
-    '.markdown.markdown-main-panel',
-    '[id^="model-response-message-content"]',
-    'structured-content-container',
-    '.model-response-text',
-    '.response-content',
-    '.response-container-content',
-    '.presented-response-container',
-    '.conversation-container',
-    '[class="response-container"]',
-    '[role="article"]',
-    'article',
-    'section',
-    'main'
-];
-
 // === DOM cleanup ("junk") selectors ========================================
 const DOM_CLEANUP_SELECTORS = [
     '[role="button"]',
@@ -73,68 +54,6 @@ const DOM_CLEANUP_SELECTORS = [
     '[role="textbox"]'
 ];
 
-// === Chrome/UI penalty selectors ===========================================
-const CHROME_PENALTY_SELECTOR =
-    'user-query,' +
-    'user-query-content,' +
-    '.user-query-container,' +
-    '.query-content,' +
-    '.response-footer,' +
-    '.response-container-footer,' +
-    'message-actions,' +
-    'sources-list,' +
-    'tts-control,' +
-    'bard-avatar,' +
-    '.avatar-gutter';
-
-const CHROME_PENALTY_REGEX =
-    /(user-query|prompt|action|button|toolbar|footer|sources-list|message-actions|thumb-|tts-|avatar-gutter)/i;
-
-// === User-prompt detection selectors =======================================
-const USER_PROMPT_SELECTOR =
-    'user-query,' +
-    'user-query-content,' +
-    '.user-query-container,' +
-    '.query-content';
-
-const USER_PROMPT_REGEX = /(user-query|query-content)/i;
-
-// === Semantic table selectors ==============================================
-const TABLE_SIGNAL_SELECTORS = [
-    'table',
-    '[role="table"]',
-    '[role="grid"]',
-    'table-block',
-    '.table-block',
-    '.table-block-component',
-    '.table-content',
-    '.horizontal-scroll-wrapper'
-];
-
-const TABLE_SIGNAL_SELECTOR_JOINED = TABLE_SIGNAL_SELECTORS.join(', ');
-
-const TABLE_SIGNAL_HTML_REGEX =
-    /<table\b|role="table"|role="grid"|<table-block\b|class="[^"]*(?:table-block-component|table-block|table-content|horizontal-scroll-wrapper)[^"]*"/gi;
-
-// === Promotion-candidate selectors =========================================
-const PROMOTION_STOP_SELECTOR = '#chat-history, main, [role="main"], body, html';
-
-const PROMOTION_CANDIDATE_SELECTOR =
-    'message-content,' +
-    'structured-content-container,' +
-    '.response-content,' +
-    '.response-container-content,' +
-    '.presented-response-container,' +
-    '.response-container,' +
-    '.conversation-container,' +
-    '.table-block-component,' +
-    '.horizontal-scroll-wrapper,' +
-    'table-block,' +
-    'infinite-scroller';
-
-const PROMOTION_CANDIDATE_REGEX =
-    /(response|conversation|table-block|horizontal-scroll-wrapper|chat-history)/i;
-
 // === Preserve selectors (used during cleanup) ==============================
 const PRESERVE_SELECTORS = [
     'pre', 'code', 'table',
@@ -146,8 +65,6 @@ const PRESERVE_SELECTORS = [
     '.table-block',
     '.table-content'
 ];
-
-const PRESERVE_SELECTOR_JOINED = PRESERVE_SELECTORS.join(', ');
 
 // Renderer-agent configuration.  These values remain Gemini-specific while
 // renderer/agent.js and the main-process consumers remain project-neutral.
@@ -161,117 +78,6 @@ const DOM_PRESERVE_CONTENT_SELECTORS = [
     'video',
     'iframe'
 ];
-
-const PRINT_BUBBLE_CSS = `
-  [data-pdf-export-target="1"] message-content,
-  [data-pdf-export-target="1"] message-content *,
-  [data-pdf-export-target="1"] structured-content-container,
-  [data-pdf-export-target="1"] structured-content-container *,
-  [data-pdf-export-target="1"] .model-response-text,
-  [data-pdf-export-target="1"] .model-response-text *,
-  [data-pdf-export-target="1"] .response-content,
-  [data-pdf-export-target="1"] .response-content *,
-  [data-pdf-export-target="1"] .response-container-content,
-   [data-pdf-export-target="1"] .response-container-content * {
-    max-height: none !important;
-    overflow: visible !important;
-    content-visibility: visible !important;
-    contain: none !important;
-  }
-  @media print {
-   /*
-   * Gemini wraps each rendered response in nested flex containers whose
-   * percentage min-heights are useful on screen but interfere with Chromium's
-   * page fragmentation.  In particular, the final fragment can be assigned to
-   * a following page without its remaining content being painted.
-   *
-   * Convert only the response-layout wrapper chain inside the marked export
-   * target to ordinary block flow for printing.  Height and flex constraints
-   * must be removed together; changing only the custom-element hosts leaves
-   * the surrounding flex formatting context intact.
-   */
-  [data-pdf-export-target="1"] .response-container,
-  [data-pdf-export-target="1"] .presented-response-container,
-  [data-pdf-export-target="1"] .response-container-content,
-  [data-pdf-export-target="1"] .response-content,
-  [data-pdf-export-target="1"] structured-content-container,
-  [data-pdf-export-target="1"] message-content > .container {
-    display: block !important;
-    height: auto !important;
-    min-height: 0 !important;
-    max-height: none !important;
-    block-size: auto !important;
-    min-block-size: 0 !important;
-    max-block-size: none !important;
-    flex: none !important;
-    overflow: visible !important;
-    break-inside: auto !important;
-    page-break-inside: auto !important;
-  }
-  /*
-   * Gemini uses inline custom-element hosts around both the response body and
-   * embedded rich-response components. Give those hosts explicit block
-   * formatting contexts so Chromium can fragment their contents across pages.
-   */
-  [data-pdf-export-target="1"] message-content,
-  [data-pdf-export-target="1"] response-container,
-  [data-pdf-export-target="1"] response-element,
-  [data-pdf-export-target="1"] timeline,
-  [data-pdf-export-target="1"] sequence,
-  [data-pdf-export-target="1"] table-block {
-    display: block !important;
-  }
-  /*
-   * Do not allow the rich-component wrappers to create a clipped or atomic
-   * print fragment. Their individual events/rows must remain page-fragmentable.
-   */
-  [data-pdf-export-target="1"] response-element,
-  [data-pdf-export-target="1"] timeline,
-  [data-pdf-export-target="1"] sequence,
-  [data-pdf-export-target="1"] table-block,
-  [data-pdf-export-target="1"] .timeline-container,
-  [data-pdf-export-target="1"] .sequence-container,
-  [data-pdf-export-target="1"] .table-block-component {
-    break-inside: auto !important;
-    page-break-inside: auto !important;
-    max-height: none !important;
-    overflow: visible !important;
-  }
-  [data-pdf-export-target="1"] code-block,
-  [data-pdf-export-target="1"] .code-block,
-  [data-pdf-export-target="1"] .formatted-code-block-internal-container,
-  [data-pdf-export-target="1"] .animated-opacity,
-  [data-pdf-export-target="1"] pre,
-  [data-pdf-export-target="1"] code.code-container {
-    max-height: none !important;
-    overflow: visible !important;
-    overflow-x: visible !important;
-    overflow-y: visible !important;
-    break-inside: auto !important;
-    page-break-inside: auto !important;
-  }
-  [data-pdf-export-target="1"] code-block {
-    display: block !important;
-  }
-  [data-pdf-export-target="1"] pre {
-    height: auto !important;
-    block-size: auto !important;
-    min-height: 0 !important;
-    min-block-size: 0 !important;
-    white-space: pre-wrap !important;
-    overflow-wrap: anywhere !important;
-    word-break: break-word !important;
-  }
-  [data-pdf-export-target="1"] {
-    margin-bottom: 0 !important;
-    padding-bottom: 0 !important;
-  }
-  [data-pdf-export-target="1"] > *:last-child {
-    margin-bottom: 0 !important;
-    padding-bottom: 0 !important;
-  }
-}
-`;
 
 const VIRTUALIZER_SELECTORS = [
     'infinite-scroller',
@@ -296,6 +102,25 @@ const DOM_COLLECTION_SELECTORS = [
     '.response-container',
     '[role="article"]'
 ];
+
+// Which collection selectors identify a user turn and which an assistant turn.
+// The shared renderer agent classifies rows with these lists instead of
+// guessing from keywords in the selector text.
+const DOM_ROLE_SELECTORS = Object.freeze({
+    user: Object.freeze([
+        'user-query'
+    ]),
+    assistant: Object.freeze([
+        'model-response',
+        '[id^="model-response-message-content"]',
+        '.response-container'
+    ])
+});
+
+// Gemini has no verified answer label in its DOM text, so none is searched
+// for. Set these (see Copilot's chat-dom.js) only after confirming the label.
+const ANSWER_MARKER = '';
+const ANSWER_LEADING_LABELS = Object.freeze([]);
 
 const DOM_COLLECTION_ROW_SELECTORS = [
     'infinite-scroller',
@@ -335,374 +160,6 @@ const CHAT_INPUT_SELECTORS = [
 // Gemini's reasoning DOM ("Show thinking") has not been mapped yet -- populate
 // with app-correct [aria-expanded="false"] selectors to enable the feature.
 const REASONING_EXPAND_SELECTORS = [];
-
-// === buildLocateChatRootScript =============================================
-// Returns a JS string that, when executed in the renderer, locates the
-// best chat root element and optionally returns its outerHTML.
-//
-// Contract note:
-// This function intentionally supports the same higher-level options used by
-// the shared exporters module:
-//
-// - includeHtml:
-//   Return the selected node's HTML.
-//
-// - cleanupJunk:
-//   Remove obvious Gemini chrome/input/action UI from the returned HTML.
-//
-// - selectContent:
-//   Select the scored best element in the live renderer document.
-//
-// - scrollIntoView:
-//   Bring the scored best element into view before returning/selecting.
-//
-// Keeping this contract aligned with Copilot lets shared exporter logic use the
-// direct-select path instead of relying on selector fallback behavior.
-function buildLocateChatRootScript({
- includeHtml = true,
- cleanupJunk = false,
- selectContent = false,
- scrollIntoView = false,
- markForExport = false
-} = {}) {
- const selectorsJson = JSON.stringify(CHAT_ROOT_SELECTORS);
- const transcriptJson = JSON.stringify(TRANSCRIPT_SELECTORS);
- const junkJson = JSON.stringify(DOM_CLEANUP_SELECTORS);
- const preserveJson = JSON.stringify(PRESERVE_SELECTORS);
- const includeHtmlLiteral = includeHtml ? 'true' : 'false';
- const cleanupJunkLiteral = cleanupJunk ? 'true' : 'false';
- const selectContentLiteral = selectContent ? 'true' : 'false';
- const scrollIntoViewLiteral = scrollIntoView ? 'true' : 'false';
- const markForExportLiteral = markForExport ? 'true' : 'false';
-    return `
-(function () {
-    const candidates = ${selectorsJson};
-    const transcriptSelectors = ${transcriptJson};
- const junkSelectors = ${junkJson};
- const preserveSelectors = ${preserveJson};
-    function visible(el) {
-        if (!el) return false;
-        const r = el.getBoundingClientRect?.();
-        return !!r && r.width > 0 && r.height > 0;
-    }
-    function textOf(el) {
-        try { return String(el?.innerText || el?.textContent || ''); } catch { return ''; }
-    }
-    function count(el, sel) {
-        try { return el?.querySelectorAll?.(sel)?.length || 0; } catch { return 0; }
-    }
-    function semanticBonus(el) {
-        try {
-            let bonus = 0;
-            if (el.matches?.('message-content, .markdown.markdown-main-panel, [id^="model-response-message-content"]')) bonus += 1400;
-            if (el.matches?.('structured-content-container, .model-response-text')) bonus += 1000;
-            if (el.matches?.('.response-content, .response-container-content, .presented-response-container')) bonus += 700;
-            if (count(el, 'table, .horizontal-scroll-wrapper, .table-block-component, table-block') > 0) bonus += 180;
-            return bonus;
-        } catch { return 0; }
-    }
-    function chromePenalty(el) {
-        try {
-            let penalty = 0;
-            if (el.matches?.('${CHROME_PENALTY_SELECTOR}')) penalty += 2200;
-            const cls = String(el.className || '');
-            if (${CHROME_PENALTY_REGEX}.test(cls)) penalty += 1200;
-            return penalty;
-        } catch { return 0; }
-    }
-    function editablePenalty(el) {
-        const selfEditable = !!el?.matches?.('textarea, input, [contenteditable="true"], div[role="textbox"]');
-        if (selfEditable) return 2000;
-        return (count(el, 'textarea, input, [contenteditable="true"], div[role="textbox"]') * 900)
-            + (count(el, 'form') * 300)
-            + (count(el, '[role="button"], button') * 8);
-    }
-    function score(el) {
-        if (!el || !visible(el)) return -1;
-        const text = textOf(el).trim();
-        const len = Math.min(text.length, 5000);
-        const articleCount = count(el, '[role="article"], article');
-        const responseCount = count(el, 'message-content, .markdown, [id^="model-response-message-content"], structured-content-container, .model-response-text, .response-content, .response-container-content, .presented-response-container, .conversation-container, [class="response-container"]');
-        const richCount = count(el, 'table, pre, code, ul, ol, blockquote');
-        const scrollable = (() => {
-            try {
-                const cs = getComputedStyle(el);
-                return (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) ? 1 : 0;
-            } catch { return 0; }
-        })();
-        return 1000
-            + Math.min(len, 1600)
-            + (articleCount * 90)
-            + (responseCount * 60)
-            + (richCount * 25)
-            + (scrollable * 50)
-            + semanticBonus(el)
-            - chromePenalty(el)
-            - editablePenalty(el);
-    }
-    const found = [];
-    for (const sel of candidates) {
-        try {
-            document.querySelectorAll(sel).forEach((root) => {
-                found.push({ sel, el: root });
-                transcriptSelectors.forEach((childSel) => {
-                    try { root.querySelectorAll(childSel).forEach((el) => found.push({ sel: childSel, el })); } catch {}
-                });
-            });
-        } catch {}
-    }
-    if (!found.length) return null;
-    const scored = found
-        .map(({ sel, el }) => ({ sel, el, score: score(el), textLength: textOf(el).trim().length }))
-        .filter((entry) => entry.score >= 0)
-        .sort((a, b) => {
-            if (b.score !== a.score) return b.score - a.score;
-            return b.textLength - a.textLength;
-        });
-    const best = scored[0];
-    if (!best || !best.el) return null;
-
-    /*
-     * Derive the pane root independently from the scored content node.
-     *
-     * Important:
-     * Do NOT pool narrow chat containers and broad app shells together and
-     * then sort by innerText length. Broad shells often include Gemini's left
-     * navigation plus the right chat pane, so they naturally have more text and
-     * incorrectly win.
-     *
-     * Instead:
-     * 1. Try narrow chat/history containers first.
-     * 2. Then try conversation/content containers.
-     * 3. Then try Gemini app chat containers.
-     * 4. Use broad main/[role="main"] only as a last resort.
-     */
-    function findPaneRoot(el) {
-        function areaOf(node) {
-            try {
-                const r = node.getBoundingClientRect?.();
-                if (!r) return Number.POSITIVE_INFINITY;
-                return Math.max(1, Number(r.width || 0) * Number(r.height || 0));
-            } catch {
-                return Number.POSITIVE_INFINITY;
-            }
-        }
-
-        function textLengthOf(node) {
-            try {
-                return String(node?.innerText || node?.textContent || '').trim().length;
-            } catch {
-                return 0;
-            }
-        }
-
-        function containsNavigationChrome(node) {
-            try {
-                return !!node.querySelector?.([
-                    'nav',
-                    'aside',
-                    '[role="navigation"]',
-                    'mat-sidenav',
-                    'bard-sidenav',
-                    '[class*="sidenav" i]',
-                    '[class*="side-nav" i]',
-                    '[class*="sidebar" i]',
-                    '[class*="drawer" i]',
-                    '[data-test-id*="side" i]',
-                    '[data-test-id*="nav" i]'
-                ].join(','));
-            } catch {
-                return false;
-            }
-        }
-
-        function candidatesFor(selectorGroup) {
-            try {
-                return Array.from(document.querySelectorAll(selectorGroup))
-                    .filter((node) => {
-                        try {
-                            return (
-                                node &&
-                                node.contains(el) &&
-                                visible(node) &&
-                                textLengthOf(node) > 0
-                            );
-                        } catch {
-                            return false;
-                        }
-                    })
-                    .sort((a, b) => {
-                        const aChrome = containsNavigationChrome(a) ? 1 : 0;
-                        const bChrome = containsNavigationChrome(b) ? 1 : 0;
-                        if (aChrome !== bChrome) return aChrome - bChrome;
-
-                        /*
-                         * Within the same priority tier, choose the smallest
-                         * visible container that contains the selected content.
-                         * This avoids selecting the left navigation pane along
-                         * with the right chat pane.
-                         */
-                        const aArea = areaOf(a);
-                        const bArea = areaOf(b);
-                        if (aArea !== bArea) return aArea - bArea;
-
-                        return textLengthOf(b) - textLengthOf(a);
-                    });
-            } catch {
-                return [];
-            }
-        }
-
-        const selectorTiers = [
-            '#chat-history, infinite-scroller',
-            '.conversation-container, [class="response-container"]',
-            '#mainChat, main.chat-app, [data-test-id="chat-app"]',
-            '[role="main"], main'
-        ];
-
-        for (const selectorGroup of selectorTiers) {
-            const matches = candidatesFor(selectorGroup);
-            if (matches[0]) return matches[0];
-        }
-
-        return el;
-    }
-
- const paneRoot = findPaneRoot(best.el);
-
- // --- Mark the pane root for PDF/print export targeting ---
- // When markForExport is true, stamp a unique data attribute on paneRoot
- // so the export prep script can find it unambiguously instead of
- // re-querying a potentially ambiguous CSS selector.
- if (${markForExportLiteral}) {
-     try {
-         document.querySelectorAll('[data-pdf-export-target]').forEach(function(el) {
-             try { el.removeAttribute('data-pdf-export-target'); } catch(e) {}
-         });
-         paneRoot.setAttribute('data-pdf-export-target', '1');
-     } catch(e) {}
- }
-
- function cleanCloneHtml(el) {
- try {
- const clone = el.cloneNode(true);
- if (${cleanupJunkLiteral}) {
- try {
- clone.querySelectorAll(junkSelectors.join(',')).forEach((node) => {
- try { node.remove(); } catch {}
- });
- } catch {}
-
- try {
- const preserveJoined = preserveSelectors.join(', ');
- clone.querySelectorAll(preserveJoined).forEach((node) => {
- try { node.setAttribute('data-preserve', 'true'); } catch {}
- });
- } catch {}
-
- try {
- clone.querySelectorAll('div, span').forEach((node) => {
- try {
- if (
- !String(node.textContent || '').trim() &&
- !node.querySelector('[data-preserve]') &&
- !node.querySelector('pre, code, table, ul, ol, [role="table"], [role="grid"]')
- ) {
- node.remove();
- }
- } catch {}
- });
- } catch {}
- }
- return clone.outerHTML;
- } catch {
- try { return el.outerHTML || ''; } catch { return ''; }
- }
- }
-
- if (${scrollIntoViewLiteral}) {
- try {
- paneRoot.scrollIntoView({ block: 'start', inline: 'nearest' });
- } catch {}
- }
-
- let selectedTextLength = 0;
- let selectedOk = false;
-
- if (${selectContentLiteral}) {
- try {
- const selection = window.getSelection?.();
- if (selection) {
- selection.removeAllRanges();
- const range = document.createRange();
- range.selectNodeContents(paneRoot);
- selection.addRange(range);
- selectedTextLength = String(selection.toString() || '').length;
- selectedOk = selectedTextLength > 0;
- }
- } catch {}
- }
-
- const resultHtml = ${includeHtmlLiteral} ? cleanCloneHtml(${selectContentLiteral} ? paneRoot : best.el) : '';
-
-    return {
- ok: ${selectContentLiteral} ? selectedOk : true,
-        selector: best.sel,
- html: resultHtml,
-        textLength: Number(best.textLength || 0),
- score: Number(best.score || 0),
- selectedRootTag: paneRoot?.tagName || '',
- selectedRootId: paneRoot?.id || '',
- selectedTextLength
-    };
-})();
-`;
-}
-
-// === cleanupDOMFragmentScript ==============================================
-// Returns renderer-side JS that cleans a cloned DOM fragment.
-function cleanupDOMFragmentScript(containerName = 'container') {
-    const junkJson = JSON.stringify(DOM_CLEANUP_SELECTORS);
-    const preserveJson = JSON.stringify(PRESERVE_SELECTORS);
-    return `
-(function() {
-    const clone = ${containerName};
-    if (!clone) return;
-
-    const JUNK = ${junkJson};
-    const PRESERVE = ${preserveJson};
-    const PRESERVE_JOINED = PRESERVE.join(', ');
-    clone.querySelectorAll(JUNK.join(',')).forEach(el => {
-        try { el.remove(); } catch {}
-    });
-    clone.querySelectorAll(PRESERVE_JOINED).forEach(el => {
-        try { el.setAttribute('data-preserve', 'true'); } catch {}
-    });
-    clone.querySelectorAll('[data-preserve]').forEach(el => {
-        try {
-            el.querySelectorAll('*').forEach(child => child.setAttribute('data-preserve-descendant', 'true'));
-        } catch {}
-    });
-})();
-`;
-}
-
-// === buildChatPaneDetectionScript ==========================================
-// Returns JS that detects and selects the chat pane for
-// operations like "Select Chat Pane".
-function buildChatPaneDetectionScript({
- includeHtml = false,
- cleanupJunk = false,
- selectContent = false,
- scrollIntoView = false
-} = {}) {
- return buildLocateChatRootScript({
- includeHtml,
- cleanupJunk,
- selectContent,
- scrollIntoView
- });
-}
 
 // ============================================================================
 // Formal capability contract consumed by renderer/agent.js. Selectors remain
@@ -769,7 +226,6 @@ const DOM_CLEANUP_POLICY = Object.freeze({
 });
 
 module.exports = {
-    CHAT_SELECTOR,
     CHAT_ROOT_SELECTORS,
     CHAT_MESSAGE_LIST_SELECTORS,
     CHAT_SCOPE_SELECTOR,
@@ -779,34 +235,20 @@ module.exports = {
     EXPORT_ROOT_CLASS,
     EXPORT_ROOT_SELECTOR,
     CODE_PREVIEW_IFRAME_SELECTOR,
-    TRANSCRIPT_SELECTORS,
     DOM_CLEANUP_SELECTORS,
     DOM_CLEANUP_POLICY,
     DOM_ADAPTER_CONTRACT,
     DOM_PRESERVE_CONTENT_SELECTORS,
-    PRINT_BUBBLE_CSS,
     VIRTUALIZER_SELECTORS,
     DOM_SCORE_RULES,
     DOM_COLLECTION_SELECTORS,
+    DOM_ROLE_SELECTORS,
+    ANSWER_MARKER,
+    ANSWER_LEADING_LABELS,
     DOM_COLLECTION_ROW_SELECTORS,
     DOM_COLLECTION_EXCLUDE_SELECTORS,
     DOM_COLLECTION_KEY_ATTRIBUTES,
     CHAT_INPUT_SELECTORS,
     REASONING_EXPAND_SELECTORS,
-    CHROME_PENALTY_SELECTOR,
-    CHROME_PENALTY_REGEX,
-    USER_PROMPT_SELECTOR,
-    USER_PROMPT_REGEX,
-    TABLE_SIGNAL_SELECTORS,
-    TABLE_SIGNAL_SELECTOR_JOINED,
-    TABLE_SIGNAL_HTML_REGEX,
-    PROMOTION_STOP_SELECTOR,
-    PROMOTION_CANDIDATE_SELECTOR,
-    PROMOTION_CANDIDATE_REGEX,
-    PRESERVE_SELECTORS,
-    PRESERVE_SELECTOR_JOINED,
     messageContentById,
-    buildLocateChatRootScript,
-    cleanupDOMFragmentScript,
-    buildChatPaneDetectionScript,
 };

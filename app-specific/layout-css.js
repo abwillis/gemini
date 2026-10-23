@@ -561,40 +561,15 @@ function createLayoutCSS(deps = {}) {
         await install();
     }
 
-    async function attachComposerTracking(win) {
-        if (!win?.webContents) return;
-        const wc = win.webContents;
-
-        const install = async () => {
-            try {
-                const results = await callRAFrames(
-                    { webContents: wc },
-                    'startComposerTracking',
-                    {}
-                );
-                const missing = (results || []).filter(r => r?.value?.missing);
-                if (missing.length) {
-                    console.warn(
-                        '[layout-css] startComposerTracking MISSING on renderer agent '
-                        + 'in some frames; composer will keep its default width:',
-                        missing
-                    );
-                }
-            } catch (err) {
-                console.error('attachComposerTracking failed:', err);
-            }
-        };
-
-        if (wc.__composerTrackingAttached) {
-            await install();
-            return;
-        }
-        wc.__composerTrackingAttached = true;
-
-        wc.on('did-finish-load', install);
-        wc.on('did-navigate-in-page', install);
-        await install();
-    }
+    // Intentionally a no-op. startComposerTracking() installs a document-wide
+    // MutationObserver that tags the composer wrapper chain with
+    // data-expanded-composer, but this app's layout CSS never reads that
+    // marker, so tracking would only cost work on every DOM mutation and log a
+    // warning whenever a frame lacks the agent. The export is kept so the
+    // shared window-helpers and main.js wiring stay identical across the apps.
+    // If composer width rules are added here later, replace this with the
+    // retrying implementation in the Copilot app's layout-css.js.
+    async function attachComposerTracking() {}
 
     return {
         applyMaxLayoutCSS,
